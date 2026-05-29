@@ -220,17 +220,21 @@ impl SmartStrategy {
             ("Down", "Up", dn_ask, up_ask)
         };
         let main_shares = if main_dir == "Up" { pos.up_shares } else { pos.down_shares };
+        let opp_shares  = if opp_dir  == "Up" { pos.up_shares } else { pos.down_shares };
+        // 锁仓只需补足"差额"使两边相等；对边已有的份额不能重复买，否则会超买成单边赌注
+        let lock_qty = (main_shares - opp_shares).max(0.0);
 
-        // ── P2：锁利（worst_pnl_after_lock >= LOCK_MIN_PROFIT）────────────
-        // 等额买入 opp 边，确保 worst_pnl 锁定为正
-        let p2_worst = pos.worst_pnl_if_add(opp_dir, opp_ask, main_shares);
-        if p2_worst >= LOCK_MIN_PROFIT {
-            info!(
-                "[SMART LOCK_PROFIT {mode}] {} 买{opp_dir}@{opp_ask:.3} ×{main_shares:.0}份  锁定worst_pnl={p2_worst:+.2}  T-{seconds_left}s",
-                market.title
-            );
-            self.do_lock(&market, &pos, opp_dir, opp_ask, main_shares, p2_worst, "lock_profit").await?;
-            return Ok(());
+        // ── P2：锁利（补差额至两边相等后 worst_pnl >= LOCK_MIN_PROFIT）────
+        if lock_qty > 0.0 {
+            let p2_worst = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
+            if p2_worst >= LOCK_MIN_PROFIT {
+                info!(
+                    "[SMART LOCK_PROFIT {mode}] {} 买{opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  锁定worst_pnl={p2_worst:+.2}  T-{seconds_left}s",
+                    market.title
+                );
+                self.do_lock(&market, &pos, opp_dir, opp_ask, lock_qty, p2_worst, "lock_profit").await?;
+                return Ok(());
+            }
         }
 
         // 当前趋势信号（用于决定"追单"还是"减险"）
@@ -280,13 +284,20 @@ impl SmartStrategy {
 
         // ── 强制锁仓（最后 60s）──────────────────────────────────────────
         if seconds_left <= ENTRY_MIN_SECONDS_LEFT {
-            let proj = pos.worst_pnl_if_add(opp_dir, opp_ask, main_shares);
+            if lock_qty <= 0.0 {
+                // 两边已相等，无需再买，直接标记锁定
+                let p = self.state.get_or_create(&market.slug, market.end_ts);
+                p.phase = Phase::Locked;
+                self.state.save().await?;
+                return Ok(());
+            }
+            let proj = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
             let label = if proj >= 0.0 { "lock_profit" } else { "lock_loss" };
             info!(
-                "[SMART FORCE {mode}] {} 强制锁仓 {opp_dir}@{opp_ask:.3} ×{main_shares:.0}份  worst={proj:+.2}  T-{seconds_left}s",
+                "[SMART FORCE {mode}] {} 强制锁仓 {opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  worst={proj:+.2}  T-{seconds_left}s",
                 market.title
             );
-            self.do_lock(&market, &pos, opp_dir, opp_ask, main_shares, proj, label).await?;
+            self.do_lock(&market, &pos, opp_dir, opp_ask, lock_qty, proj, label).await?;
             return Ok(());
         }
 
