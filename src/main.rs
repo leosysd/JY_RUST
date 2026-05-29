@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
 
     // 初始化策略
     let mut strategy = SmartStrategy::new(
-        config.clone(), cache, chainlink, binance
+        config.clone(), cache, chainlink, binance, ws.clone()
     ).await?;
 
     let poll = tokio::time::Duration::from_millis(config.poll_ms);

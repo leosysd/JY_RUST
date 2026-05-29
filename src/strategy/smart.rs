@@ -3,9 +3,10 @@ use crate::config::Config;
 use crate::feeds::{BinanceFeed, ChainlinkFeed};
 use crate::position::{full_cost_per_share, taker_fee, MarketPosition, Phase, TradeRecord};
 use crate::state::SmartStateStore;
+use crate::ws::MarketWs;
 use crate::zscore::ZScoreModel;
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::info;
 use std::path::PathBuf;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -22,6 +23,8 @@ pub struct SmartStrategy {
     pub model: ZScoreModel,
     pub signal_file: PathBuf,
     pub first_allowed_start: i64,
+    pub ws: MarketWs,
+    pub cached_market: Option<Market>,
 }
 
 impl SmartStrategy {
@@ -30,6 +33,7 @@ impl SmartStrategy {
         cache: BookCache,
         chainlink: ChainlinkFeed,
         binance: BinanceFeed,
+        ws: MarketWs,
     ) -> Result<Self> {
         let state = SmartStateStore::load(config.state_file.clone()).await?;
         let client = ClobClient::new(&config.clob_api_url, &config.gamma_api_url, &config.market_slug_prefix);
@@ -38,14 +42,13 @@ impl SmartStrategy {
         let now = chrono::Utc::now().timestamp();
         let first_allowed_start = ((now / 300) + 1) * 300;
 
-        Ok(Self { config, state, client, cache, model, signal_file, first_allowed_start })
+        Ok(Self { config, state, client, cache, model, signal_file, first_allowed_start, ws, cached_market: None })
     }
 
     pub async fn run_once(&mut self) -> Result<()> {
-        // 先检查已结束盘口的结算
         self.check_settlements().await?;
 
-        let Some(market) = self.client.find_current_market().await else {
+        let Some(market) = self.get_or_fetch_market().await else {
             return Ok(());
         };
 
@@ -58,25 +61,27 @@ impl SmartStrategy {
         let seconds_left = market.seconds_left();
         if seconds_left < 5 { return Ok(()); }
 
-        // 获取盘口价格
         let up_idx = market.outcomes.iter().position(|o| o == "Up").unwrap_or(0);
         let dn_idx = market.outcomes.iter().position(|o| o == "Down").unwrap_or(1);
-        let up_token = &market.token_ids[up_idx];
-        let dn_token = &market.token_ids[dn_idx];
+        let up_token = market.token_ids[up_idx].clone();
+        let dn_token = market.token_ids[dn_idx].clone();
 
-        let up_book = match self.client.fetch_book(up_token).await {
-            Ok(b) => b, Err(e) => { warn!("[SMART] book Up: {e}"); return Ok(()); }
+        // 价格全部从 WS 缓存读取，零 HTTP
+        let (up_ask, dn_ask) = {
+            let cache = self.cache.read().await;
+            let Some(up_ask_d) = cache.get(&up_token).and_then(|b| b.best_ask()) else {
+                info!("[SMART] {} WS盘口未就绪，等待推送...", market.title);
+                return Ok(());
+            };
+            let Some(dn_ask_d) = cache.get(&dn_token).and_then(|b| b.best_ask()) else {
+                info!("[SMART] {} WS盘口未就绪，等待推送...", market.title);
+                return Ok(());
+            };
+            let up_ask = f64::from(up_ask_d.try_into().unwrap_or(0.5f32));
+            let dn_ask = f64::from(dn_ask_d.try_into().unwrap_or(0.5f32));
+            (up_ask, dn_ask)
         };
-        let dn_book = match self.client.fetch_book(dn_token).await {
-            Ok(b) => b, Err(e) => { warn!("[SMART] book Down: {e}"); return Ok(()); }
-        };
 
-        let Some(up_ask) = up_book.best_ask() else { return Ok(()); };
-        let Some(dn_ask) = dn_book.best_ask() else { return Ok(()); };
-        let up_ask = f64::from(up_ask.try_into().unwrap_or(0.5f32));
-        let dn_ask = f64::from(dn_ask.try_into().unwrap_or(0.5f32));
-
-        // 获取或初始化仓位（clone 避免借用冲突）
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
 
         match pos.phase {
@@ -90,6 +95,29 @@ impl SmartStrategy {
         }
 
         Ok(())
+    }
+
+    /// 返回当前盘口：优先用缓存，缓存过期才 HTTP（每5分钟最多一次）。
+    async fn get_or_fetch_market(&mut self) -> Option<Market> {
+        let now = chrono::Utc::now().timestamp();
+
+        if let Some(m) = &self.cached_market {
+            if now < m.end_ts {
+                return Some(m.clone());
+            }
+        }
+
+        // 缓存过期或为空 → HTTP 拉取
+        let market = self.client.find_current_market().await?;
+
+        let is_new = self.cached_market.as_ref().map(|m| m.slug != market.slug).unwrap_or(true);
+        if is_new {
+            // 订阅新 token → WS 断线重连后服务端推送完整快照
+            self.ws.ensure_subscribed(&market.token_ids).await;
+            info!("[SMART] 新盘口 {} 已订阅WS", market.slug);
+        }
+        self.cached_market = Some(market.clone());
+        Some(market)
     }
 
     // ── 阶段1：首单入场 ────────────────────────────────────────────────────
@@ -106,13 +134,10 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // 只在价格接近 0.50（ask ≤ 0.53）时入场
         if up_ask > ENTRY_MAX_ASK && dn_ask > ENTRY_MAX_ASK {
             return Ok(());
         }
 
-        // Price to Beat = 开盘时 Chainlink BTC/USD 价格
-        // 优先用开盘时刻的缓存价；若没有则用当前最新价（开盘即为当前价）
         let price_to_beat = self.model.chainlink_at(market.start_ts)
             .or_else(|| self.model.chainlink_latest())
             .unwrap_or(0.0);
@@ -122,7 +147,6 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // 计算 z-score（需要至少 10 秒的 Binance 数据）
         let Some(sig) = self.model.compute(price_to_beat, seconds_left) else {
             info!("[SMART] {} 价格数据不足（需等待约10s），跳过入场", market.title);
             return Ok(());
@@ -133,15 +157,13 @@ impl SmartStrategy {
             return Ok(());
         };
 
-        // 检查对应方向的价格
-        let (entry_ask, opp_ask) = if dir == "Up" { (up_ask, dn_ask) } else { (dn_ask, up_ask) };
+        let (entry_ask, _opp_ask) = if dir == "Up" { (up_ask, dn_ask) } else { (dn_ask, up_ask) };
         if entry_ask > ENTRY_MAX_ASK {
             info!("[SMART] {} {}@{:.3} > {:.3}，价格偏贵，等待", market.title, dir, entry_ask, ENTRY_MAX_ASK);
             return Ok(());
         }
 
-        // 检查手续费后胜率是否足够（>55%）
-        let required_p = full_cost_per_share(entry_ask) + 0.01; // 至少1%缓冲
+        let required_p = full_cost_per_share(entry_ask) + 0.01;
         let entry_p = if dir == "Up" { sig.p_up } else { sig.p_down };
         if entry_p < required_p.max(0.55) {
             info!("[SMART] {} {}@{:.3} p={:.3} < 需要{:.3}，跳过", market.title, dir, entry_ask, entry_p, required_p);
@@ -199,13 +221,11 @@ impl SmartStrategy {
         let has_up   = pos.up_shares > 0.0;
         let has_down = pos.down_shares > 0.0;
 
-        // 决定入场方向和对立方向
         let (main_dir, opp_dir, main_ask, opp_ask) = if has_up && !has_down {
             ("Up", "Down", up_ask, dn_ask)
         } else if has_down && !has_up {
             ("Down", "Up", dn_ask, up_ask)
         } else {
-            // 双边都有，已接近锁仓状态
             return Ok(());
         };
 
@@ -224,7 +244,6 @@ impl SmartStrategy {
                 let chase_dir = sig.chase_direction();
                 if chase_dir == Some(main_dir) {
                     let chase_shares = if main_dir == "Up" { pos.up_shares } else { pos.down_shares };
-                    // 检查追仓后还能锁利润
                     if pos.can_chase_then_lock(main_dir, chase_shares, main_ask, opp_ask, TARGET_PROFIT_PER_SHARE) {
                         self.do_chase(&market, &pos, main_dir, main_ask, chase_shares, &sig).await?;
                         return Ok(());
