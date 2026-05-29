@@ -41,6 +41,9 @@ impl JetFadilStrategy {
     }
 
     pub async fn run_once(&mut self) -> Result<()> {
+        // 先检查已结束盘口的结算结果
+        self.check_settlements().await?;
+
         let Some(market) = self.client.find_current_market().await else {
             info!("[JF] 未找到当前 BTC 5m 市场，等待...");
             return Ok(());
@@ -134,8 +137,8 @@ impl JetFadilStrategy {
                     entry_price:   ask.to_string(),
                     entry_token:   token.clone(),
                     locked: false,
-                    lock_price: None,
-                    lock_profit_pct: None,
+                    end_ts: Some(market.end_ts),
+                    ..Default::default()
                 };
 
                 if !self.config.dry_run {
@@ -250,6 +253,86 @@ impl JetFadilStrategy {
             .await?;
         let line = serde_json::to_string(record)? + "\n";
         file.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// 检查已结束盘口的结算结果，更新损益
+    async fn check_settlements(&mut self) -> Result<()> {
+        let pending = self.state.pending_settlement();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let fee = Decimal::ONE + self.config.fee_rate;
+        let shares = self.config.order_shares;
+        let mut changed = false;
+
+        for (slug, s) in pending {
+            let winner = match self.client.fetch_winning_outcome(&slug).await {
+                Some(w) => w,
+                None => continue, // 还没结算
+            };
+
+            let entry_price = Decimal::from_str(&s.entry_price).unwrap_or_default();
+            let entry_cost = entry_price * shares * fee;
+
+            let pnl = if s.locked {
+                // 锁利单：利润已确定，从 lock_profit_pct 读取
+                let pct = s.lock_profit_pct.as_ref()
+                    .and_then(|p| Decimal::from_str(p).ok())
+                    .unwrap_or_default();
+                let lock_price = s.lock_price.as_ref()
+                    .and_then(|p| Decimal::from_str(p).ok())
+                    .unwrap_or_default();
+                (Decimal::ONE - (entry_price + lock_price) * fee) * shares
+            } else {
+                // 单边单：看方向对不对
+                if s.entry_outcome == winner {
+                    shares - entry_cost   // 赢：收到 shares×$1，扣入场成本
+                } else {
+                    -entry_cost           // 输：亏掉入场成本
+                }
+            };
+
+            let pnl_str = pnl.round_dp(4).to_string();
+            let emoji = if pnl >= Decimal::ZERO { "✅" } else { "❌" };
+            info!(
+                "[JF SETTLE] {} | 赢家={} | 入场={}@{} | PNL={} ({}) {}",
+                slug, winner, s.entry_outcome, entry_price, pnl_str,
+                if s.locked { "锁利" } else { "单边" }, emoji
+            );
+
+            let mut updated = s.clone();
+            updated.settled = true;
+            updated.winning_outcome = Some(winner.clone());
+            updated.realized_pnl = Some(pnl_str);
+            self.state.set_jf(&slug, updated);
+            changed = true;
+
+            // 写入信号文件
+            self.write_signal(&json!({
+                "strategy": "jetfadil",
+                "phase": "settlement",
+                "slug": slug,
+                "entry_outcome": s.entry_outcome,
+                "entry_price": s.entry_price,
+                "locked": s.locked,
+                "winning_outcome": winner,
+                "pnl": pnl.round_dp(4).to_string(),
+                "ts": chrono::Utc::now().timestamp(),
+            })).await?;
+        }
+
+        if changed {
+            self.state.save().await?;
+            let stats = self.state.summary();
+            info!(
+                "[JF STATS] 总{}盘 | 锁利{} | 赢{} 输{} | 累计PNL ${:.2}",
+                stats.total, stats.locked,
+                stats.settled_win, stats.settled_lose,
+                stats.total_pnl
+            );
+        }
         Ok(())
     }
 }

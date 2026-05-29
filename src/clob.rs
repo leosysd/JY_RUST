@@ -92,6 +92,28 @@ impl ClobClient {
         None
     }
 
+    /// 查询盘口结算结果，返回获胜方向（"Up" 或 "Down"）
+    pub async fn fetch_winning_outcome(&self, slug: &str) -> Option<String> {
+        let url = format!("{}/events/slug/{}", self.gamma_api, slug);
+        let resp: serde_json::Value = self.http.get(&url).send().await.ok()?.json().await.ok()?;
+        let markets = resp.get("markets")?.as_array()?;
+        let market = markets.first()?;
+        if market.get("closed")?.as_bool() != Some(true) {
+            return None;
+        }
+        let outcomes = parse_json_list(market.get("outcomes")?)?;
+        let prices_raw = market.get("outcomePrices")?;
+        let prices = parse_json_list(prices_raw)?;
+        for (outcome, price_str) in outcomes.iter().zip(prices.iter()) {
+            if let Ok(p) = Decimal::from_str(price_str) {
+                if p >= Decimal::new(99, 2) {
+                    return Some(outcome.clone());
+                }
+            }
+        }
+        None
+    }
+
     async fn fetch_market(&self, start_ts: i64) -> Option<Market> {
         let slug = format!("{}-{}", self.slug_prefix, start_ts);
         let url = format!("{}/events/slug/{}", self.gamma_api, slug);

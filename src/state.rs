@@ -14,6 +14,15 @@ pub struct JfMarketState {
     pub lock_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_profit_pct: Option<String>,
+    // 结算追踪
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_ts: Option<i64>,
+    #[serde(default)]
+    pub settled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub winning_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realized_pnl: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -46,6 +55,40 @@ impl StateStore {
         self.inner.jetfadil.insert(slug.to_string(), state);
     }
 
+    /// 返回所有需要结算检查的盘口（已结束但未结算）
+    pub fn pending_settlement(&self) -> Vec<(String, JfMarketState)> {
+        let now = chrono::Utc::now().timestamp();
+        self.inner.jetfadil.iter()
+            .filter(|(_, s)| {
+                !s.settled
+                    && s.end_ts.map(|t| now > t + 10).unwrap_or(false)
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// 统计摘要
+    pub fn summary(&self) -> StatsSummary {
+        let mut total = 0;
+        let mut locked = 0;
+        let mut settled_win = 0;
+        let mut settled_lose = 0;
+        let mut total_pnl = 0.0f64;
+
+        for s in self.inner.jetfadil.values() {
+            total += 1;
+            if s.locked { locked += 1; }
+            if s.settled {
+                if let Some(pnl) = s.realized_pnl.as_ref()
+                    .and_then(|p| p.parse::<f64>().ok()) {
+                    total_pnl += pnl;
+                    if pnl >= 0.0 { settled_win += 1; } else { settled_lose += 1; }
+                }
+            }
+        }
+        StatsSummary { total, locked, settled_win, settled_lose, total_pnl }
+    }
+
     pub async fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).await?;
@@ -54,4 +97,12 @@ impl StateStore {
         fs::write(&self.path, text).await?;
         Ok(())
     }
+}
+
+pub struct StatsSummary {
+    pub total: usize,
+    pub locked: usize,
+    pub settled_win: usize,
+    pub settled_lose: usize,
+    pub total_pnl: f64,
 }
