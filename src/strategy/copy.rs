@@ -117,7 +117,7 @@ impl CopyStrategy {
         }
 
         // 获取盘口确认流动性
-        let book = match self.client.get_book(&token_id, &self.cache).await {
+        let book = match self.client.fetch_book(&token_id).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("[COPY] 获取盘口失败 {token_id}: {e}");

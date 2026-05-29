@@ -67,11 +67,12 @@ impl JetFadilStrategy {
             return Ok(());
         }
 
-        let up_book = match self.client.get_book(&up_token, &self.cache).await {
+        // 每次都从 HTTP 拉取最新盘口（避免缓存过期导致价格滞后）
+        let up_book = match self.client.fetch_book(&up_token).await {
             Ok(b) => b,
             Err(e) => { warn!("[JF] book error Up: {e}"); return Ok(()); }
         };
-        let down_book = match self.client.get_book(&down_token, &self.cache).await {
+        let down_book = match self.client.fetch_book(&down_token).await {
             Ok(b) => b,
             Err(e) => { warn!("[JF] book error Down: {e}"); return Ok(()); }
         };
