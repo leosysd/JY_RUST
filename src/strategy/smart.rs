@@ -24,8 +24,8 @@ const ENTRY_MIN_SECONDS_LEFT: i64 = 60;
 const MAX_SHARES_PER_SIDE: f64 = 80.0;
 // 微批份额 = order_shares / 4（用于积累阶段）
 const MICRO_LOT_DIVISOR: f64 = 4.0;
-// JetFadil 积累：每多少秒尝试一次双边买入
-const ACCUMULATE_INTERVAL_SEC: i64 = 30;
+// JetFadil 积累：价格比上次买入再低多少才触发下一笔
+const ACCUMULATE_STEP: f64 = 0.05;
 
 pub struct SmartStrategy {
     pub config: Config,
@@ -37,8 +37,9 @@ pub struct SmartStrategy {
     pub first_allowed_start: i64,
     pub ws: MarketWs,
     pub cached_market: Option<Market>,
-    /// 上次积累买入的时间戳（避免每秒都买）
-    pub last_accumulate_ts: i64,
+    /// 各边上次积累时的买入价（价格跌过一个 step 才再买）
+    pub last_accum_price_up: f64,
+    pub last_accum_price_dn: f64,
 }
 
 impl SmartStrategy {
@@ -60,7 +61,8 @@ impl SmartStrategy {
             config, state, client, cache, model, signal_file,
             first_allowed_start, ws,
             cached_market: None,
-            last_accumulate_ts: 0,
+            last_accum_price_up: 1.0,
+            last_accum_price_dn: 1.0,
         })
     }
 
@@ -119,7 +121,8 @@ impl SmartStrategy {
         let is_new = self.cached_market.as_ref().map(|m| m.slug != market.slug).unwrap_or(true);
         if is_new {
             self.ws.ensure_subscribed(&market.token_ids).await;
-            self.last_accumulate_ts = 0;
+            self.last_accum_price_up = 1.0;
+            self.last_accum_price_dn = 1.0;
             info!("[SMART] 新盘口 {} 已订阅WS", market.slug);
         }
         self.cached_market = Some(market.clone());
@@ -278,35 +281,48 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // ── 2. JetFadil 积累：定时对便宜边微量买入 ───────────────────────
-        //    每 ACCUMULATE_INTERVAL_SEC 秒执行一次，两边都可以买
-        let now = chrono::Utc::now().timestamp();
-        if seconds_left > 90
-            && now - self.last_accumulate_ts >= ACCUMULATE_INTERVAL_SEC
-        {
-            // 先看主边有没有继续变便宜
-            if main_ask <= EXTREME_BUY_THRESHOLD && main_shares < MAX_SHARES_PER_SIDE {
+        // ── 2. JetFadil 积累：价格跌到新低档位就买 ──────────────────────
+        //    不用定时器，而是追踪各边上次买入价：
+        //    当前价 ≤ 上次买入价 - ACCUMULATE_STEP 时触发下一笔
+        //    这样价格每下跌 0.05 就自动买入一笔，完全跟随市场
+        if seconds_left > 90 {
+            let last_up = self.last_accum_price_up;
+            let last_dn = self.last_accum_price_dn;
+
+            // 主边继续下跌
+            if main_ask <= EXTREME_BUY_THRESHOLD
+                && main_ask <= last_up.min(last_dn) - ACCUMULATE_STEP  // 比上次买入（任意边）更低
+                && main_shares < MAX_SHARES_PER_SIDE
+            {
                 let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
                 info!(
-                    "[SMART ACCUM {mode}] {} 主边{main_dir}@{main_ask:.3} 继续便宜，+{micro:.0}份  已有{main_shares:.0}份  T-{seconds_left}s",
-                    market.title
+                    "[SMART ACCUM {mode}] {} 主边{main_dir}@{main_ask:.3}（上次{:.3}，又低{:.2}）+{micro:.0}份  T-{seconds_left}s",
+                    market.title,
+                    if main_dir == "Up" { last_up } else { last_dn },
+                    ACCUMULATE_STEP
                 );
                 self.do_buy(&market, main_dir, main_ask, micro, "accumulate", pos.price_to_beat).await?;
-                self.last_accumulate_ts = now;
+                if main_dir == "Up" { self.last_accum_price_up = main_ask; }
+                else                { self.last_accum_price_dn = main_ask; }
                 return Ok(());
             }
 
-            // 再看对边有没有也变便宜（JetFadil 核心：两边都买）
+            // 对边也跌到便宜区（JetFadil 核心：两边都买）
             let opp_shares = if has_up { pos.down_shares } else { pos.up_shares };
-            if opp_ask <= EXTREME_BUY_THRESHOLD && opp_shares < MAX_SHARES_PER_SIDE {
+            let last_opp = if has_up { last_dn } else { last_up };
+            if opp_ask <= EXTREME_BUY_THRESHOLD
+                && opp_ask <= last_opp - ACCUMULATE_STEP
+                && opp_shares < MAX_SHARES_PER_SIDE
+            {
                 let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
                 let proj = pos.projected_locked_pnl(opp_ask);
                 info!(
-                    "[SMART ACCUM {mode}] {} 对边{opp_dir}@{opp_ask:.3} 也便宜，+{micro:.0}份（双边积累）  预计最差PNL≈{proj:+.2}  T-{seconds_left}s",
-                    market.title
+                    "[SMART ACCUM {mode}] {} 对边{opp_dir}@{opp_ask:.3}（上次{last_opp:.3}，又低{:.2}）+{micro:.0}份 双边积累  最差PNL≈{proj:+.2}  T-{seconds_left}s",
+                    market.title, ACCUMULATE_STEP
                 );
                 self.do_buy(&market, opp_dir, opp_ask, micro, "accumulate_opp", pos.price_to_beat).await?;
-                self.last_accumulate_ts = now;
+                if opp_dir == "Up" { self.last_accum_price_up = opp_ask; }
+                else               { self.last_accum_price_dn = opp_ask; }
                 return Ok(());
             }
         }
