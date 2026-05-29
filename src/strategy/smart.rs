@@ -11,7 +11,6 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 const TARGET_PROFIT_PER_SHARE: f64 = 0.02;   // 锁利润门槛 2¢/份
-const MAX_LOSS_PER_MARKET: f64 = 15.0;        // 锁亏损：最大亏损 $15
 const ENTRY_MAX_ASK: f64 = 0.53;              // 入场最高价（不入贵的）
 const ENTRY_MIN_SECONDS_LEFT: i64 = 60;       // 最后60秒不做新首单
 
@@ -234,14 +233,12 @@ impl SmartStrategy {
             }
         }
 
-        // ── 若剩余时间 ≤ 30s 且方向不对，考虑锁亏损 ──────────────────────
+        // ── 若剩余时间 ≤ 60s 仍未锁利，强制等额锁仓（小亏换确定性）──────────
         if seconds_left <= 60 {
-            let loss_shares = pos.loss_lock_shares(opp_ask, MAX_LOSS_PER_MARKET);
-            if loss_shares >= 1.0 {
-                let proj = pos.pnl_if_up_wins().min(pos.pnl_if_down_wins());
-                self.do_lock(&market, &pos, opp_dir, opp_ask, loss_shares, proj, "lock_loss").await?;
-                return Ok(());
-            }
+            let shares = if has_up { pos.up_shares } else { pos.down_shares };
+            let proj = pos.projected_locked_pnl(opp_ask);
+            self.do_lock(&market, &pos, opp_dir, opp_ask, shares, proj, "lock_loss").await?;
+            return Ok(());
         }
 
         // 继续等待
