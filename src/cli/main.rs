@@ -341,29 +341,56 @@ fn pad(s: &str, w: usize) -> String {
     if d >= w { s.to_string() } else { format!("{}{}", s, " ".repeat(w - d)) }
 }
 
-fn render_table(headers: &[&str], rows: &[Vec<String>]) {
+/// 渲染分组表格：每个盘口一组，组与组之间用横线隔开（box-drawing 美化）。
+fn render_grouped_table(headers: &[&str], groups: &[Vec<Vec<String>>]) {
     let cols = headers.len();
     let mut widths: Vec<usize> = headers.iter().map(|h| dwidth(h)).collect();
-    for r in rows {
-        for (i, c) in r.iter().enumerate().take(cols) {
-            widths[i] = widths[i].max(dwidth(c));
+    for g in groups {
+        for r in g {
+            for (i, c) in r.iter().enumerate().take(cols) {
+                widths[i] = widths[i].max(dwidth(c));
+            }
         }
     }
-    let sep: String = format!("+{}+", widths.iter().map(|w| "-".repeat(w + 2)).collect::<Vec<_>>().join("+"));
+    let rule = |l: &str, m: &str, r: &str| -> String {
+        format!("{l}{}{r}", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join(m))
+    };
     let line = |cells: &[String]| -> String {
-        let mut out = String::from("|");
-        for (i, c) in cells.iter().enumerate().take(cols) {
-            out.push_str(&format!(" {} |", pad(c, widths[i])));
+        let mut out = String::from("│");
+        for (i, w) in widths.iter().enumerate() {
+            let c = cells.get(i).map(|s| s.as_str()).unwrap_or("");
+            out.push_str(&format!(" {} │", pad(c, *w)));
         }
         out
     };
-    println!("{sep}");
+
+    println!("{}", rule("┌", "┬", "┐"));
     println!("{}", line(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>()));
-    println!("{sep}");
-    for r in rows {
-        println!("{}", line(r));
+    println!("{}", rule("├", "┼", "┤"));
+    for (gi, g) in groups.iter().enumerate() {
+        if gi > 0 {
+            println!("{}", rule("├", "┼", "┤"));
+        }
+        for r in g {
+            println!("{}", line(r));
+        }
     }
-    println!("{sep}");
+    println!("{}", rule("└", "┴", "┘"));
+}
+
+/// 交易阶段 → 中文短标
+fn phase_label(p: &str) -> &'static str {
+    match p {
+        "entry" => "入场",
+        "trend_chase" => "追单",
+        "hedge" => "减险",
+        "lock_profit" => "锁利",
+        "lock_loss" => "锁亏",
+        "lottery" => "彩票",
+        "arb_entry" => "套利",
+        "arb_lock" => "套利锁",
+        _ => "其他",
+    }
 }
 
 fn show_stats() {
@@ -388,8 +415,8 @@ fn show_stats() {
         return;
     }
 
-    let headers = ["盘口时间", "交易秒", "方向", "份额", "价格", "成本", "锁利", "结果", "盈亏"];
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    let headers = ["盘口时间", "秒", "方向", "价格", "份额", "成本", "阶段", "结果", "盈亏"];
+    let mut groups: Vec<Vec<Vec<String>>> = Vec::new();
 
     let (mut total, mut win, mut lose, mut locked, mut holding) = (0, 0, 0, 0, 0);
     let mut net_pnl = 0.0f64;
@@ -407,9 +434,9 @@ fn show_stats() {
             },
         }
 
+        let mut group: Vec<Vec<String>> = Vec::new();
         for (i, t) in m.trades.iter().enumerate() {
             let is_last = i == n - 1;
-            let lock_flag = if t.phase.starts_with("lock") || t.phase == "arb_lock" { "✓" } else { "" };
             let (result, pnl) = if is_last {
                 let r = m.winner.clone().unwrap_or_else(|| match format!("{:?}", m.phase).as_str() {
                     "Locked" => "锁定中".into(),
@@ -420,21 +447,22 @@ fn show_stats() {
             } else {
                 (String::new(), String::new())
             };
-            rows.push(vec![
+            group.push(vec![
                 if i == 0 { label.clone() } else { String::new() },
                 (t.ts - start_ts).to_string(),
                 t.side.to_lowercase(),
-                format!("{:.2}", t.shares),
                 format!("{:.3}", t.price),
+                format!("{:.0}", t.shares),
                 format!("{:.2}", t.total_cost),
-                lock_flag.to_string(),
+                phase_label(&t.phase).to_string(),
                 result,
                 pnl,
             ]);
         }
+        groups.push(group);
     }
 
-    render_table(&headers, &rows);
+    render_grouped_table(&headers, &groups);
     println!(
         "\n  已结算 {} 盘  胜 {} / 负 {}   锁定中 {}  持仓中 {}",
         total, win, lose, locked, holding
