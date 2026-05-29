@@ -56,6 +56,7 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
             set_env_val("QUANT_STRATEGY", val);
             println!("{} QUANT_STRATEGY={val}", style("✔").green());
         }
+        "update" => update_bot()?,
         _ => {
             eprintln!("未知命令: {}", args[0]);
             std::process::exit(1);
@@ -93,6 +94,7 @@ fn interactive_menu() -> Result<()> {
             "7. 查看实时日志",
             "8. 切换 DRY_RUN 模式",
             "9. 切换策略（jetfadil / copy）",
+            "u. 更新程序（从 GitHub 拉取最新版本）",
             "0. 退出",
         ];
 
@@ -117,7 +119,8 @@ fn interactive_menu() -> Result<()> {
             }
             7 => toggle_dry_run()?,
             8 => toggle_strategy()?,
-            9 => break,
+            9 => update_bot()?,
+            10 => break,
             _ => {}
         }
     }
@@ -319,6 +322,110 @@ fn set_env_val(key: &str, val: &str) {
         lines.push(entry);
     }
     let _ = std::fs::write(&path, lines.join("\n") + "\n");
+}
+
+fn update_bot() -> Result<()> {
+    const REPO: &str = "https://github.com/leosysd/JY_RUST.git";
+    const INSTALL_DIR: &str = "/opt/jy-rust";
+
+    println!("{}", style("── 更新程序 ──").bold());
+    println!("  来源: {}", style(REPO).dim());
+    println!();
+
+    // 确认
+    let ok = Confirm::with_theme(&theme())
+        .with_prompt("从 GitHub 拉取最新版本并重新编译？（服务将短暂停止）")
+        .default(true)
+        .interact()?;
+    if !ok {
+        return Ok(());
+    }
+
+    println!("{} 停止服务...", style("[1/4]").cyan());
+    let _ = std::process::Command::new("sudo")
+        .args(["systemctl", "stop", SERVICE])
+        .status();
+
+    println!("{} 拉取最新代码...", style("[2/4]").cyan());
+    let pull_status = if std::path::Path::new(&format!("{}/.git", INSTALL_DIR)).exists() {
+        std::process::Command::new("git")
+            .args(["-C", INSTALL_DIR, "pull", "--ff-only"])
+            .status()
+    } else {
+        std::process::Command::new("git")
+            .args(["clone", REPO, INSTALL_DIR])
+            .status()
+    };
+
+    match pull_status {
+        Ok(s) if s.success() => println!("  {} 代码更新成功", style("✔").green()),
+        Ok(s) => {
+            println!("  {} git 退出码: {}", style("✖").red(), s.code().unwrap_or(-1));
+            println!("  正在重启服务（使用旧版本）...");
+            let _ = std::process::Command::new("sudo")
+                .args(["systemctl", "start", SERVICE])
+                .status();
+            return Ok(());
+        }
+        Err(e) => {
+            println!("  {} {e}", style("✖").red());
+            let _ = std::process::Command::new("sudo")
+                .args(["systemctl", "start", SERVICE])
+                .status();
+            return Ok(());
+        }
+    }
+
+    println!("{} 编译中（需要 1-2 分钟）...", style("[3/4]").cyan());
+
+    // 确保 cargo 在 PATH 中
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let cargo_path = format!("{home}/.cargo/bin");
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{cargo_path}:{current_path}");
+
+    let build_status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(INSTALL_DIR)
+        .env("PATH", &new_path)
+        .status();
+
+    match build_status {
+        Ok(s) if s.success() => println!("  {} 编译成功", style("✔").green()),
+        _ => {
+            println!("  {} 编译失败，使用旧版本重启", style("✖").red());
+            let _ = std::process::Command::new("sudo")
+                .args(["systemctl", "start", SERVICE])
+                .status();
+            return Ok(());
+        }
+    }
+
+    println!("{} 安装并重启服务...", style("[4/4]").cyan());
+    let bin_dir = format!("{INSTALL_DIR}/target/release");
+    let _ = std::process::Command::new("sudo")
+        .args(["cp", &format!("{bin_dir}/jy-bot"), "/usr/local/bin/jy-bot"])
+        .status();
+    let _ = std::process::Command::new("sudo")
+        .args(["cp", &format!("{bin_dir}/jy"), "/usr/local/bin/jy"])
+        .status();
+
+    let _ = std::process::Command::new("sudo")
+        .args(["systemctl", "start", SERVICE])
+        .status();
+
+    println!();
+    println!("{} 更新完成！", style("✔").green().bold());
+
+    // 显示新版本的 git log
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["-C", INSTALL_DIR, "log", "--oneline", "-3"])
+        .output()
+    {
+        println!("  最新提交:\n  {}", String::from_utf8_lossy(&out.stdout).trim().replace('\n', "\n  "));
+    }
+
+    Ok(())
 }
 
 trait StrExt {
