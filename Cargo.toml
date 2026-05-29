@@ -32,6 +32,11 @@ rand = "0.8"
 # CLI interface
 dialoguer = "0.11"
 console = "0.15"
+# 官方 Polymarket CLOB V2 客户端（实盘下单签名）
+polymarket_client_sdk_v2 = { version = "=0.6.0-canary.1", features = ["clob"] }
+alloy = { version = "1", default-features = false, features = ["signer-local", "signers"] }
+# 依赖树里同时存在 ring 与 aws-lc-rs，需在启动时显式选定 rustls 加密后端
+rustls = { version = "0.23", features = ["ring"] }
 
 [profile.release]
 opt-level = 3

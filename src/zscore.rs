@@ -23,13 +23,6 @@ impl ZSignal {
         else if self.z <= -0.15 { Some("Down") }
         else { None }
     }
-
-    /// 是否满足追仓条件（z ≥ 0.25，方向更强）
-    pub fn chase_direction(&self) -> Option<&'static str> {
-        if self.z >= 0.25 { Some("Up") }
-        else if self.z <= -0.25 { Some("Down") }
-        else { None }
-    }
 }
 
 pub struct ZScoreModel {

@@ -40,16 +40,6 @@ impl BinanceFeed {
         self.history.lock().unwrap().iter().cloned().collect()
     }
 
-    /// 最近 window_sec 秒的价格均值
-    pub fn mean_price(&self, window_sec: i64) -> Option<f64> {
-        let now = chrono::Utc::now().timestamp();
-        let cutoff = now - window_sec;
-        let h = self.history.lock().unwrap();
-        let prices: Vec<f64> = h.iter().filter(|p| p.ts >= cutoff).map(|p| p.price).collect();
-        if prices.is_empty() { return None; }
-        Some(prices.iter().sum::<f64>() / prices.len() as f64)
-    }
-
     pub fn run(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {

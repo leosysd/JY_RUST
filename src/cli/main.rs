@@ -8,8 +8,8 @@ mod feeds;
 mod position;
 #[path = "../state.rs"]
 mod state;
-#[path = "../signing.rs"]
-mod signing;
+#[path = "../executor.rs"]
+mod executor;
 #[path = "../ws.rs"]
 mod ws;
 #[path = "../zscore.rs"]
@@ -30,6 +30,7 @@ fn theme() -> ColorfulTheme {
 }
 
 fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     // 如果有子命令直接处理
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
@@ -59,8 +60,8 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
         }
         "set-bot-mode" => {
             let val = args.get(1).map(|s| s.as_str()).unwrap_or("quant");
-            set_env_val("QUANT_STRATEGY", val);
-            println!("{} QUANT_STRATEGY={val}", style("✔").green());
+            set_env_val("BOT_MODE", val);
+            println!("{} BOT_MODE={val}", style("✔").green());
         }
         "update" => update_bot()?,
         _ => {
@@ -81,7 +82,7 @@ fn interactive_menu() -> Result<()> {
         // 显示当前状态
         let running = is_service_running();
         let dry_run = read_env_val("DRY_RUN").unwrap_or("1".into());
-        let mode = read_env_val("QUANT_STRATEGY").unwrap_or("jetfadil".into());
+        let mode = read_env_val("BOT_MODE").unwrap_or_else(|| "quant".into());
         println!(
             "  服务: {}  模式: {}  DRY_RUN: {}",
             if running { style("运行中").green().bold() } else { style("已停止").red().bold() },
@@ -99,7 +100,7 @@ fn interactive_menu() -> Result<()> {
             "6. 重启服务",
             "7. 查看实时日志",
             "8. 切换 DRY_RUN 模式",
-            "9. 切换策略（jetfadil / copy）",
+            "9. 切换模式（quant / copy）",
             "u. 更新程序（从 GitHub 拉取最新版本）",
             "0. 退出",
         ];
@@ -139,8 +140,8 @@ fn edit_config() -> Result<()> {
     let curr = |key: &str| read_env_val(key).unwrap_or_default();
 
     let bot_mode: String = Input::with_theme(&theme())
-        .with_prompt("BOT_MODE (jetfadil/copy)")
-        .default(curr("QUANT_STRATEGY").into())
+        .with_prompt("BOT_MODE (quant/copy)")
+        .default({ let m = curr("BOT_MODE"); if m.is_empty() { "quant".into() } else { m } })
         .interact_text()?;
 
     let target_wallet: String = Input::with_theme(&theme())
@@ -177,7 +178,7 @@ fn edit_config() -> Result<()> {
         .interact_text()?;
 
     // 写入 .env
-    set_env_val("QUANT_STRATEGY", &bot_mode);
+    set_env_val("BOT_MODE", &bot_mode);
     if !target_wallet.is_empty() { set_env_val("TARGET_WALLET", &target_wallet); }
     if !private_key.is_empty() { set_env_val("PRIVATE_KEY", &private_key); }
     if !deposit_wallet.is_empty() { set_env_val("DEPOSIT_WALLET_ADDRESS", &deposit_wallet); }
@@ -192,10 +193,10 @@ fn edit_config() -> Result<()> {
 fn show_config() {
     println!("{}", style("── 当前配置 ──").bold());
     let keys = [
-        "QUANT_STRATEGY", "DRY_RUN", "TARGET_WALLET",
+        "BOT_MODE", "DRY_RUN", "TARGET_WALLET",
         "DEPOSIT_WALLET_ADDRESS", "COPY_RATIO",
-        "QUANT_ORDER_SHARES", "QUANT_ARBITRAGE_MIN_PROFIT",
-        "JF_MAX_ENTRY_DELAY_SEC", "CLOB_API_URL",
+        "QUANT_ORDER_SHARES", "SIGNATURE_TYPE",
+        "CLOB_API_URL", "CLOB_V2_API_URL",
     ];
     for key in &keys {
         let val = read_env_val(key).unwrap_or_else(|| "(未设置)".into());
@@ -246,19 +247,18 @@ fn toggle_dry_run() -> Result<()> {
 }
 
 fn toggle_strategy() -> Result<()> {
-    let curr = read_env_val("QUANT_STRATEGY").unwrap_or("jetfadil".into());
+    let curr = read_env_val("BOT_MODE").unwrap_or_else(|| "quant".into());
     let choice = Select::with_theme(&theme())
-        .with_prompt("选择策略")
+        .with_prompt("选择模式")
         .items(&[
-            "jetfadil - 锁利策略（复刻 JetFadil，推荐）",
-            "copy     - 跟单模式（直接复制目标地址交易）",
-            "arb      - 纯套利（仅在两边合价 < 0.935 时入场）",
+            "quant - 量化（BTC 5m 趋势追单 + 锁利，推荐）",
+            "copy  - 跟单（镜像目标地址成交）",
         ])
-        .default(match curr.as_str() { "copy" => 1, "arb" => 2, _ => 0 })
+        .default(if curr == "copy" { 1 } else { 0 })
         .interact()?;
-    let new_val = match choice { 1 => "copy", 2 => "arb", _ => "jetfadil" };
-    set_env_val("QUANT_STRATEGY", new_val);
-    println!("{} QUANT_STRATEGY={new_val}", style("✔").green());
+    let new_val = if choice == 1 { "copy" } else { "quant" };
+    set_env_val("BOT_MODE", new_val);
+    println!("{} BOT_MODE={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
         service_cmd("restart");
     }

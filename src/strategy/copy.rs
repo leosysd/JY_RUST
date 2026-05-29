@@ -1,10 +1,12 @@
-use crate::clob::{BookCache, ClobClient, OrderBook};
+use crate::clob::{ClobClient, OrderBook};
 use crate::config::Config;
+use crate::executor::OrderExecutor;
 use anyhow::Result;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 const DATA_API: &str = "https://data-api.polymarket.com";
@@ -30,18 +32,18 @@ struct Activity {
 pub struct CopyStrategy {
     config: Config,
     client: ClobClient,
-    cache: BookCache,
     seen: HashSet<String>,
+    executor: Arc<OrderExecutor>,
 }
 
 impl CopyStrategy {
-    pub fn new(config: Config, cache: BookCache) -> Self {
+    pub fn new(config: Config, executor: Arc<OrderExecutor>) -> Self {
         let client = ClobClient::new(
             &config.clob_api_url,
             &config.gamma_api_url,
             &config.market_slug_prefix,
         );
-        Self { config, client, cache, seen: HashSet::new() }
+        Self { config, client, seen: HashSet::new(), executor }
     }
 
     pub async fn bootstrap(&mut self) -> Result<()> {
@@ -107,6 +109,11 @@ impl CopyStrategy {
         if target_size.is_zero() || target_price.is_zero() {
             return Ok(());
         }
+        // 目前只镜像 BUY（建仓）；SELL（平仓）暂不跟，避免误用 buy 执行器
+        if side != "BUY" {
+            info!("[COPY SKIP] {title} | {outcome} | {side}（暂不跟卖出）");
+            return Ok(());
+        }
 
         let copy_size = (target_size * self.config.copy_ratio)
             .round_dp(4);
@@ -134,9 +141,15 @@ impl CopyStrategy {
             self.config.copy_ratio
         );
 
-        if !self.config.dry_run {
-            // TODO: 调用签名下单
-            info!("[COPY] 实盘下单待实现");
+        let price_f64 = copy_price.to_string().parse::<f64>().unwrap_or(0.0);
+        let shares_f64 = copy_size.to_string().parse::<f64>().unwrap_or(0.0);
+        match self.executor.buy(&token_id, price_f64, shares_f64).await {
+            Ok(fill) if fill.simulated => {} // DRY_RUN：已在上方日志体现
+            Ok(fill) => info!(
+                "[COPY ORDER] {title} id={} status={} ok={}",
+                fill.order_id, fill.status, fill.success
+            ),
+            Err(e) => warn!("[COPY ORDER ERR] {title}: {e}"),
         }
 
         Ok(())

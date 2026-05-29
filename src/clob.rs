@@ -23,11 +23,6 @@ impl Market {
         (self.end_ts - now).max(0)
     }
 
-    pub fn seconds_elapsed(&self) -> i64 {
-        let now = chrono::Utc::now().timestamp();
-        (now - self.start_ts).max(0)
-    }
-
     pub fn token_for(&self, outcome: &str) -> Option<&str> {
         self.outcomes
             .iter()
@@ -63,8 +58,6 @@ pub struct ClobClient {
     pub clob_api: String,
     pub gamma_api: String,
     pub slug_prefix: String,
-    /// 用于查询 Chainlink 开盘价的 feed 引用（可选）
-    pub chainlink: Option<crate::feeds::ChainlinkFeed>,
 }
 
 impl ClobClient {
@@ -78,18 +71,7 @@ impl ClobClient {
             clob_api: clob_api.to_string(),
             gamma_api: gamma_api.to_string(),
             slug_prefix: slug_prefix.to_string(),
-            chainlink: None,
         }
-    }
-
-    pub fn with_chainlink(mut self, feed: crate::feeds::ChainlinkFeed) -> Self {
-        self.chainlink = Some(feed);
-        self
-    }
-
-    /// 查询 Chainlink 在指定时间戳附近的价格（Price to Beat）
-    pub fn chainlink_at_ts(&self, ts: i64) -> Option<f64> {
-        self.chainlink.as_ref()?.at_ts(ts)
     }
 
     pub async fn find_current_market(&self) -> Option<Market> {
@@ -188,21 +170,6 @@ impl ClobClient {
         }
 
         Ok(parse_book(&resp))
-    }
-
-    pub async fn get_book(&self, token_id: &str, cache: &BookCache) -> Result<OrderBook> {
-        {
-            let guard = cache.read().await;
-            if let Some(b) = guard.get(token_id) {
-                return Ok(b.clone());
-            }
-        }
-        let book = self.fetch_book(token_id).await?;
-        {
-            let mut guard = cache.write().await;
-            guard.insert(token_id.to_string(), book.clone());
-        }
-        Ok(book)
     }
 }
 

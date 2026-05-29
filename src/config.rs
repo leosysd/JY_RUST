@@ -7,6 +7,7 @@ use std::str::FromStr;
 pub struct Config {
     // 链/API
     pub clob_api_url: String,
+    pub clob_v2_api_url: String,
     pub gamma_api_url: String,
     pub chain_id: u64,
     pub signature_type: u8,
@@ -82,10 +83,22 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         _ => None,
     };
     let dry_run = env_bool("DRY_RUN", true);
-    let bot_mode = env("QUANT_STRATEGY", "jetfadil").to_lowercase();
+    // 模式：copy=跟单，其余=量化(smart)
+    let bot_mode = match env("BOT_MODE", &env("QUANT_STRATEGY", "quant")).to_lowercase().as_str() {
+        "copy" => "copy".to_string(),
+        _ => "quant".to_string(),
+    };
+    let signature_type: u8 = env("SIGNATURE_TYPE", "3").parse().unwrap_or(3);
 
-    if !dry_run && private_key.is_none() {
-        bail!("DRY_RUN=0 时必须设置 PRIVATE_KEY");
+    // 实盘前置校验：DRY_RUN=0 必须有 PRIVATE_KEY；用代理钱包(sig_type≠0)还必须有 DEPOSIT_WALLET_ADDRESS。
+    // API creds 由官方 SDK 在启动时用私钥自动派生/校验（见 executor::OrderExecutor::new）。
+    if !dry_run {
+        if private_key.is_none() {
+            bail!("DRY_RUN=0 时必须设置 PRIVATE_KEY");
+        }
+        if signature_type != 0 && deposit_wallet.is_none() {
+            bail!("DRY_RUN=0 且 SIGNATURE_TYPE={signature_type}（代理钱包）时必须设置 DEPOSIT_WALLET_ADDRESS");
+        }
     }
 
     let base = PathBuf::from(
@@ -96,9 +109,10 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
 
     Ok(Config {
         clob_api_url: env("CLOB_API_URL", "https://clob.polymarket.com"),
+        clob_v2_api_url: env("CLOB_V2_API_URL", "https://clob-v2.polymarket.com"),
         gamma_api_url: env("GAMMA_API_URL", "https://gamma-api.polymarket.com"),
         chain_id: env_u64("CHAIN_ID", 137),
-        signature_type: env("SIGNATURE_TYPE", "3").parse().unwrap_or(3),
+        signature_type,
         private_key,
         deposit_wallet,
         dry_run,

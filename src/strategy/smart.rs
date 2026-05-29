@@ -1,13 +1,15 @@
 use crate::clob::{BookCache, ClobClient, Market};
 use crate::config::Config;
+use crate::executor::OrderExecutor;
 use crate::feeds::{BinanceFeed, ChainlinkFeed};
 use crate::position::{full_cost_per_share, taker_fee, MarketPosition, Phase, TradeRecord};
 use crate::state::SmartStateStore;
 use crate::ws::MarketWs;
 use crate::zscore::ZScoreModel;
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
@@ -42,6 +44,7 @@ pub struct SmartStrategy {
     pub first_allowed_start: i64,
     pub ws: MarketWs,
     pub cached_market: Option<Market>,
+    pub executor: Arc<OrderExecutor>,
 }
 
 impl SmartStrategy {
@@ -51,6 +54,7 @@ impl SmartStrategy {
         chainlink: ChainlinkFeed,
         binance: BinanceFeed,
         ws: MarketWs,
+        executor: Arc<OrderExecutor>,
     ) -> Result<Self> {
         let state = SmartStateStore::load(config.state_file.clone()).await?;
         let client = ClobClient::new(
@@ -63,7 +67,7 @@ impl SmartStrategy {
         Ok(Self {
             config, state, client, cache, model,
             signal_file, first_allowed_start, ws,
-            cached_market: None,
+            cached_market: None, executor,
         })
     }
 
@@ -312,6 +316,34 @@ impl SmartStrategy {
 
     // ── 通用：买入（不切换 Locked）────────────────────────────────────────
 
+    /// 下单（真实或模拟）。返回 true 表示可以记账，false 表示下单失败应跳过本次记账。
+    async fn place_order(
+        &self,
+        market: &Market,
+        dir: &str,
+        price: f64,
+        shares: f64,
+        phase_label: &str,
+    ) -> bool {
+        let Some(token) = market.token_for(dir) else {
+            warn!("[SMART] {} 找不到 {dir} 的 token_id，跳过下单", market.title);
+            return false;
+        };
+        match self.executor.buy(token, price, shares).await {
+            Ok(fill) => {
+                if !fill.simulated {
+                    info!("[SMART ORDER] {} {dir} {phase_label} id={} status={} ok={}",
+                        market.title, fill.order_id, fill.status, fill.success);
+                }
+                fill.success
+            }
+            Err(e) => {
+                warn!("[SMART ORDER ERR] {} {dir} {phase_label}: {e}", market.title);
+                false
+            }
+        }
+    }
+
     async fn do_buy(
         &mut self,
         market: &Market,
@@ -321,6 +353,11 @@ impl SmartStrategy {
         phase_label: &str,
         price_to_beat: f64,
     ) -> Result<()> {
+        // 真实/模拟下单（DRY_RUN 模拟立即成交；LIVE 真实提交，失败则不记账、下轮重试）
+        if !self.place_order(market, dir, price, shares, phase_label).await {
+            return Ok(());
+        }
+
         let fee    = taker_fee(price);
         let full_c = full_cost_per_share(price);
         let trade = TradeRecord {
@@ -359,8 +396,6 @@ impl SmartStrategy {
         projected_pnl: f64,
         phase_label: &str,
     ) -> Result<()> {
-        let fee    = taker_fee(price);
-        let full_c = full_cost_per_share(price);
         let mode   = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         let secs   = (pos.end_ts - chrono::Utc::now().timestamp()).max(0);
 
@@ -368,6 +403,14 @@ impl SmartStrategy {
             "[SMART LOCK {mode} {}] {} {dir}@{price:.3} ×{shares:.0}份  worst_pnl≈${projected_pnl:+.2}  T-{secs}s",
             phase_label.to_uppercase(), market.title
         );
+
+        // 真实/模拟下单
+        if !self.place_order(market, dir, price, shares, phase_label).await {
+            return Ok(());
+        }
+
+        let fee    = taker_fee(price);
+        let full_c = full_cost_per_share(price);
         let trade = TradeRecord {
             side: dir.to_string(), shares, price,
             fee_per_share: fee, full_cost_per_share: full_c,

@@ -76,55 +76,6 @@ impl MarketPosition {
         self.down_cost_total / self.down_shares
     }
 
-    /// 当前加入新仓后，是否仍然可以锁利润
-    /// new_side: 要追的方向
-    /// new_shares: 追的份数
-    /// new_price: 追的价格
-    /// opp_ask: 对立方向当前盘口价格
-    pub fn can_chase_then_lock(
-        &self,
-        new_side: &str,
-        new_shares: f64,
-        new_price: f64,
-        opp_ask: f64,
-        target_profit_per_share: f64,
-    ) -> bool {
-        let new_full = full_cost_per_share(new_price);
-        let opp_full = full_cost_per_share(opp_ask);
-
-        let new_avg = if new_side == "Up" {
-            (self.up_cost_total + new_shares * new_full) / (self.up_shares + new_shares)
-        } else {
-            (self.down_cost_total + new_shares * new_full) / (self.down_shares + new_shares)
-        };
-
-        new_avg + opp_full < 1.0 - target_profit_per_share
-    }
-
-    /// 是否可以锁利润（买对立方向）
-    /// opp_ask: 对立方向当前价
-    /// target: 期望锁定的利润/份（如 0.02）
-    pub fn can_lock_profit(&self, opp_ask: f64, target: f64) -> bool {
-        let a = if self.up_shares > 0.0 { self.up_avg_full() }
-                else { self.down_avg_full() };
-        let d = full_cost_per_share(opp_ask);
-        a + d < 1.0 - target
-    }
-
-    /// 锁亏损：买多少份对立方向，把 Down 赢时的亏损控制在 max_loss
-    /// 公式：q_D = (q_U × a* - L) / (1 - d*)
-    pub fn loss_lock_shares(&self, opp_ask: f64, max_loss: f64) -> f64 {
-        let (q_main, a) = if self.up_shares > 0.0 {
-            (self.up_shares, self.up_avg_full())
-        } else {
-            (self.down_shares, self.down_avg_full())
-        };
-        let d = full_cost_per_share(opp_ask);
-        let numerator = q_main * a - max_loss;
-        if numerator <= 0.0 || d >= 1.0 { return 0.0; }
-        (numerator / (1.0 - d)).max(0.0)
-    }
-
     /// 添加一笔交易
     pub fn add_trade(&mut self, trade: TradeRecord) {
         if trade.side == "Up" {
@@ -137,17 +88,6 @@ impl MarketPosition {
         self.trades.push(trade);
     }
 
-    /// 预计锁定损益（如果现在以 opp_ask 买对立方向同等份数）
-    pub fn projected_locked_pnl(&self, opp_ask: f64) -> f64 {
-        let (q, a) = if self.up_shares > 0.0 {
-            (self.up_shares, self.up_avg_full())
-        } else {
-            (self.down_shares, self.down_avg_full())
-        };
-        let d = full_cost_per_share(opp_ask);
-        q * (1.0 - a - d)
-    }
-
     /// 如果 Up 赢，当前已有仓位的 PnL
     pub fn pnl_if_up_wins(&self) -> f64 {
         self.up_shares * (1.0 - self.up_avg_full())
@@ -158,11 +98,6 @@ impl MarketPosition {
     pub fn pnl_if_down_wins(&self) -> f64 {
         self.down_shares * (1.0 - self.down_avg_full())
             - self.up_cost_total
-    }
-
-    /// 总已投入成本
-    pub fn total_invested(&self) -> f64 {
-        self.up_cost_total + self.down_cost_total
     }
 
     /// 当前最坏情形 PnL（无论谁赢都取较差那个）
