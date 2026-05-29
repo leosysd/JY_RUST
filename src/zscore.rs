@@ -42,6 +42,16 @@ impl ZScoreModel {
         Self { chainlink, binance }
     }
 
+    /// 获取指定时间戳附近的 Chainlink 价格
+    pub fn chainlink_at(&self, ts: i64) -> Option<f64> {
+        self.chainlink.at_ts(ts)
+    }
+
+    /// 获取最新 Chainlink 价格
+    pub fn chainlink_latest(&self) -> Option<f64> {
+        self.chainlink.latest().map(|p| p.price)
+    }
+
     /// 计算当前 z-score 信号
     /// price_to_beat: 本轮开盘时的 Chainlink 价格 (B)
     /// seconds_left: 距结算剩余秒数

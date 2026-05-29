@@ -112,18 +112,20 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // Price to Beat：开盘 Chainlink 价
-        let price_to_beat = match self.client.chainlink_at_ts(market.start_ts) {
-            Some(p) => p,
-            None => {
-                // 用当前 Up ask 近似（首次启动时 Chainlink 可能还未缓存到开盘价）
-                1.0 - dn_ask
-            }
-        };
+        // Price to Beat = 开盘时 Chainlink BTC/USD 价格
+        // 优先用开盘时刻的缓存价；若没有则用当前最新价（开盘即为当前价）
+        let price_to_beat = self.model.chainlink_at(market.start_ts)
+            .or_else(|| self.model.chainlink_latest())
+            .unwrap_or(0.0);
 
-        // 计算 z-score
+        if price_to_beat < 1000.0 {
+            info!("[SMART] {} Chainlink 数据未就绪（B={:.0}），跳过入场", market.title, price_to_beat);
+            return Ok(());
+        }
+
+        // 计算 z-score（需要至少 10 秒的 Binance 数据）
         let Some(sig) = self.model.compute(price_to_beat, seconds_left) else {
-            info!("[SMART] {} 价格数据不足，跳过入场", market.title);
+            info!("[SMART] {} 价格数据不足（需等待约10s），跳过入场", market.title);
             return Ok(());
         };
 
