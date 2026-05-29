@@ -160,6 +160,11 @@ fn edit_config() -> Result<()> {
         .default(if curr("DRY_RUN") == "0" { 1 } else { 0 })
         .interact()?;
 
+    let order_shares: String = Input::with_theme(&theme())
+        .with_prompt("QUANT_ORDER_SHARES（每笔份数，测试实盘建议先填 1）")
+        .default(curr("QUANT_ORDER_SHARES").if_empty("20").into())
+        .interact_text()?;
+
     let copy_ratio: String = Input::with_theme(&theme())
         .with_prompt("COPY_RATIO（跟单比例，仅 copy 模式）")
         .default(curr("COPY_RATIO").if_empty("1.0").into())
@@ -171,6 +176,7 @@ fn edit_config() -> Result<()> {
     if !private_key.is_empty() { set_env_val("PRIVATE_KEY", &private_key); }
     if !deposit_wallet.is_empty() { set_env_val("DEPOSIT_WALLET_ADDRESS", &deposit_wallet); }
     set_env_val("DRY_RUN", if dry_run_choice == 0 { "1" } else { "0" });
+    set_env_val("QUANT_ORDER_SHARES", &order_shares);
     set_env_val("COPY_RATIO", &copy_ratio);
 
     println!("{} 配置已保存到 {ENV_PATH}", style("✔").green());
