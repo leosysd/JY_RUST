@@ -46,6 +46,8 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
             service_cmd(action);
         }
         "logs" => show_logs(50),
+        "stats" => show_stats(),
+        "clear" => clear_sim_data()?,
         "status" => service_cmd("status"),
         "start" => service_cmd("start"),
         "stop" => service_cmd("stop"),
@@ -92,17 +94,19 @@ fn interactive_menu() -> Result<()> {
         println!();
 
         let items = vec![
-            "1. 初始化/修改配置",
-            "2. 查看当前配置",
-            "3. 测试 API 连接",
-            "4. 启动服务",
-            "5. 停止服务",
-            "6. 重启服务",
-            "7. 查看实时日志",
-            "8. 切换 DRY_RUN 模式",
-            "9. 切换模式（quant / copy）",
-            "u. 更新程序（从 GitHub 拉取最新版本）",
-            "0. 退出",
+            "1.  初始化/修改配置",
+            "2.  查看当前配置",
+            "3.  测试 API 连接",
+            "4.  交易统计表",
+            "5.  启动服务",
+            "6.  停止服务",
+            "7.  重启服务",
+            "8.  查看实时日志",
+            "9.  切换 DRY_RUN 模式",
+            "10. 切换模式（quant / copy）",
+            "11. 清空模拟数据",
+            "12. 更新程序（从 GitHub 拉取最新版本）",
+            "0.  退出",
         ];
 
         let sel = Select::with_theme(&theme())
@@ -116,18 +120,20 @@ fn interactive_menu() -> Result<()> {
             0 => edit_config()?,
             1 => show_config(),
             2 => test_connection()?,
-            3 => service_cmd("start"),
-            4 => service_cmd("stop"),
-            5 => service_cmd("restart"),
-            6 => {
+            3 => show_stats(),
+            4 => service_cmd("start"),
+            5 => service_cmd("stop"),
+            6 => service_cmd("restart"),
+            7 => {
                 show_logs(30);
                 println!("\n{}", style("（按 Ctrl+C 停止日志）").dim());
                 live_logs();
             }
-            7 => toggle_dry_run()?,
-            8 => toggle_strategy()?,
-            9 => update_bot()?,
-            10 => break,
+            8 => toggle_dry_run()?,
+            9 => toggle_strategy()?,
+            10 => clear_sim_data()?,
+            11 => update_bot()?,
+            12 => break,
             _ => {}
         }
     }
@@ -302,6 +308,167 @@ fn is_service_running() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+// ── 交易统计 ──────────────────────────────────────────────────────────────
+
+fn state_file_path() -> PathBuf {
+    let f = read_env_val("QUANT_STATE_FILE").unwrap_or_else(|| "quant_state.json".into());
+    let p = PathBuf::from(&f);
+    if p.is_absolute() {
+        p
+    } else {
+        PathBuf::from(ENV_PATH)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(f)
+    }
+}
+
+/// 北京时间 HH:MM（按 UTC 时间戳 +8h）
+fn bj_hm(ts: i64) -> String {
+    let bj = ts + 8 * 3600;
+    format!("{:02}:{:02}", (bj / 3600) % 24, (bj / 60) % 60)
+}
+
+/// 显示宽度：CJK/全角算 2，其余算 1
+fn dwidth(s: &str) -> usize {
+    s.chars().map(|c| if (c as u32) >= 0x2E80 { 2 } else { 1 }).sum()
+}
+
+fn pad(s: &str, w: usize) -> String {
+    let d = dwidth(s);
+    if d >= w { s.to_string() } else { format!("{}{}", s, " ".repeat(w - d)) }
+}
+
+fn render_table(headers: &[&str], rows: &[Vec<String>]) {
+    let cols = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| dwidth(h)).collect();
+    for r in rows {
+        for (i, c) in r.iter().enumerate().take(cols) {
+            widths[i] = widths[i].max(dwidth(c));
+        }
+    }
+    let sep: String = format!("+{}+", widths.iter().map(|w| "-".repeat(w + 2)).collect::<Vec<_>>().join("+"));
+    let line = |cells: &[String]| -> String {
+        let mut out = String::from("|");
+        for (i, c) in cells.iter().enumerate().take(cols) {
+            out.push_str(&format!(" {} |", pad(c, widths[i])));
+        }
+        out
+    };
+    println!("{sep}");
+    println!("{}", line(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>()));
+    println!("{sep}");
+    for r in rows {
+        println!("{}", line(r));
+    }
+    println!("{sep}");
+}
+
+fn show_stats() {
+    let path = state_file_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => { println!("{} 读取状态文件失败 {}: {e}", style("✖").red(), path.display()); return; }
+    };
+    let positions: std::collections::HashMap<String, position::MarketPosition> =
+        match serde_json::from_str(&text) {
+            Ok(p) => p,
+            Err(e) => { println!("{} 解析失败: {e}", style("✖").red()); return; }
+        };
+
+    // 按盘口开始时间排序
+    let mut markets: Vec<&position::MarketPosition> =
+        positions.values().filter(|p| !p.trades.is_empty()).collect();
+    markets.sort_by_key(|p| p.end_ts);
+
+    if markets.is_empty() {
+        println!("{} 暂无交易记录", style("ℹ").cyan());
+        return;
+    }
+
+    let headers = ["盘口时间", "交易秒", "方向", "份额", "价格", "成本", "锁利", "结果", "盈亏"];
+    let mut rows: Vec<Vec<String>> = Vec::new();
+
+    let (mut total, mut win, mut lose, mut locked, mut holding) = (0, 0, 0, 0, 0);
+    let mut net_pnl = 0.0f64;
+
+    for m in &markets {
+        let start_ts = m.end_ts - 300;
+        let label = format!("{}~{}", bj_hm(start_ts), bj_hm(m.end_ts));
+        let n = m.trades.len();
+
+        match m.realized_pnl {
+            Some(p) => { total += 1; net_pnl += p; if p >= 0.0 { win += 1 } else { lose += 1 } }
+            None => match format!("{:?}", m.phase).as_str() {
+                "Locked" => locked += 1,
+                _ => holding += 1,
+            },
+        }
+
+        for (i, t) in m.trades.iter().enumerate() {
+            let is_last = i == n - 1;
+            let lock_flag = if t.phase.starts_with("lock") || t.phase == "arb_lock" { "✓" } else { "" };
+            let (result, pnl) = if is_last {
+                let r = m.winner.clone().unwrap_or_else(|| match format!("{:?}", m.phase).as_str() {
+                    "Locked" => "锁定中".into(),
+                    _ => "持仓中".into(),
+                });
+                let p = m.realized_pnl.map(|v| format!("{v:+.2}")).unwrap_or_else(|| "-".into());
+                (r, p)
+            } else {
+                (String::new(), String::new())
+            };
+            rows.push(vec![
+                if i == 0 { label.clone() } else { String::new() },
+                (t.ts - start_ts).to_string(),
+                t.side.to_lowercase(),
+                format!("{:.2}", t.shares),
+                format!("{:.3}", t.price),
+                format!("{:.2}", t.total_cost),
+                lock_flag.to_string(),
+                result,
+                pnl,
+            ]);
+        }
+    }
+
+    render_table(&headers, &rows);
+    println!(
+        "\n  已结算 {} 盘  胜 {} / 负 {}   锁定中 {}  持仓中 {}",
+        total, win, lose, locked, holding
+    );
+    let pnl_styled = if net_pnl >= 0.0 {
+        style(format!("${net_pnl:+.2}")).green().bold()
+    } else {
+        style(format!("${net_pnl:+.2}")).red().bold()
+    };
+    println!("  已实现净盈亏: {pnl_styled}");
+}
+
+fn clear_sim_data() -> Result<()> {
+    let path = state_file_path();
+    if !Confirm::with_theme(&theme())
+        .with_prompt(format!("确认清空模拟数据 {}？", path.display()))
+        .default(false)
+        .interact()?
+    {
+        println!("{} 已取消", style("✖").yellow());
+        return Ok(());
+    }
+    // 必须先停服务：运行中的 bot 会把内存里的旧持仓 save() 回去，导致清空被覆盖
+    let was_running = is_service_running();
+    if was_running {
+        service_cmd("stop");
+    }
+    std::fs::write(&path, "{}\n")?;
+    println!("{} 已清空 {}", style("✔").green(), path.display());
+    if was_running {
+        service_cmd("start");
+        println!("{} 服务已重新启动，从空状态开始", style("✔").green());
+    }
+    Ok(())
 }
 
 fn read_env_val(key: &str) -> Option<String> {
