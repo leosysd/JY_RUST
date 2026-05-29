@@ -11,12 +11,21 @@ use std::path::PathBuf;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
-const TARGET_PROFIT_PER_SHARE: f64 = 0.02;   // 锁利润门槛 2¢/份
-const ENTRY_MAX_ASK: f64 = 0.53;              // 标准入场最高价（接近50/50）
-const EXTREME_ENTRY_ASK: f64 = 0.22;         // 极端价格入场（均值回归）
-const ENTRY_MIN_SECONDS_LEFT: i64 = 60;       // 最后60秒不做首单
-const MAX_SHARES_PER_SIDE: f64 = 40.0;        // 单边最大累积份额
-const MICRO_LOT_DIVISOR: f64 = 4.0;           // 微批 = order_shares / 4
+// ── 策略参数 ──────────────────────────────────────────────────────────────
+// 锁利门槛：提高到 5¢/份，避免在 50/50 时立即以微利锁定
+const TARGET_PROFIT_PER_SHARE: f64 = 0.05;
+// 标准入场价上限（z-score 路径）
+const ENTRY_MAX_ASK: f64 = 0.53;
+// 极端价格阈值：一边 ≤ 此价时触发均值回归积累
+const EXTREME_BUY_THRESHOLD: f64 = 0.25;
+// 最后多少秒不做新首单
+const ENTRY_MIN_SECONDS_LEFT: i64 = 60;
+// 单边最大积累份额（防止无限加仓）
+const MAX_SHARES_PER_SIDE: f64 = 80.0;
+// 微批份额 = order_shares / 4（用于积累阶段）
+const MICRO_LOT_DIVISOR: f64 = 4.0;
+// JetFadil 积累：每多少秒尝试一次双边买入
+const ACCUMULATE_INTERVAL_SEC: i64 = 30;
 
 pub struct SmartStrategy {
     pub config: Config,
@@ -28,6 +37,8 @@ pub struct SmartStrategy {
     pub first_allowed_start: i64,
     pub ws: MarketWs,
     pub cached_market: Option<Market>,
+    /// 上次积累买入的时间戳（避免每秒都买）
+    pub last_accumulate_ts: i64,
 }
 
 impl SmartStrategy {
@@ -45,7 +56,12 @@ impl SmartStrategy {
         let now = chrono::Utc::now().timestamp();
         let first_allowed_start = ((now / 300) + 1) * 300;
 
-        Ok(Self { config, state, client, cache, model, signal_file, first_allowed_start, ws, cached_market: None })
+        Ok(Self {
+            config, state, client, cache, model, signal_file,
+            first_allowed_start, ws,
+            cached_market: None,
+            last_accumulate_ts: 0,
+        })
     }
 
     pub async fn run_once(&mut self) -> Result<()> {
@@ -103,13 +119,21 @@ impl SmartStrategy {
         let is_new = self.cached_market.as_ref().map(|m| m.slug != market.slug).unwrap_or(true);
         if is_new {
             self.ws.ensure_subscribed(&market.token_ids).await;
+            self.last_accumulate_ts = 0;
             info!("[SMART] 新盘口 {} 已订阅WS", market.slug);
         }
         self.cached_market = Some(market.clone());
         Some(market)
     }
 
-    // ── 阶段1：入场决策 ────────────────────────────────────────────────────
+    // ── 阶段1：首单入场 ────────────────────────────────────────────────────
+    //
+    // 两条路径：
+    //  A. JetFadil 路径：任意一边价格 ≤ EXTREME_BUY_THRESHOLD（0.25），
+    //     说明市场已极端偏向，用微批买入便宜边（份额多），等价格修正。
+    //     z-score 不强烈反对时进入。
+    //
+    //  B. 标准路径：价格接近 50/50，z-score 方向明确，买满 order_shares。
 
     async fn try_entry(
         &mut self,
@@ -130,42 +154,38 @@ impl SmartStrategy {
         }
 
         let sig = self.model.compute(price_to_beat, seconds_left);
-        let order_shares = self.config.order_shares.to_string().parse::<f64>().unwrap_or(20.0);
-        let micro_lot = (order_shares / MICRO_LOT_DIVISOR).max(1.0);
+        let order_shares = self.order_shares();
+        let micro = (order_shares / MICRO_LOT_DIVISOR).max(1.0);
 
-        // ── 路径A：极端价格入场（均值回归）─────────────────────────────────
-        // 当一边价格 ≤ 0.22，该边被市场严重低估，逆势买入便宜份额
-        let extreme = if up_ask <= EXTREME_ENTRY_ASK && up_ask <= dn_ask {
+        // ── 路径A：极端价格，JetFadil 式便宜份额积累 ───────────────────────
+        let extreme = if up_ask <= EXTREME_BUY_THRESHOLD && up_ask <= dn_ask {
             Some(("Up", up_ask))
-        } else if dn_ask <= EXTREME_ENTRY_ASK {
+        } else if dn_ask <= EXTREME_BUY_THRESHOLD {
             Some(("Down", dn_ask))
         } else {
             None
         };
 
         if let Some((dir, cheap_ask)) = extreme {
-            // z-score 过滤：不要对抗确认趋势（|z| > 0.35 且方向相反时跳过）
+            // 不对抗明确趋势（z 强烈反对则跳过）
             let trend_ok = sig.as_ref().map(|s| match dir {
-                "Up"   => s.z > -0.35,
-                _      => s.z <  0.35,
+                "Up"   => s.z > -0.40,
+                _      => s.z <  0.40,
             }).unwrap_or(true);
 
             if trend_ok {
-                let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
                 let z_str = sig.as_ref().map(|s| format!("{:.3}", s.z)).unwrap_or("-".into());
+                let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
                 info!(
-                    "[SMART EXTREME {mode}] {} {dir}@{cheap_ask:.3} ×{micro_lot:.0}份  z={z_str}  T-{seconds_left}s  (均值回归入场)",
-                    market.title
+                    "[SMART EXTREME {mode}] {} {dir}@{cheap_ask:.3} ×{micro:.0}份  z={z_str}  T-{seconds_left}s  每$买{:.1}份",
+                    market.title, 1.0 / cheap_ask
                 );
-                self.do_buy(&market, dir, cheap_ask, micro_lot, "entry").await?;
+                self.do_buy(&market, dir, cheap_ask, micro, "entry_extreme", price_to_beat).await?;
                 return Ok(());
             }
-            info!("[SMART] {} 极端价格但趋势过强（z={:.3}），跳过极端入场",
-                market.title,
-                sig.as_ref().map(|s| s.z).unwrap_or(0.0));
         }
 
-        // ── 路径B：标准 z-score 入场（接近50/50，方向明确）──────────────────
+        // ── 路径B：标准 z-score 入场，使用完整 order_shares ────────────────
         if up_ask > ENTRY_MAX_ASK && dn_ask > ENTRY_MAX_ASK { return Ok(()); }
 
         let Some(sig) = sig else {
@@ -190,18 +210,23 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // 标准入场用 order_shares/2（小化单次风险）
-        let std_lot = (order_shares / 2.0).max(1.0);
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         info!(
-            "[SMART ENTRY {mode}] {} {dir}@{entry_ask:.3} ×{std_lot:.0}份  z={:.3} p={entry_p:.3}  T-{seconds_left}s",
+            "[SMART ENTRY {mode}] {} {dir}@{entry_ask:.3} ×{order_shares:.0}份  z={:.3} p={entry_p:.3}  T-{seconds_left}s",
             market.title, sig.z
         );
-        self.do_buy(&market, dir, entry_ask, std_lot, "entry").await?;
+        self.do_buy(&market, dir, entry_ask, order_shares, "entry", price_to_beat).await?;
         Ok(())
     }
 
-    // ── 阶段2：持仓管理（锁利 / 累积 / 锁亏）──────────────────────────────
+    // ── 阶段2：持仓管理 ────────────────────────────────────────────────────
+    //
+    // 优先级：
+    //  1. 锁利（a*+d* < 1-TARGET_PROFIT_PER_SHARE）
+    //  2. JetFadil积累：每 ACCUMULATE_INTERVAL_SEC 秒，
+    //     对价格 ≤ EXTREME_BUY_THRESHOLD 的一边微量买入（两边都可以）
+    //  3. 标准追仓（z强信号 + 追完仍可锁利）
+    //  4. 60s强制锁亏
 
     async fn try_manage(
         &mut self,
@@ -213,25 +238,22 @@ impl SmartStrategy {
     ) -> Result<()> {
         let has_up   = pos.up_shares > 0.0;
         let has_down = pos.down_shares > 0.0;
+        let order_shares = self.order_shares();
+        let micro = (order_shares / MICRO_LOT_DIVISOR).max(1.0);
 
-        // 双边都有 → 检查是否可以锁利/锁亏后结束
+        // 双边都有 → 检查是否可锁利或到期锁定
         if has_up && has_down {
-            // 计算当前双边 PnL
-            let proj_up_wins   = pos.pnl_if_up_wins();
-            let proj_down_wins = pos.pnl_if_down_wins();
-            let worst = proj_up_wins.min(proj_down_wins);
-
-            // 已经锁定（两边都有且都不能追加了）
+            let up_wins   = pos.pnl_if_up_wins();
+            let down_wins = pos.pnl_if_down_wins();
             info!(
-                "[SMART] {} 双边持仓  Up={:.0}@{:.3} Down={:.0}@{:.3}  Up赢={:+.2} Down赢={:+.2}  T-{seconds_left}s",
+                "[SMART] {} 双边 Up={:.0}@{:.3} Down={:.0}@{:.3}  Up赢={:+.2} Down赢={:+.2}  T-{seconds_left}s",
                 market.title,
                 pos.up_shares, pos.up_avg_full(),
                 pos.down_shares, pos.down_avg_full(),
-                proj_up_wins, proj_down_wins
+                up_wins, down_wins
             );
-
-            // 如果两边都有 且 已达到锁定条件（最差情形也正赢或接受），转 Locked
-            if seconds_left <= 60 || worst >= -0.5 {
+            // 最差情形 > -0.5 或最后60秒 → 直接锁定
+            if seconds_left <= 60 || up_wins.min(down_wins) >= -0.5 {
                 let p = self.state.get_or_create(&market.slug, market.end_ts);
                 p.phase = Phase::Locked;
                 self.state.save().await?;
@@ -239,82 +261,92 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        let (main_dir, opp_dir, main_ask, opp_ask) = if has_up {
-            ("Up", "Down", up_ask, dn_ask)
-        } else {
-            ("Down", "Up", dn_ask, up_ask)
-        };
+        let (main_dir, opp_dir, main_ask, opp_ask) =
+            if has_up  { ("Up",   "Down", up_ask, dn_ask) }
+            else        { ("Down", "Up",   dn_ask, up_ask) };
 
-        let order_shares = self.config.order_shares.to_string().parse::<f64>().unwrap_or(20.0);
-        let micro_lot = (order_shares / MICRO_LOT_DIVISOR).max(1.0);
         let main_shares = if has_up { pos.up_shares } else { pos.down_shares };
 
-        // ── 1. 优先：锁利润 ────────────────────────────────────────────────
+        // ── 1. 锁利 ──────────────────────────────────────────────────────
         if pos.can_lock_profit(opp_ask, TARGET_PROFIT_PER_SHARE) {
             let proj = pos.projected_locked_pnl(opp_ask);
+            info!(
+                "[SMART] {} 可锁利 a*={:.3} opp@{:.3} 预计PNL={:+.2}  T-{seconds_left}s",
+                market.title, pos.up_avg_full().max(pos.down_avg_full()), opp_ask, proj
+            );
             self.do_lock(&market, &pos, opp_dir, opp_ask, main_shares, proj, "lock_profit").await?;
             return Ok(());
         }
 
-        // ── 2. 主边继续便宜 → 微量累积 ────────────────────────────────────
-        if main_ask <= EXTREME_ENTRY_ASK && main_shares < MAX_SHARES_PER_SIDE && seconds_left > 90 {
-            let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
-            info!(
-                "[SMART ACCUM {mode}] {} 继续累积 {main_dir}@{main_ask:.3} ×{micro_lot:.0}份  已有{main_shares:.0}份  T-{seconds_left}s",
-                market.title
-            );
-            self.do_buy(&market, main_dir, main_ask, micro_lot, "accumulate").await?;
-            return Ok(());
+        // ── 2. JetFadil 积累：定时对便宜边微量买入 ───────────────────────
+        //    每 ACCUMULATE_INTERVAL_SEC 秒执行一次，两边都可以买
+        let now = chrono::Utc::now().timestamp();
+        if seconds_left > 90
+            && now - self.last_accumulate_ts >= ACCUMULATE_INTERVAL_SEC
+        {
+            // 先看主边有没有继续变便宜
+            if main_ask <= EXTREME_BUY_THRESHOLD && main_shares < MAX_SHARES_PER_SIDE {
+                let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+                info!(
+                    "[SMART ACCUM {mode}] {} 主边{main_dir}@{main_ask:.3} 继续便宜，+{micro:.0}份  已有{main_shares:.0}份  T-{seconds_left}s",
+                    market.title
+                );
+                self.do_buy(&market, main_dir, main_ask, micro, "accumulate", pos.price_to_beat).await?;
+                self.last_accumulate_ts = now;
+                return Ok(());
+            }
+
+            // 再看对边有没有也变便宜（JetFadil 核心：两边都买）
+            let opp_shares = if has_up { pos.down_shares } else { pos.up_shares };
+            if opp_ask <= EXTREME_BUY_THRESHOLD && opp_shares < MAX_SHARES_PER_SIDE {
+                let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+                let proj = pos.projected_locked_pnl(opp_ask);
+                info!(
+                    "[SMART ACCUM {mode}] {} 对边{opp_dir}@{opp_ask:.3} 也便宜，+{micro:.0}份（双边积累）  预计最差PNL≈{proj:+.2}  T-{seconds_left}s",
+                    market.title
+                );
+                self.do_buy(&market, opp_dir, opp_ask, micro, "accumulate_opp", pos.price_to_beat).await?;
+                self.last_accumulate_ts = now;
+                return Ok(());
+            }
         }
 
-        // ── 3. 对边也变便宜 → 便宜对冲，降低方向风险 ──────────────────────
-        if opp_ask <= EXTREME_ENTRY_ASK && seconds_left > 90 {
-            let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
-            let proj = pos.projected_locked_pnl(opp_ask);
-            info!(
-                "[SMART HEDGE {mode}] {} 对边也便宜！买 {opp_dir}@{opp_ask:.3} ×{micro_lot:.0}份  预计最差PnL≈{proj:+.2}  T-{seconds_left}s",
-                market.title
-            );
-            self.do_buy(&market, opp_dir, opp_ask, micro_lot, "cheap_hedge").await?;
-            return Ok(());
-        }
-
-        // ── 4. 标准追仓（z-score 强信号 + 仍可锁利）──────────────────────
+        // ── 3. 标准追仓（z > 0.25 + 追完仍可锁利 + 未超上限）────────────
         if seconds_left > 30 {
             if let Some(sig) = self.model.compute(pos.price_to_beat, seconds_left) {
-                if sig.chase_direction() == Some(main_dir) {
-                    let chase_lot = micro_lot;
-                    if pos.can_chase_then_lock(main_dir, chase_lot, main_ask, opp_ask, TARGET_PROFIT_PER_SHARE)
-                       && main_shares < MAX_SHARES_PER_SIDE {
+                if sig.chase_direction() == Some(main_dir) && main_shares < MAX_SHARES_PER_SIDE {
+                    if pos.can_chase_then_lock(main_dir, micro, main_ask, opp_ask, TARGET_PROFIT_PER_SHARE) {
                         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
                         info!(
-                            "[SMART CHASE {mode}] {} {main_dir}@{main_ask:.3} ×{chase_lot:.0}份  z={:.3}  T-{seconds_left}s",
+                            "[SMART CHASE {mode}] {} {main_dir}@{main_ask:.3} ×{micro:.0}份  z={:.3}  T-{seconds_left}s",
                             market.title, sig.z
                         );
-                        self.do_buy(&market, main_dir, main_ask, chase_lot, "chase").await?;
+                        self.do_buy(&market, main_dir, main_ask, micro, "chase", pos.price_to_beat).await?;
                         return Ok(());
                     }
                 }
             }
         }
 
-        // ── 5. 60s 到期强制锁仓 ────────────────────────────────────────────
+        // ── 4. 60s 到期强制锁亏 ──────────────────────────────────────────
         if seconds_left <= 60 {
             let proj = pos.projected_locked_pnl(opp_ask);
             self.do_lock(&market, &pos, opp_dir, opp_ask, main_shares, proj, "lock_loss").await?;
             return Ok(());
         }
 
-        // 继续等待
+        // 等待
         let a = pos.up_avg_full().max(pos.down_avg_full());
         info!(
-            "[SMART] {} {main_dir}仓 {main_shares:.0}份@{a:.3}  opp@{opp_ask:.3}  a+d={:.3}  T-{seconds_left}s",
-            market.title, a + full_cost_per_share(opp_ask)
+            "[SMART] {} {main_dir}{main_shares:.0}份@{a:.3}  opp@{opp_ask:.3}  a+d={:.3}  需<{:.2}才锁利  T-{seconds_left}s",
+            market.title,
+            a + full_cost_per_share(opp_ask),
+            1.0 - TARGET_PROFIT_PER_SHARE
         );
         Ok(())
     }
 
-    // ── 通用：买入（不切换phase） ──────────────────────────────────────────
+    // ── 通用：买入 ────────────────────────────────────────────────────────
 
     async fn do_buy(
         &mut self,
@@ -323,35 +355,37 @@ impl SmartStrategy {
         price: f64,
         shares: f64,
         phase_label: &str,
+        price_to_beat: f64,
     ) -> Result<()> {
-        let fee   = taker_fee(price);
+        let fee    = taker_fee(price);
         let full_c = full_cost_per_share(price);
 
         let trade = TradeRecord {
             side: dir.to_string(), shares, price,
             fee_per_share: fee, full_cost_per_share: full_c,
-            total_cost: full_c * shares, phase: phase_label.to_string(),
-            ts: chrono::Utc::now().timestamp(), time_bj: beijing_now(),
+            total_cost: full_c * shares,
+            phase: phase_label.to_string(),
+            ts: chrono::Utc::now().timestamp(),
+            time_bj: beijing_now(),
         };
         self.write_signal(&serde_json::json!({
             "phase": phase_label, "market": market.slug,
             "direction": dir, "price": price, "shares": shares,
+            "shares_per_dollar": 1.0 / price,
             "dry_run": self.config.dry_run, "ts": trade.ts,
         })).await?;
 
         let pos = self.state.get_or_create(&market.slug, market.end_ts);
         pos.add_trade(trade);
         if matches!(pos.phase, Phase::Waiting) {
-            pos.price_to_beat = self.model.chainlink_at(market.start_ts)
-                .or_else(|| self.model.chainlink_latest())
-                .unwrap_or(0.0);
+            pos.price_to_beat = price_to_beat;
             pos.phase = Phase::Holding;
         }
         self.state.save().await?;
         Ok(())
     }
 
-    // ── 锁仓（切换 Phase::Locked） ─────────────────────────────────────────
+    // ── 锁仓 ──────────────────────────────────────────────────────────────
 
     async fn do_lock(
         &mut self,
@@ -363,9 +397,9 @@ impl SmartStrategy {
         projected_pnl: f64,
         phase_label: &str,
     ) -> Result<()> {
-        let fee   = taker_fee(opp_ask);
+        let fee    = taker_fee(opp_ask);
         let full_c = full_cost_per_share(opp_ask);
-        let mode  = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+        let mode   = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         let seconds_left = (pos.end_ts - chrono::Utc::now().timestamp()).max(0);
 
         info!(
@@ -380,9 +414,11 @@ impl SmartStrategy {
             ts: chrono::Utc::now().timestamp(), time_bj: beijing_now(),
         };
         self.write_signal(&serde_json::json!({
-            "phase": phase_label, "market": market.slug, "direction": opp_dir,
-            "price": opp_ask, "shares": shares, "projected_pnl": projected_pnl,
-            "seconds_left": seconds_left, "dry_run": self.config.dry_run, "ts": trade.ts,
+            "phase": phase_label, "market": market.slug,
+            "direction": opp_dir, "price": opp_ask, "shares": shares,
+            "projected_pnl": projected_pnl,
+            "seconds_left": seconds_left,
+            "dry_run": self.config.dry_run, "ts": trade.ts,
         })).await?;
 
         let pos = self.state.get_or_create(&market.slug, market.end_ts);
@@ -392,7 +428,7 @@ impl SmartStrategy {
         Ok(())
     }
 
-    // ── 结算 ───────────────────────────────────────────────────────────────
+    // ── 结算 ──────────────────────────────────────────────────────────────
 
     async fn check_settlements(&mut self) -> Result<()> {
         let pending = self.state.pending_settlement();
@@ -431,6 +467,10 @@ impl SmartStrategy {
                 s.total, s.locked, s.win, s.lose, s.total_pnl);
         }
         Ok(())
+    }
+
+    fn order_shares(&self) -> f64 {
+        self.config.order_shares.to_string().parse::<f64>().unwrap_or(20.0)
     }
 
     async fn write_signal(&self, v: &serde_json::Value) -> Result<()> {
