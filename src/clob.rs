@@ -63,6 +63,8 @@ pub struct ClobClient {
     pub clob_api: String,
     pub gamma_api: String,
     pub slug_prefix: String,
+    /// 用于查询 Chainlink 开盘价的 feed 引用（可选）
+    pub chainlink: Option<crate::feeds::ChainlinkFeed>,
 }
 
 impl ClobClient {
@@ -76,7 +78,18 @@ impl ClobClient {
             clob_api: clob_api.to_string(),
             gamma_api: gamma_api.to_string(),
             slug_prefix: slug_prefix.to_string(),
+            chainlink: None,
         }
+    }
+
+    pub fn with_chainlink(mut self, feed: crate::feeds::ChainlinkFeed) -> Self {
+        self.chainlink = Some(feed);
+        self
+    }
+
+    /// 查询 Chainlink 在指定时间戳附近的价格（Price to Beat）
+    pub fn chainlink_at_ts(&self, ts: i64) -> Option<f64> {
+        self.chainlink.as_ref()?.at_ts(ts)
     }
 
     pub async fn find_current_market(&self) -> Option<Market> {

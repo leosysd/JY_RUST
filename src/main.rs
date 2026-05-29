@@ -1,13 +1,16 @@
 mod clob;
 mod config;
-mod signing;
+mod feeds;
+mod position;
 mod state;
 mod strategy;
 mod ws;
+mod zscore;
 
 use anyhow::Result;
 use clob::new_book_cache;
-use strategy::{copy::CopyStrategy, jetfadil::JetFadilStrategy};
+use feeds::{BinanceFeed, ChainlinkFeed};
+use strategy::smart::SmartStrategy;
 use tracing::{error, info};
 use ws::MarketWs;
 
@@ -20,11 +23,10 @@ async fn main() -> Result<()> {
 
     let env_path = std::env::args().nth(1);
     let config = config::load(env_path.as_deref())?;
-    let mode = &config.bot_mode;
 
     info!(
-        "[JY-BOT] mode={mode} dry_run={} strategy={}",
-        config.dry_run, config.bot_mode
+        "[JY-BOT] strategy=smart dry_run={} shares={}",
+        config.dry_run, config.order_shares
     );
     if config.dry_run {
         info!("[MODE] DRY_RUN=1，只打印，不真实下单。");
@@ -33,38 +35,31 @@ async fn main() -> Result<()> {
     }
 
     let cache = new_book_cache();
+
+    // 价格数据源
+    let chainlink = ChainlinkFeed::new();
+    let binance   = BinanceFeed::new();
+
+    // 启动后台数据流
+    let _cl_handle = chainlink.clone().run();
+    let _bn_handle = binance.clone().run();
+
+    // WebSocket 盘口缓存
     let ws = MarketWs::new(&config.market_ws_url, cache.clone());
     let _ws_handle = ws.run();
 
-    let poll = tokio::time::Duration::from_millis(config.poll_ms);
+    // 初始化策略
+    let mut strategy = SmartStrategy::new(
+        config.clone(), cache, chainlink, binance
+    ).await?;
 
-    match mode.as_str() {
-        "copy" => {
-            info!("[JY-BOT] 跟单模式: target={}", config.target_wallet);
-            let mut strategy = CopyStrategy::new(config, cache);
-            strategy.bootstrap().await?;
-            info!("[JY-BOT] 开始轮询，间隔 {}ms", poll.as_millis());
-            loop {
-                if let Err(e) = strategy.run_once().await {
-                    error!("[COPY ERROR] {e}");
-                }
-                tokio::time::sleep(poll).await;
-            }
+    let poll = tokio::time::Duration::from_millis(config.poll_ms);
+    info!("[JY-BOT] 开始轮询，间隔 {}ms", config.poll_ms);
+
+    loop {
+        if let Err(e) = strategy.run_once().await {
+            error!("[JY-BOT ERROR] {e}");
         }
-        _ => {
-            // jetfadil / arb / combo - 默认 JetFadil
-            info!(
-                "[JY-BOT] JetFadil 策略: shares={} min_lock_profit={} max_entry_delay={}s",
-                config.order_shares, config.min_lock_profit, config.max_entry_delay_sec
-            );
-            let mut strategy = JetFadilStrategy::new(config.clone(), cache).await?;
-            info!("[JY-BOT] 开始轮询，间隔 {}ms", poll.as_millis());
-            loop {
-                if let Err(e) = strategy.run_once().await {
-                    error!("[JY-BOT ERROR] {e}");
-                }
-                tokio::time::sleep(poll).await;
-            }
-        }
+        tokio::time::sleep(poll).await;
     }
 }

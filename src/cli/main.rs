@@ -2,12 +2,18 @@
 mod config;
 #[path = "../clob.rs"]
 mod clob;
+#[path = "../feeds/mod.rs"]
+mod feeds;
+#[path = "../position.rs"]
+mod position;
 #[path = "../state.rs"]
 mod state;
 #[path = "../signing.rs"]
 mod signing;
 #[path = "../ws.rs"]
 mod ws;
+#[path = "../zscore.rs"]
+mod zscore;
 #[path = "../strategy/mod.rs"]
 mod strategy;
 

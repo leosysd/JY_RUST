@@ -1,2 +1,1 @@
-pub mod copy;
-pub mod jetfadil;
+pub mod smart;
