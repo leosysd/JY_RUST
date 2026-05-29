@@ -164,4 +164,27 @@ impl MarketPosition {
     pub fn total_invested(&self) -> f64 {
         self.up_cost_total + self.down_cost_total
     }
+
+    /// 当前最坏情形 PnL（无论谁赢都取较差那个）
+    pub fn worst_pnl(&self) -> f64 {
+        self.pnl_if_up_wins().min(self.pnl_if_down_wins())
+    }
+
+    /// 假设再买 `shares` 份 `side` 方向（价格 `price`），最坏情形 PnL 会变成多少
+    pub fn worst_pnl_if_add(&self, side: &str, price: f64, shares: f64) -> f64 {
+        let full_c = full_cost_per_share(price);
+        let cost   = full_c * shares;
+        let (us, uc, ds, dc) = if side == "Up" {
+            (self.up_shares + shares, self.up_cost_total + cost,
+             self.down_shares,        self.down_cost_total)
+        } else {
+            (self.up_shares,   self.up_cost_total,
+             self.down_shares + shares, self.down_cost_total + cost)
+        };
+        let ua = if us > 0.0 { uc / us } else { 0.0 };
+        let da = if ds > 0.0 { dc / ds } else { 0.0 };
+        let pnl_up  = us * (1.0 - ua) - dc;
+        let pnl_dn  = ds * (1.0 - da) - uc;
+        pnl_up.min(pnl_dn)
+    }
 }
