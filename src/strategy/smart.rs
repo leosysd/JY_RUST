@@ -12,20 +12,27 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 // ── 策略参数 ──────────────────────────────────────────────────────────────
-// 锁利门槛：提高到 5¢/份，避免在 50/50 时立即以微利锁定
-const TARGET_PROFIT_PER_SHARE: f64 = 0.05;
-// 标准入场价上限（z-score 路径）
-const ENTRY_MAX_ASK: f64 = 0.53;
-// 极端价格阈值：一边 ≤ 此价时触发均值回归积累
-const EXTREME_BUY_THRESHOLD: f64 = 0.25;
-// 最后多少秒不做新首单
-const ENTRY_MIN_SECONDS_LEFT: i64 = 60;
-// 单边最大积累份额（防止无限加仓）
-const MAX_SHARES_PER_SIDE: f64 = 80.0;
-// 微批份额 = order_shares / 4（用于积累阶段）
-const MICRO_LOT_DIVISOR: f64 = 4.0;
-// JetFadil 积累：价格比上次买入再低多少才触发下一笔
-const ACCUMULATE_STEP: f64 = 0.05;
+//
+// 策略核心：趋势追单 + 对边便宜时锁利
+//
+// 逻辑：
+//  1. z-score 确认方向（如 BTC 上涨 → 追 Up）
+//  2. 当趋势方向价格在 [0.48, 0.70] 区间内，首单买入 order_shares 份
+//  3. 每当价格再上涨 0.05，追加一笔（最多 5 笔 = 最大 100 份）
+//  4. 对边价格跌到可以锁利（a*+d* < 0.95）时，等额买入对边 → 锁定利润
+//  5. 最后 60s 仍未锁利 → 强制等额锁仓（可能锁亏）
+//
+// 核算示例（Up 连追5笔，涨到 0.75 锁利）：
+//  追单总成本 ≈ $61.69（100份 Up，均价 0.617）
+//  锁利成本   ≈ $26.31（100份 Down@0.25）
+//  锁利后保底 ≈ +$12.00（无论谁赢，ROI 13.6%）
+
+const TARGET_PROFIT_PER_SHARE: f64 = 0.05; // 锁利门槛 5¢/份（a*+d* < 0.95）
+const TREND_ENTRY_MIN: f64 = 0.48;         // 首单入场价下限
+const TREND_ENTRY_MAX: f64 = 0.70;         // 追单价格上限（>0.70 不追）
+const TREND_STEP: f64 = 0.05;              // 价格每涨 0.05 追一笔
+const MAX_TREND_TRADES: usize = 5;         // 最多追 5 笔
+const ENTRY_MIN_SECONDS_LEFT: i64 = 60;    // 最后 60s 不开新首单
 
 pub struct SmartStrategy {
     pub config: Config,
@@ -37,9 +44,6 @@ pub struct SmartStrategy {
     pub first_allowed_start: i64,
     pub ws: MarketWs,
     pub cached_market: Option<Market>,
-    /// 各边上次积累时的买入价（价格跌过一个 step 才再买）
-    pub last_accum_price_up: f64,
-    pub last_accum_price_dn: f64,
 }
 
 impl SmartStrategy {
@@ -51,18 +55,20 @@ impl SmartStrategy {
         ws: MarketWs,
     ) -> Result<Self> {
         let state = SmartStateStore::load(config.state_file.clone()).await?;
-        let client = ClobClient::new(&config.clob_api_url, &config.gamma_api_url, &config.market_slug_prefix);
+        let client = ClobClient::new(
+            &config.clob_api_url,
+            &config.gamma_api_url,
+            &config.market_slug_prefix,
+        );
         let model = ZScoreModel::new(chainlink, binance);
         let signal_file = config.signal_file.clone();
         let now = chrono::Utc::now().timestamp();
         let first_allowed_start = ((now / 300) + 1) * 300;
 
         Ok(Self {
-            config, state, client, cache, model, signal_file,
-            first_allowed_start, ws,
+            config, state, client, cache, model,
+            signal_file, first_allowed_start, ws,
             cached_market: None,
-            last_accum_price_up: 1.0,
-            last_accum_price_dn: 1.0,
         })
     }
 
@@ -87,28 +93,24 @@ impl SmartStrategy {
         let (up_ask, dn_ask) = {
             let cache = self.cache.read().await;
             let Some(ua) = cache.get(&up_token).and_then(|b| b.best_ask()) else {
-                info!("[SMART] {} WS盘口未就绪，等待推送...", market.title);
+                info!("[SMART] {} WS盘口未就绪...", market.title);
                 return Ok(());
             };
             let Some(da) = cache.get(&dn_token).and_then(|b| b.best_ask()) else {
-                info!("[SMART] {} WS盘口未就绪，等待推送...", market.title);
+                info!("[SMART] {} WS盘口未就绪...", market.title);
                 return Ok(());
             };
-            (f64::from(ua.try_into().unwrap_or(0.5f32)), f64::from(da.try_into().unwrap_or(0.5f32)))
+            (f64::from(ua.try_into().unwrap_or(0.5f32)),
+             f64::from(da.try_into().unwrap_or(0.5f32)))
         };
 
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
 
         match pos.phase {
-            Phase::Waiting => {
-                self.try_entry(&market, pos, up_ask, dn_ask, seconds_left).await?;
-            }
-            Phase::Holding => {
-                self.try_manage(&market, pos, up_ask, dn_ask, seconds_left).await?;
-            }
+            Phase::Waiting  => self.try_entry(&market, pos, up_ask, dn_ask, seconds_left).await?,
+            Phase::Holding  => self.try_manage(&market, pos, up_ask, dn_ask, seconds_left).await?,
             Phase::Locked | Phase::Settled => {}
         }
-
         Ok(())
     }
 
@@ -118,11 +120,11 @@ impl SmartStrategy {
             if now < m.end_ts { return Some(m.clone()); }
         }
         let market = self.client.find_current_market().await?;
-        let is_new = self.cached_market.as_ref().map(|m| m.slug != market.slug).unwrap_or(true);
+        let is_new = self.cached_market.as_ref()
+            .map(|m| m.slug != market.slug)
+            .unwrap_or(true);
         if is_new {
             self.ws.ensure_subscribed(&market.token_ids).await;
-            self.last_accum_price_up = 1.0;
-            self.last_accum_price_dn = 1.0;
             info!("[SMART] 新盘口 {} 已订阅WS", market.slug);
         }
         self.cached_market = Some(market.clone());
@@ -131,12 +133,8 @@ impl SmartStrategy {
 
     // ── 阶段1：首单入场 ────────────────────────────────────────────────────
     //
-    // 两条路径：
-    //  A. JetFadil 路径：任意一边价格 ≤ EXTREME_BUY_THRESHOLD（0.25），
-    //     说明市场已极端偏向，用微批买入便宜边（份额多），等价格修正。
-    //     z-score 不强烈反对时进入。
-    //
-    //  B. 标准路径：价格接近 50/50，z-score 方向明确，买满 order_shares。
+    // z-score 确认方向，趋势方向价格在 [TREND_ENTRY_MIN, TREND_ENTRY_MAX] 时入场。
+    // 入场份额 = order_shares（CLI 可配置，默认 20 份）。
 
     async fn try_entry(
         &mut self,
@@ -151,85 +149,56 @@ impl SmartStrategy {
         let price_to_beat = self.model.chainlink_at(market.start_ts)
             .or_else(|| self.model.chainlink_latest())
             .unwrap_or(0.0);
+
         if price_to_beat < 1000.0 {
-            info!("[SMART] {} Chainlink未就绪，跳过", market.title);
+            info!("[SMART] {} Chainlink未就绪，跳过入场", market.title);
             return Ok(());
         }
 
-        let sig = self.model.compute(price_to_beat, seconds_left);
-        let order_shares = self.order_shares();
-        let micro = (order_shares / MICRO_LOT_DIVISOR).max(1.0);
-
-        // ── 路径A：极端价格，JetFadil 式便宜份额积累 ───────────────────────
-        let extreme = if up_ask <= EXTREME_BUY_THRESHOLD && up_ask <= dn_ask {
-            Some(("Up", up_ask))
-        } else if dn_ask <= EXTREME_BUY_THRESHOLD {
-            Some(("Down", dn_ask))
-        } else {
-            None
-        };
-
-        if let Some((dir, cheap_ask)) = extreme {
-            // 不对抗明确趋势（z 强烈反对则跳过）
-            let trend_ok = sig.as_ref().map(|s| match dir {
-                "Up"   => s.z > -0.40,
-                _      => s.z <  0.40,
-            }).unwrap_or(true);
-
-            if trend_ok {
-                let z_str = sig.as_ref().map(|s| format!("{:.3}", s.z)).unwrap_or("-".into());
-                let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
-                info!(
-                    "[SMART EXTREME {mode}] {} {dir}@{cheap_ask:.3} ×{micro:.0}份  z={z_str}  T-{seconds_left}s  每$买{:.1}份",
-                    market.title, 1.0 / cheap_ask
-                );
-                self.do_buy(&market, dir, cheap_ask, micro, "entry_extreme", price_to_beat).await?;
-                return Ok(());
-            }
-        }
-
-        // ── 路径B：标准 z-score 入场，使用完整 order_shares ────────────────
-        if up_ask > ENTRY_MAX_ASK && dn_ask > ENTRY_MAX_ASK { return Ok(()); }
-
-        let Some(sig) = sig else {
+        let Some(sig) = self.model.compute(price_to_beat, seconds_left) else {
             info!("[SMART] {} 价格数据不足，跳过入场", market.title);
             return Ok(());
         };
+
         let Some(dir) = sig.direction() else {
             info!("[SMART] {} z={:.3} 信号不足，不入场", market.title, sig.z);
             return Ok(());
         };
 
-        let (entry_ask, _) = if dir == "Up" { (up_ask, dn_ask) } else { (dn_ask, up_ask) };
-        if entry_ask > ENTRY_MAX_ASK {
-            info!("[SMART] {} {}@{:.3} 偏贵，等待", market.title, dir, entry_ask);
+        let entry_ask = if dir == "Up" { up_ask } else { dn_ask };
+
+        if entry_ask < TREND_ENTRY_MIN {
+            info!(
+                "[SMART] {} {dir}@{entry_ask:.3} < {TREND_ENTRY_MIN}，市场已极端偏向，不追",
+                market.title
+            );
+            return Ok(());
+        }
+        if entry_ask > TREND_ENTRY_MAX {
+            info!(
+                "[SMART] {} {dir}@{entry_ask:.3} > {TREND_ENTRY_MAX}，价格过高不追",
+                market.title
+            );
             return Ok(());
         }
 
-        let required_p = full_cost_per_share(entry_ask) + 0.01;
-        let entry_p = if dir == "Up" { sig.p_up } else { sig.p_down };
-        if entry_p < required_p.max(0.55) {
-            info!("[SMART] {} {}@{:.3} p={:.3}<{:.3}，跳过", market.title, dir, entry_ask, entry_p, required_p);
-            return Ok(());
-        }
-
+        let shares = self.order_shares();
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         info!(
-            "[SMART ENTRY {mode}] {} {dir}@{entry_ask:.3} ×{order_shares:.0}份  z={:.3} p={entry_p:.3}  T-{seconds_left}s",
+            "[SMART ENTRY {mode}] {} {dir}@{entry_ask:.3} ×{shares:.0}份  z={:.3}  T-{seconds_left}s",
             market.title, sig.z
         );
-        self.do_buy(&market, dir, entry_ask, order_shares, "entry", price_to_beat).await?;
+        self.do_buy(&market, dir, entry_ask, shares, "entry", price_to_beat).await?;
         Ok(())
     }
 
-    // ── 阶段2：持仓管理 ────────────────────────────────────────────────────
+    // ── 阶段2：趋势追单 + 锁利管理 ─────────────────────────────────────────
     //
     // 优先级：
-    //  1. 锁利（a*+d* < 1-TARGET_PROFIT_PER_SHARE）
-    //  2. JetFadil积累：每 ACCUMULATE_INTERVAL_SEC 秒，
-    //     对价格 ≤ EXTREME_BUY_THRESHOLD 的一边微量买入（两边都可以）
-    //  3. 标准追仓（z强信号 + 追完仍可锁利）
-    //  4. 60s强制锁亏
+    //  1. 锁利：a* + d* < 0.95 → 等额买入对边，锁定利润
+    //  2. 趋势追单：趋势方向价格比上笔又涨了 TREND_STEP(0.05)，且未超过 TREND_ENTRY_MAX
+    //     → 再买 order_shares 份（最多追 MAX_TREND_TRADES 笔）
+    //  3. 60s 强制锁仓（可能锁亏，对边等额买入）
 
     async fn try_manage(
         &mut self,
@@ -241,123 +210,86 @@ impl SmartStrategy {
     ) -> Result<()> {
         let has_up   = pos.up_shares > 0.0;
         let has_down = pos.down_shares > 0.0;
-        let order_shares = self.order_shares();
-        let micro = (order_shares / MICRO_LOT_DIVISOR).max(1.0);
 
-        // 双边都有 → 检查是否可锁利或到期锁定
+        // 双边都有 → 已完成锁仓，打印状态等结算
         if has_up && has_down {
             let up_wins   = pos.pnl_if_up_wins();
             let down_wins = pos.pnl_if_down_wins();
             info!(
-                "[SMART] {} 双边 Up={:.0}@{:.3} Down={:.0}@{:.3}  Up赢={:+.2} Down赢={:+.2}  T-{seconds_left}s",
+                "[SMART] {} 已锁仓 Up={:.0}@{:.3} Down={:.0}@{:.3} Up赢={:+.2} Down赢={:+.2} T-{seconds_left}s",
                 market.title,
                 pos.up_shares, pos.up_avg_full(),
                 pos.down_shares, pos.down_avg_full(),
                 up_wins, down_wins
             );
-            // 最差情形 > -0.5 或最后60秒 → 直接锁定
-            if seconds_left <= 60 || up_wins.min(down_wins) >= -0.5 {
-                let p = self.state.get_or_create(&market.slug, market.end_ts);
-                p.phase = Phase::Locked;
-                self.state.save().await?;
-            }
+            let p = self.state.get_or_create(&market.slug, market.end_ts);
+            p.phase = Phase::Locked;
+            self.state.save().await?;
             return Ok(());
         }
 
-        let (main_dir, opp_dir, main_ask, opp_ask) =
-            if has_up  { ("Up",   "Down", up_ask, dn_ask) }
-            else        { ("Down", "Up",   dn_ask, up_ask) };
+        let (trend_dir, opp_dir, trend_ask, opp_ask) = if has_up {
+            ("Up",   "Down", up_ask, dn_ask)
+        } else {
+            ("Down", "Up",   dn_ask, up_ask)
+        };
 
-        let main_shares = if has_up { pos.up_shares } else { pos.down_shares };
+        let trend_shares = if has_up { pos.up_shares } else { pos.down_shares };
+        let shares = self.order_shares();
 
-        // ── 1. 锁利 ──────────────────────────────────────────────────────
+        // ── 1. 锁利（最优先）─────────────────────────────────────────────
         if pos.can_lock_profit(opp_ask, TARGET_PROFIT_PER_SHARE) {
             let proj = pos.projected_locked_pnl(opp_ask);
+            let a = pos.up_avg_full().max(pos.down_avg_full());
             info!(
-                "[SMART] {} 可锁利 a*={:.3} opp@{:.3} 预计PNL={:+.2}  T-{seconds_left}s",
-                market.title, pos.up_avg_full().max(pos.down_avg_full()), opp_ask, proj
+                "[SMART] {} 触发锁利！{trend_dir}{trend_shares:.0}份 a*={:.3} opp@{opp_ask:.3} d*={:.3} a+d={:.3} 预计+${proj:.2} T-{seconds_left}s",
+                market.title, a,
+                full_cost_per_share(opp_ask),
+                a + full_cost_per_share(opp_ask)
             );
-            self.do_lock(&market, &pos, opp_dir, opp_ask, main_shares, proj, "lock_profit").await?;
+            self.do_lock(&market, &pos, opp_dir, opp_ask, trend_shares, proj, "lock_profit").await?;
             return Ok(());
         }
 
-        // ── 2. JetFadil 积累：价格跌到新低档位就买 ──────────────────────
-        //    不用定时器，而是追踪各边上次买入价：
-        //    当前价 ≤ 上次买入价 - ACCUMULATE_STEP 时触发下一笔
-        //    这样价格每下跌 0.05 就自动买入一笔，完全跟随市场
-        if seconds_left > 90 {
-            let last_up = self.last_accum_price_up;
-            let last_dn = self.last_accum_price_dn;
+        // ── 2. 趋势追单 ───────────────────────────────────────────────────
+        // 当趋势方向价格比上笔买入再涨了 TREND_STEP，且总笔数未超上限
+        let trend_trades: Vec<_> = pos.trades.iter()
+            .filter(|t| t.side == trend_dir && !t.phase.contains("lock"))
+            .collect();
+        let trade_count = trend_trades.len();
+        let last_trend_price = trend_trades.last().map(|t| t.price).unwrap_or(0.0);
 
-            // 主边继续下跌
-            if main_ask <= EXTREME_BUY_THRESHOLD
-                && main_ask <= last_up.min(last_dn) - ACCUMULATE_STEP  // 比上次买入（任意边）更低
-                && main_shares < MAX_SHARES_PER_SIDE
-            {
-                let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
-                info!(
-                    "[SMART ACCUM {mode}] {} 主边{main_dir}@{main_ask:.3}（上次{:.3}，又低{:.2}）+{micro:.0}份  T-{seconds_left}s",
-                    market.title,
-                    if main_dir == "Up" { last_up } else { last_dn },
-                    ACCUMULATE_STEP
-                );
-                self.do_buy(&market, main_dir, main_ask, micro, "accumulate", pos.price_to_beat).await?;
-                if main_dir == "Up" { self.last_accum_price_up = main_ask; }
-                else                { self.last_accum_price_dn = main_ask; }
-                return Ok(());
-            }
-
-            // 对边也跌到便宜区（JetFadil 核心：两边都买）
-            let opp_shares = if has_up { pos.down_shares } else { pos.up_shares };
-            let last_opp = if has_up { last_dn } else { last_up };
-            if opp_ask <= EXTREME_BUY_THRESHOLD
-                && opp_ask <= last_opp - ACCUMULATE_STEP
-                && opp_shares < MAX_SHARES_PER_SIDE
-            {
-                let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
-                let proj = pos.projected_locked_pnl(opp_ask);
-                info!(
-                    "[SMART ACCUM {mode}] {} 对边{opp_dir}@{opp_ask:.3}（上次{last_opp:.3}，又低{:.2}）+{micro:.0}份 双边积累  最差PNL≈{proj:+.2}  T-{seconds_left}s",
-                    market.title, ACCUMULATE_STEP
-                );
-                self.do_buy(&market, opp_dir, opp_ask, micro, "accumulate_opp", pos.price_to_beat).await?;
-                if opp_dir == "Up" { self.last_accum_price_up = opp_ask; }
-                else               { self.last_accum_price_dn = opp_ask; }
-                return Ok(());
-            }
+        if trade_count < MAX_TREND_TRADES
+            && trend_ask >= last_trend_price + TREND_STEP
+            && trend_ask <= TREND_ENTRY_MAX
+            && seconds_left > ENTRY_MIN_SECONDS_LEFT
+        {
+            let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+            info!(
+                "[SMART TREND {mode}] {} 追单 {trend_dir}@{trend_ask:.3}（上笔{last_trend_price:.3}+{TREND_STEP}）×{shares:.0}份  第{}/{}笔  T-{seconds_left}s",
+                market.title,
+                trade_count + 1, MAX_TREND_TRADES
+            );
+            self.do_buy(&market, trend_dir, trend_ask, shares, "trend_chase", pos.price_to_beat).await?;
+            return Ok(());
         }
 
-        // ── 3. 标准追仓（z > 0.25 + 追完仍可锁利 + 未超上限）────────────
-        if seconds_left > 30 {
-            if let Some(sig) = self.model.compute(pos.price_to_beat, seconds_left) {
-                if sig.chase_direction() == Some(main_dir) && main_shares < MAX_SHARES_PER_SIDE {
-                    if pos.can_chase_then_lock(main_dir, micro, main_ask, opp_ask, TARGET_PROFIT_PER_SHARE) {
-                        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
-                        info!(
-                            "[SMART CHASE {mode}] {} {main_dir}@{main_ask:.3} ×{micro:.0}份  z={:.3}  T-{seconds_left}s",
-                            market.title, sig.z
-                        );
-                        self.do_buy(&market, main_dir, main_ask, micro, "chase", pos.price_to_beat).await?;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        // ── 4. 60s 到期强制锁亏 ──────────────────────────────────────────
+        // ── 3. 60s 强制锁仓 ───────────────────────────────────────────────
         if seconds_left <= 60 {
             let proj = pos.projected_locked_pnl(opp_ask);
-            self.do_lock(&market, &pos, opp_dir, opp_ask, main_shares, proj, "lock_loss").await?;
+            let label = if proj >= 0.0 { "lock_profit" } else { "lock_loss" };
+            self.do_lock(&market, &pos, opp_dir, opp_ask, trend_shares, proj, label).await?;
             return Ok(());
         }
 
         // 等待
         let a = pos.up_avg_full().max(pos.down_avg_full());
+        let d = full_cost_per_share(opp_ask);
         info!(
-            "[SMART] {} {main_dir}{main_shares:.0}份@{a:.3}  opp@{opp_ask:.3}  a+d={:.3}  需<{:.2}才锁利  T-{seconds_left}s",
+            "[SMART] {} {trend_dir}{trend_shares:.0}份@{a:.3} opp@{opp_ask:.3}  a+d={:.3}（需<{:.2}才锁利）  第{}/{}笔  T-{seconds_left}s",
             market.title,
-            a + full_cost_per_share(opp_ask),
-            1.0 - TARGET_PROFIT_PER_SHARE
+            a + d, 1.0 - TARGET_PROFIT_PER_SHARE,
+            trade_count, MAX_TREND_TRADES
         );
         Ok(())
     }
@@ -375,7 +307,6 @@ impl SmartStrategy {
     ) -> Result<()> {
         let fee    = taker_fee(price);
         let full_c = full_cost_per_share(price);
-
         let trade = TradeRecord {
             side: dir.to_string(), shares, price,
             fee_per_share: fee, full_cost_per_share: full_c,
@@ -387,7 +318,7 @@ impl SmartStrategy {
         self.write_signal(&serde_json::json!({
             "phase": phase_label, "market": market.slug,
             "direction": dir, "price": price, "shares": shares,
-            "shares_per_dollar": 1.0 / price,
+            "full_cost": full_c, "total_cost": full_c * shares,
             "dry_run": self.config.dry_run, "ts": trade.ts,
         })).await?;
 
@@ -416,10 +347,10 @@ impl SmartStrategy {
         let fee    = taker_fee(opp_ask);
         let full_c = full_cost_per_share(opp_ask);
         let mode   = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
-        let seconds_left = (pos.end_ts - chrono::Utc::now().timestamp()).max(0);
+        let secs   = (pos.end_ts - chrono::Utc::now().timestamp()).max(0);
 
         info!(
-            "[SMART LOCK {mode} {}] {} {opp_dir}@{opp_ask:.3} ×{shares:.0}份  预计PNL≈${projected_pnl:+.2}  T-{seconds_left}s",
+            "[SMART LOCK {mode} {}] {} {opp_dir}@{opp_ask:.3} ×{shares:.0}份  预计PNL≈${projected_pnl:+.2}  T-{secs}s",
             phase_label.to_uppercase(), market.title
         );
 
@@ -432,8 +363,7 @@ impl SmartStrategy {
         self.write_signal(&serde_json::json!({
             "phase": phase_label, "market": market.slug,
             "direction": opp_dir, "price": opp_ask, "shares": shares,
-            "projected_pnl": projected_pnl,
-            "seconds_left": seconds_left,
+            "projected_pnl": projected_pnl, "seconds_left": secs,
             "dry_run": self.config.dry_run, "ts": trade.ts,
         })).await?;
 
@@ -454,7 +384,11 @@ impl SmartStrategy {
         for (slug, pos) in pending {
             let Some(winner) = self.client.fetch_winning_outcome(&slug).await else { continue };
 
-            let pnl = if winner == "Up" { pos.pnl_if_up_wins() } else { pos.pnl_if_down_wins() };
+            let pnl = if winner == "Up" {
+                pos.pnl_if_up_wins()
+            } else {
+                pos.pnl_if_down_wins()
+            };
             let emoji = if pnl >= 0.0 { "✅" } else { "❌" };
             info!(
                 "[SMART SETTLE] {} | 赢={} | Up={:.0}@{:.3} Down={:.0}@{:.3} | PNL={:+.2} {}",
@@ -470,8 +404,9 @@ impl SmartStrategy {
             p.realized_pnl = Some(pnl);
 
             self.write_signal(&serde_json::json!({
-                "phase":"settlement","slug":slug,"winner":winner,"pnl":pnl,
-                "ts":chrono::Utc::now().timestamp()
+                "phase": "settlement", "slug": slug,
+                "winner": winner, "pnl": pnl,
+                "ts": chrono::Utc::now().timestamp()
             })).await?;
             changed = true;
         }
@@ -479,8 +414,10 @@ impl SmartStrategy {
         if changed {
             self.state.save().await?;
             let s = self.state.summary();
-            info!("[SMART STATS] 共{}盘 锁{} 赢{} 输{}  净PNL ${:.2}",
-                s.total, s.locked, s.win, s.lose, s.total_pnl);
+            info!(
+                "[SMART STATS] 共{}盘 锁{} 赢{} 输{}  净PNL ${:.2}",
+                s.total, s.locked, s.win, s.lose, s.total_pnl
+            );
         }
         Ok(())
     }
@@ -490,8 +427,12 @@ impl SmartStrategy {
     }
 
     async fn write_signal(&self, v: &serde_json::Value) -> Result<()> {
-        if let Some(p) = self.signal_file.parent() { fs::create_dir_all(p).await?; }
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.signal_file).await?;
+        if let Some(p) = self.signal_file.parent() {
+            fs::create_dir_all(p).await?;
+        }
+        let mut f = OpenOptions::new()
+            .create(true).append(true)
+            .open(&self.signal_file).await?;
         f.write_all((serde_json::to_string(v)? + "\n").as_bytes()).await?;
         Ok(())
     }
@@ -504,4 +445,6 @@ fn beijing_time(ts: i64) -> String {
     dt.format("%H:%M:%S+08:00").to_string()
 }
 
-fn beijing_now() -> String { beijing_time(chrono::Utc::now().timestamp()) }
+fn beijing_now() -> String {
+    beijing_time(chrono::Utc::now().timestamp())
+}
