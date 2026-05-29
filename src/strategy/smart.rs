@@ -27,9 +27,9 @@ const TREND_STEP: f64 = 0.05;
 const MAX_TREND_TRADES: usize = 5;
 /// P4 追单允许 worst_pnl 最多恶化多少（超过就不追）
 const TREND_WORST_PNL_FLOOR: f64 = -30.0;
-/// P5 便宜保险触发价格上限
-const CHEAP_THRESHOLD: f64 = 0.35;
-/// P3/P5 微批份额 = order_shares / 4
+/// P3 减险触发：单次买入须把 worst_pnl 改善至少这么多（避免每秒刷单）
+const REBALANCE_MIN_IMPROVE: f64 = 1.0;
+/// P3 微批份额 = order_shares / 4
 const MICRO_DIVISOR: f64 = 4.0;
 /// 最后多少秒不开新首单
 const ENTRY_MIN_SECONDS_LEFT: i64 = 60;
@@ -233,62 +233,47 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // ── P3：补弱边（改善 worst_pnl，减少方向风险）────────────────────
-        let weak_dir = opp_dir;  // 弱边就是 opp（主边份额更多）
-        let weak_ask = opp_ask;
-        let p3_worst = pos.worst_pnl_if_add(weak_dir, weak_ask, micro);
-        if p3_worst > cur_worst && seconds_left > ENTRY_MIN_SECONDS_LEFT {
-            info!(
-                "[SMART REBAL {mode}] {} 补弱边{weak_dir}@{weak_ask:.3} ×{micro:.0}份  worst改善 {cur_worst:+.2}→{p3_worst:+.2}  T-{seconds_left}s",
-                market.title
-            );
-            self.do_buy(&market, weak_dir, weak_ask, micro, "rebalance", pos.price_to_beat).await?;
-            return Ok(());
-        }
+        // 当前趋势信号（用于决定"追单"还是"减险"）
+        let trend_dir = self.model.compute(pos.price_to_beat, seconds_left)
+            .and_then(|s| s.direction());
 
-        // ── P4：趋势追单（顺势加仓，不能让 worst_pnl 低于下限）────────────
-        if seconds_left > ENTRY_MIN_SECONDS_LEFT {
-            if let Some(sig) = self.model.compute(pos.price_to_beat, seconds_left) {
-                if sig.direction() == Some(main_dir) {
-                    // 统计主边历史交易，确定上次追单价
-                    let trend_trades: Vec<_> = pos.trades.iter()
-                        .filter(|t| t.side == main_dir && !t.phase.starts_with("lock") && !t.phase.starts_with("arb"))
-                        .collect();
-                    let trade_count  = trend_trades.len();
-                    let last_price   = trend_trades.last().map(|t| t.price).unwrap_or(0.0);
+        // ── P4：趋势追单（趋势仍支持主边时，优先顺势加仓）────────────────
+        // 注意：必须在 P3 减险之前，否则单边持仓时减险会每 tick 抢先触发，追单永不执行。
+        if seconds_left > ENTRY_MIN_SECONDS_LEFT && trend_dir == Some(main_dir) {
+            let trend_trades: Vec<_> = pos.trades.iter()
+                .filter(|t| t.side == main_dir && !t.phase.starts_with("lock") && !t.phase.starts_with("arb"))
+                .collect();
+            let trade_count = trend_trades.len();
+            let last_price  = trend_trades.last().map(|t| t.price).unwrap_or(0.0);
 
-                    if trade_count < MAX_TREND_TRADES
-                        && main_ask >= last_price + TREND_STEP
-                        && main_ask <= TREND_ENTRY_MAX
-                    {
-                        let p4_worst = pos.worst_pnl_if_add(main_dir, main_ask, shares);
-                        if p4_worst >= TREND_WORST_PNL_FLOOR {
-                            info!(
-                                "[SMART TREND {mode}] {} 追{main_dir}@{main_ask:.3} ×{shares:.0}份（第{}/{}笔）worst={p4_worst:+.2}  T-{seconds_left}s",
-                                market.title, trade_count + 1, MAX_TREND_TRADES
-                            );
-                            self.do_buy(&market, main_dir, main_ask, shares, "trend_chase", pos.price_to_beat).await?;
-                            return Ok(());
-                        } else {
-                            info!(
-                                "[SMART] {} 趋势追单会使worst_pnl={p4_worst:+.2} < 下限{TREND_WORST_PNL_FLOOR}，跳过",
-                                market.title
-                            );
-                        }
-                    }
+            if trade_count < MAX_TREND_TRADES
+                && main_ask >= last_price + TREND_STEP
+                && main_ask <= TREND_ENTRY_MAX
+            {
+                let p4_worst = pos.worst_pnl_if_add(main_dir, main_ask, shares);
+                if p4_worst >= TREND_WORST_PNL_FLOOR {
+                    info!(
+                        "[SMART TREND {mode}] {} 追{main_dir}@{main_ask:.3} ×{shares:.0}份（第{}/{}笔）worst={p4_worst:+.2}  T-{seconds_left}s",
+                        market.title, trade_count + 1, MAX_TREND_TRADES
+                    );
+                    self.do_buy(&market, main_dir, main_ask, shares, "trend_chase", pos.price_to_beat).await?;
+                    return Ok(());
                 }
+                info!("[SMART] {} 趋势追单会使worst={p4_worst:+.2} < 下限{TREND_WORST_PNL_FLOOR}，跳过",
+                    market.title);
             }
         }
 
-        // ── P5：便宜保险（opp 价格 ≤ CHEAP_THRESHOLD 且改善 worst_pnl）────
-        if opp_ask <= CHEAP_THRESHOLD && seconds_left > ENTRY_MIN_SECONDS_LEFT {
-            let p5_worst = pos.worst_pnl_if_add(opp_dir, opp_ask, micro);
-            if p5_worst > cur_worst {
+        // ── P3：减险/对冲（仅当趋势不再支持主边时；改善需达阈值，避免每秒刷单）──
+        // 合并了原"便宜保险"：对边便宜本就让 worst 改善更多，统一走这里。
+        if seconds_left > ENTRY_MIN_SECONDS_LEFT && trend_dir != Some(main_dir) {
+            let p3_worst = pos.worst_pnl_if_add(opp_dir, opp_ask, micro);
+            if p3_worst - cur_worst >= REBALANCE_MIN_IMPROVE {
                 info!(
-                    "[SMART INSURE {mode}] {} {opp_dir}@{opp_ask:.3} 便宜保险 ×{micro:.0}份  worst改善 {cur_worst:+.2}→{p5_worst:+.2}  T-{seconds_left}s",
+                    "[SMART HEDGE {mode}] {} 趋势转向，减险买{opp_dir}@{opp_ask:.3} ×{micro:.0}份  worst {cur_worst:+.2}→{p3_worst:+.2}  T-{seconds_left}s",
                     market.title
                 );
-                self.do_buy(&market, opp_dir, opp_ask, micro, "insurance", pos.price_to_beat).await?;
+                self.do_buy(&market, opp_dir, opp_ask, micro, "hedge", pos.price_to_beat).await?;
                 return Ok(());
             }
         }
@@ -399,15 +384,15 @@ impl SmartStrategy {
         let mode   = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         let secs   = (pos.end_ts - chrono::Utc::now().timestamp()).max(0);
 
+        // 先下单；失败则不记账、不打印锁仓成功日志
+        if !self.place_order(market, dir, price, shares, phase_label).await {
+            return Ok(());
+        }
+
         info!(
             "[SMART LOCK {mode} {}] {} {dir}@{price:.3} ×{shares:.0}份  worst_pnl≈${projected_pnl:+.2}  T-{secs}s",
             phase_label.to_uppercase(), market.title
         );
-
-        // 真实/模拟下单
-        if !self.place_order(market, dir, price, shares, phase_label).await {
-            return Ok(());
-        }
 
         let fee    = taker_fee(price);
         let full_c = full_cost_per_share(price);

@@ -10,14 +10,14 @@
 
 use std::str::FromStr;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk_v2::types::{Address, Decimal as SdkDecimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
@@ -96,20 +96,22 @@ impl OrderExecutor {
         Ok(Self::Live { client: Box::new(client), signer })
     }
 
-    pub fn is_live(&self) -> bool {
-        matches!(self, Self::Live { .. })
-    }
-
-    /// 买入指定 token：GTC 限价单，价格用当前盘口 ask（marketable，立即成交为主）。
+    /// 买入指定 token。
+    ///
+    /// LIVE 用 **FOK（fill-or-kill）**：立即全额成交或撤单，语义与策略"按 ask 即时成交"的
+    /// 记账模型一致——只有真正成交(status=Matched)才返回 success=true，否则不记账、下轮重试。
+    /// 限价加 `MARKETABLE_BUFFER` 让 FOK 能穿透盘口若干档，提高成交率。
     pub async fn buy(&self, token_id: &str, price: f64, shares: f64) -> Result<Fill> {
         match self {
             Self::DryRun => Ok(Fill::simulated()),
             Self::Live { client, signer } => {
                 let tid = U256::from_str(token_id)
                     .with_context(|| format!("token_id 解析失败: {token_id}"))?;
-                let p = SdkDecimal::from_str(&format!("{price:.3}"))
+                // marketable 限价：在 ask 上加缓冲并对齐到 0.01 tick，封顶 0.99
+                let limit = ((price + MARKETABLE_BUFFER).min(0.99) * 100.0).round() / 100.0;
+                let p = SdkDecimal::from_str(&format!("{limit:.2}"))
                     .context("价格转换失败")?;
-                let s = SdkDecimal::from_str(&format!("{shares}"))
+                let s = SdkDecimal::from_str(&format!("{shares:.2}"))
                     .context("份额转换失败")?;
 
                 let resp = client
@@ -118,25 +120,29 @@ impl OrderExecutor {
                     .side(Side::Buy)
                     .price(p)
                     .size(s)
-                    .order_type(OrderType::GTC)
+                    .order_type(OrderType::FOK)
                     .build_sign_and_post(signer)
                     .await
                     .context("提交订单失败")?;
 
-                if !resp.success {
-                    warn!("[EXEC] 订单未成功: id={} status={} err={:?}",
-                        resp.order_id, resp.status, resp.error_msg);
+                let filled = resp.success && matches!(resp.status, OrderStatusType::Matched);
+                if !filled {
+                    warn!("[EXEC] 订单未成交(不记账): id={} status={} ok={} err={:?}",
+                        resp.order_id, resp.status, resp.success, resp.error_msg);
                 }
                 Ok(Fill {
                     order_id: resp.order_id,
                     status: resp.status.to_string(),
-                    success: resp.success,
+                    success: filled,
                     simulated: false,
                 })
             }
         }
     }
 }
+
+/// FOK 限价相对 ask 的上浮，使其可穿透盘口若干档成交。
+const MARKETABLE_BUFFER: f64 = 0.02;
 
 /// 配置中的 signature_type(u8) → SDK 枚举。
 /// 0=EOA, 1=Proxy(email/magic), 2=GnosisSafe, 3=Poly1271(V2 智能合约钱包)
@@ -147,12 +153,4 @@ fn map_sig_type(t: u8) -> SignatureType {
         2 => SignatureType::GnosisSafe,
         _ => SignatureType::Poly1271,
     }
-}
-
-/// LIVE 模式下用于启动期凭证自检（main 在进入循环前调用，失败即退出）。
-pub fn require_live_ready(exec: &OrderExecutor, config: &Config) -> Result<()> {
-    if !config.dry_run && !exec.is_live() {
-        bail!("DRY_RUN=0 但执行器未进入实盘模式");
-    }
-    Ok(())
 }

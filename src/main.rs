@@ -43,7 +43,6 @@ async fn main() -> Result<()> {
 
     // 统一下单执行器（LIVE 模式在此完成认证/派生 API creds，失败即退出）
     let exec = Arc::new(OrderExecutor::new(&config).await?);
-    executor::require_live_ready(&exec, &config)?;
 
     let poll = tokio::time::Duration::from_millis(config.poll_ms);
     info!("[JY-BOT] 开始轮询，间隔 {}ms", config.poll_ms);
