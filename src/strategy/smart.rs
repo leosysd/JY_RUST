@@ -29,6 +29,8 @@ const MAX_TREND_TRADES: usize = 5;
 const TREND_WORST_PNL_FLOOR: f64 = -30.0;
 /// P3 减险触发：单次买入须把 worst_pnl 改善至少这么多（避免每秒刷单）
 const REBALANCE_MIN_IMPROVE: f64 = 1.0;
+/// 冷门彩票：临近结束时便宜边 ask ≤ 此价才买（下行受限于极低价）
+const LOTTERY_MAX_PRICE: f64 = 0.10;
 /// P3 微批份额 = order_shares / 4
 const MICRO_DIVISOR: f64 = 4.0;
 /// 最后多少秒不开新首单
@@ -282,22 +284,37 @@ impl SmartStrategy {
             }
         }
 
-        // ── 强制锁仓（最后 60s）──────────────────────────────────────────
+        // ── 强制锁仓（最后 60s）：先补差额锁平，再可选冷门彩票 ─────────────
         if seconds_left <= ENTRY_MIN_SECONDS_LEFT {
-            if lock_qty <= 0.0 {
-                // 两边已相等，无需再买，直接标记锁定
-                let p = self.state.get_or_create(&market.slug, market.end_ts);
-                p.phase = Phase::Locked;
-                self.state.save().await?;
-                return Ok(());
+            // 1) 补差额锁平核心仓位（只买差额，避免超买成单边赌注）
+            if lock_qty > 0.0 {
+                let proj = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
+                let label = if proj >= 0.0 { "lock_profit" } else { "lock_loss" };
+                info!(
+                    "[SMART FORCE {mode}] {} 锁平 {opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  worst={proj:+.2}  T-{seconds_left}s",
+                    market.title
+                );
+                if !self.do_buy(&market, opp_dir, opp_ask, lock_qty, label, pos.price_to_beat).await? {
+                    return Ok(()); // 锁平下单失败，本轮不锁定，下轮重试
+                }
             }
-            let proj = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
-            let label = if proj >= 0.0 { "lock_profit" } else { "lock_loss" };
-            info!(
-                "[SMART FORCE {mode}] {} 强制锁仓 {opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  worst={proj:+.2}  T-{seconds_left}s",
-                market.title
-            );
-            self.do_lock(&market, &pos, opp_dir, opp_ask, lock_qty, proj, label).await?;
+
+            // 2) 可控冷门彩票：便宜边 ask ≤ LOTTERY_MAX_PRICE 时固定份额博一把。
+            //    下行被极低价锁死（最多亏掉这笔成本），不参与对冲，纯方向小注。
+            let (cheap_dir, cheap_ask) = if up_ask <= dn_ask { ("Up", up_ask) } else { ("Down", dn_ask) };
+            if cheap_ask > 0.0 && cheap_ask <= LOTTERY_MAX_PRICE {
+                let lot = self.order_shares();
+                info!(
+                    "[SMART LOTTERY {mode}] {} 冷门彩票 {cheap_dir}@{cheap_ask:.3} ×{lot:.0}份  成本≈${:.2}  T-{seconds_left}s",
+                    market.title, cheap_ask * lot
+                );
+                let _ = self.do_buy(&market, cheap_dir, cheap_ask, lot, "lottery", pos.price_to_beat).await?;
+            }
+
+            // 3) 标记锁定
+            let p = self.state.get_or_create(&market.slug, market.end_ts);
+            p.phase = Phase::Locked;
+            self.state.save().await?;
             return Ok(());
         }
 
@@ -348,10 +365,11 @@ impl SmartStrategy {
         shares: f64,
         phase_label: &str,
         price_to_beat: f64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // 真实/模拟下单（DRY_RUN 模拟立即成交；LIVE 真实提交，失败则不记账、下轮重试）
+        // 返回 true=已成交并记账，false=未成交
         if !self.place_order(market, dir, price, shares, phase_label).await {
-            return Ok(());
+            return Ok(false);
         }
 
         let fee    = taker_fee(price);
@@ -377,7 +395,7 @@ impl SmartStrategy {
             pos.phase = Phase::Holding;
         }
         self.state.save().await?;
-        Ok(())
+        Ok(true)
     }
 
     // ── 锁仓（切换 Phase::Locked）─────────────────────────────────────────
