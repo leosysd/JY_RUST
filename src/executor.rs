@@ -115,9 +115,13 @@ impl OrderExecutor {
                     .with_context(|| format!("token_id 解析失败: {token_id}"))?;
                 // marketable 限价：在 ask 上加缓冲并对齐到 0.01 tick，封顶 0.99
                 let limit = ((price + MARKETABLE_BUFFER).min(0.99) * 100.0).round() / 100.0;
+                // 份额取整：Polymarket 要求 BUY 金额(price×shares)≤2位小数。
+                // 价格已是2位小数，份额取整 → 乘积必然≤2位小数，金额合法。
+                // 成交返回的零头(如5.158729)若直接下单会算出4位小数金额被拒。
+                let order_shares = shares.round().max(1.0);
                 let p = SdkDecimal::from_str(&format!("{limit:.2}"))
                     .context("价格转换失败")?;
-                let s = SdkDecimal::from_str(&format!("{shares:.2}"))
+                let s = SdkDecimal::from_str(&format!("{order_shares:.0}"))
                     .context("份额转换失败")?;
 
                 let resp = client
