@@ -50,6 +50,10 @@ pub struct SmartStrategy {
     /// 双轨制影子账：实盘时记录"假设按 ask 全额成交"的理想账，与真实账对比。
     /// 模拟(DRY_RUN)时不使用（主账本身即理想账）。
     pub ideal_state: SmartStateStore,
+    /// 逐秒盘口快照日志路径（用于离线回放对冲/锁仓策略）。
+    pub book_log_file: PathBuf,
+    /// 盘口日志节流：上次写入的 unix 秒（POLL_MS<1000 时避免重复写同一秒）。
+    pub last_book_log_ts: i64,
 }
 
 /// 由主状态文件路径派生影子账路径：quant_state.json → quant_state_ideal.json
@@ -76,12 +80,17 @@ impl SmartStrategy {
         );
         let model = ZScoreModel::new(chainlink, binance);
         let signal_file = config.signal_file.clone();
+        // 盘口快照日志与 signal 同目录：quant_signals.jsonl → quant_book.jsonl
+        let book_log_file = signal_file
+            .parent().unwrap_or_else(|| std::path::Path::new("."))
+            .join("quant_book.jsonl");
         let now = chrono::Utc::now().timestamp();
         let first_allowed_start = ((now / 300) + 1) * 300;
         Ok(Self {
             config, state, client, cache, model,
             signal_file, first_allowed_start, ws,
             cached_market: None, executor, ideal_state,
+            book_log_file, last_book_log_ts: 0,
         })
     }
 
@@ -119,12 +128,55 @@ impl SmartStrategy {
 
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
 
+        // 逐秒盘口快照（节流到 1 秒/条）：为离线回放对冲/锁仓时机提供完整盘口序列。
+        self.log_book(&market, &pos, up_ask, dn_ask, seconds_left).await;
+
         match pos.phase {
             Phase::Waiting  => self.decide_waiting(&market, pos, up_ask, dn_ask, seconds_left).await?,
             Phase::Holding  => self.decide_holding(&market, pos, up_ask, dn_ask, seconds_left).await?,
             Phase::Locked | Phase::Settled => {}
         }
         Ok(())
+    }
+
+    /// 写一条逐秒盘口快照到 quant_book.jsonl（节流：同一 unix 秒只写一条）。
+    /// 含当前持仓与 worst_pnl，回放时无需再 join 状态文件即可重建对冲决策。
+    async fn log_book(
+        &mut self,
+        market: &Market,
+        pos: &MarketPosition,
+        up_ask: f64,
+        dn_ask: f64,
+        seconds_left: i64,
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        if now == self.last_book_log_ts { return; }
+        self.last_book_log_ts = now;
+        let rec = serde_json::json!({
+            "event": "book",
+            "ts": now,
+            "time_bj": beijing_now(),
+            "slug": market.slug,
+            "end_ts": market.end_ts,
+            "seconds_left": seconds_left,
+            "up_ask": up_ask,
+            "down_ask": dn_ask,
+            "up_shares": pos.up_shares,
+            "down_shares": pos.down_shares,
+            "up_cost_total": pos.up_cost_total,
+            "down_cost_total": pos.down_cost_total,
+            "worst_pnl": pos.worst_pnl(),
+            "price_to_beat": pos.price_to_beat,
+        });
+        if let Some(p) = self.book_log_file.parent() {
+            let _ = fs::create_dir_all(p).await;
+        }
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true)
+            .open(&self.book_log_file).await
+        {
+            let line = rec.to_string() + "\n";
+            let _ = f.write_all(line.as_bytes()).await;
+        }
     }
 
     async fn get_or_fetch_market(&mut self) -> Option<Market> {
