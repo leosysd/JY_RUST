@@ -17,7 +17,7 @@ use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk_v2::types::{Address, Decimal as SdkDecimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
