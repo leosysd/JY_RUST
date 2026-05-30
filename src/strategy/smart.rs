@@ -259,6 +259,26 @@ impl SmartStrategy {
             "[SMART ENTRY {mode}] {} {dir}@{entry_ask:.3} ×{shares:.0}份  z={:.3}  T-{seconds_left}s",
             market.title, sig.z
         );
+        // 入场信号快照：记录 z-score 全套字段，用于离线分析"信号强度 vs 方向准确率"。
+        // 纯记录，不影响下单。结算后可 join winner 验证。
+        self.write_signal(&serde_json::json!({
+            "phase": "entry_signal",
+            "market": market.slug,
+            "direction": dir,
+            "entry_ask": entry_ask,
+            "z": sig.z,
+            "p_up": sig.p_up,
+            "p_down": sig.p_down,
+            "e": sig.e,
+            "v": sig.v,
+            "ct": sig.ct,
+            "xt": sig.xt,
+            "b": sig.b,
+            "sigma120": sig.sigma120,
+            "basis60": sig.basis60,
+            "seconds_left": seconds_left,
+            "ts": chrono::Utc::now().timestamp(),
+        })).await?;
         self.do_buy(&market, dir, entry_ask, shares, "entry", price_to_beat).await?;
         Ok(())
     }
