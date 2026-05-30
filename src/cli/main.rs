@@ -46,7 +46,11 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
             service_cmd(action);
         }
         "logs" => show_logs(50),
-        "stats" => show_stats(),
+        "stats" => match args.get(1).map(|s| s.as_str()) {
+            Some("--ideal") => show_stats_file(&ideal_state_path()),
+            Some("--diff")  => show_stats_diff(),
+            _               => show_stats_file(&state_file_path()),
+        },
         "clear" => clear_sim_data()?,
         "status" => service_cmd("status"),
         "start" => service_cmd("start"),

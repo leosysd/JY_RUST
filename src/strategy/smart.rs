@@ -8,7 +8,7 @@ use crate::ws::MarketWs;
 use crate::zscore::ZScoreModel;
 use anyhow::Result;
 use tracing::{info, warn};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -53,10 +53,10 @@ pub struct SmartStrategy {
 }
 
 /// 由主状态文件路径派生影子账路径：quant_state.json → quant_state_ideal.json
-fn ideal_path(p: &Path) -> PathBuf {
+fn ideal_path(p: &std::path::Path) -> PathBuf {
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("quant_state");
     let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("json");
-    let parent = p.parent().unwrap_or_else(|| Path::new("."));
+    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
     parent.join(format!("{stem}_ideal.{ext}"))
 }
 

@@ -134,11 +134,12 @@ impl OrderExecutor {
                 let filled = resp.success && matches!(resp.status, OrderStatusType::Matched);
 
                 // 从真实成交额反推成交均价/份额：BUY → making=USDC支出, taking=买到份额
-                let making = resp.making_amount.and_then(|d| d.to_string().parse::<f64>().ok());
-                let taking = resp.taking_amount.and_then(|d| d.to_string().parse::<f64>().ok());
-                let (filled_price, filled_shares) = match (making, taking) {
-                    (Some(m), Some(t)) if t > 0.0 => (m / t, t),
-                    _ => (price, if filled { shares } else { 0.0 }),
+                let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
+                let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+                let (filled_price, filled_shares) = if taking > 0.0 {
+                    (making / taking, taking)
+                } else {
+                    (price, if filled { shares } else { 0.0 })
                 };
 
                 if !filled {
