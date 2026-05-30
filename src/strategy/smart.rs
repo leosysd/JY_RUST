@@ -367,7 +367,7 @@ impl SmartStrategy {
                 Some(fill)
             }
             Err(e) => {
-                warn!("[SMART ORDER ERR] {} {dir} {phase_label}: {e}", market.title);
+                warn!("[SMART ORDER ERR] {} {dir} {phase_label}: {e:#}", market.title);
                 None
             }
         }

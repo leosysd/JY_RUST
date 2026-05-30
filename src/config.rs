@@ -109,7 +109,9 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
 
     Ok(Config {
         clob_api_url: env("CLOB_API_URL", "https://clob.polymarket.com"),
-        clob_v2_api_url: env("CLOB_V2_API_URL", "https://clob-v2.polymarket.com"),
+        // 注意：clob-v2.polymarket.com 现已 301 重定向到主域名，SDK 不跟随重定向，
+        // 故默认直接用主域名（实测可正常认证/签名/成交）。
+        clob_v2_api_url: env("CLOB_V2_API_URL", "https://clob.polymarket.com"),
         gamma_api_url: env("GAMMA_API_URL", "https://gamma-api.polymarket.com"),
         chain_id: env_u64("CHAIN_ID", 137),
         signature_type,

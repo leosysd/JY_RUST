@@ -104,9 +104,9 @@ impl OrderExecutor {
 
     /// 买入指定 token。
     ///
-    /// LIVE 用 **FOK（fill-or-kill）**：立即全额成交或撤单，语义与策略"按 ask 即时成交"的
-    /// 记账模型一致——只有真正成交(status=Matched)才返回 success=true，否则不记账、下轮重试。
-    /// 限价加 `MARKETABLE_BUFFER` 让 FOK 能穿透盘口若干档，提高成交率。
+    /// LIVE 用 **FAK（fill-and-kill）**：立即吃单，能成交多少成交多少，剩余取消。
+    /// 比 FOK 更适合 5 分钟盘口的浅流动性——部分成交也按真实成交份额记账。
+    /// 限价加 `MARKETABLE_BUFFER` 让单子能穿透盘口若干档。
     pub async fn buy(&self, token_id: &str, price: f64, shares: f64) -> Result<Fill> {
         match self {
             Self::DryRun => Ok(Fill::simulated(price, shares)),
@@ -126,25 +126,28 @@ impl OrderExecutor {
                     .side(Side::Buy)
                     .price(p)
                     .size(s)
-                    .order_type(OrderType::FOK)
+                    .order_type(OrderType::FAK)
                     .build_sign_and_post(signer)
                     .await
                     .context("提交订单失败")?;
 
-                let filled = resp.success && matches!(resp.status, OrderStatusType::Matched);
-
                 // 从真实成交额反推成交均价/份额：BUY → making=USDC支出, taking=买到份额
                 let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
                 let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
-                let (filled_price, filled_shares) = if taking > 0.0 {
+                // FAK 部分成交：以真实成交份额为准（taking>0 即视为成交）
+                let filled = taking > 0.0;
+                let (filled_price, filled_shares) = if filled {
                     (making / taking, taking)
                 } else {
-                    (price, if filled { shares } else { 0.0 })
+                    (price, 0.0)
                 };
 
                 if !filled {
                     warn!("[EXEC] 订单未成交(不记账): id={} status={} ok={} err={:?}",
                         resp.order_id, resp.status, resp.success, resp.error_msg);
+                } else if (taking - shares).abs() > 0.01 {
+                    warn!("[EXEC] 部分成交: 请求{shares:.0}份 实际{taking:.1}份 @ {:.3}",
+                        making / taking);
                 }
                 Ok(Fill {
                     order_id: resp.order_id,
