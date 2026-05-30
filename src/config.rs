@@ -37,6 +37,18 @@ pub struct Config {
     pub max_entry_delay_sec: u64,
     pub min_seconds_left: u64,
 
+    // 锁仓/追单可调参数
+    /// 锁利门槛系数：实际门槛 = order_shares × 此值（设5×0.2=$1 才锁利）
+    pub lock_min_profit_factor: f64,
+    /// 追单价格上限：main_ask 高于此值不再追单
+    pub trend_chase_max_price: f64,
+    /// 强制锁线（秒）：剩余 ≤ 此值触发强制处理
+    pub force_lock_seconds_left: i64,
+    /// 强制亏损模式："smooth"=按趋势顺势加注锁利；"lock"=旧行为等额对锁(锁亏)
+    pub force_loss_mode: String,
+    /// 磨平预算倍数：smooth 模式顺势加注最多再花 entry成本 × 此值
+    pub smooth_budget_mult: f64,
+
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -62,6 +74,18 @@ fn env_decimal(key: &str, default: &str) -> Decimal {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
+    env(key, &default.to_string())
+        .parse()
+        .unwrap_or(default)
+}
+
+fn env_i64(key: &str, default: i64) -> i64 {
+    env(key, &default.to_string())
+        .parse()
+        .unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
     env(key, &default.to_string())
         .parse()
         .unwrap_or(default)
@@ -135,6 +159,11 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         fee_rate: env_decimal("TAKER_FEE_RATE", "0.07"),
         max_entry_delay_sec: env_u64("JF_MAX_ENTRY_DELAY_SEC", 30),
         min_seconds_left: env_u64("QUANT_MIN_SECONDS_LEFT", 5),
+        lock_min_profit_factor: env_f64("LOCK_MIN_PROFIT_FACTOR", 0.2),
+        trend_chase_max_price: env_f64("TREND_CHASE_MAX_PRICE", 0.60),
+        force_lock_seconds_left: env_i64("FORCE_LOCK_SECONDS_LEFT", 60),
+        force_loss_mode: env("FORCE_LOSS_MODE", "smooth").to_lowercase(),
+        smooth_budget_mult: env_f64("SMOOTH_BUDGET_MULT", 0.5),
         poll_ms: env_u64("POLL_MS", 1000),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),

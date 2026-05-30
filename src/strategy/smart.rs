@@ -16,8 +16,7 @@ use tokio::io::AsyncWriteExt;
 // ── 策略参数 ──────────────────────────────────────────────────────────────
 /// P1 纯套利门槛：full_cost(up)+full_cost(dn) < 此值时同时买两边
 const ARB_THRESHOLD: f64 = 0.995;
-/// P2 锁利门槛：等额锁定后 worst_pnl >= 此值才执行
-const LOCK_MIN_PROFIT: f64 = 0.20;
+/// P2 锁利门槛系数现由 config.lock_min_profit_factor 控制（门槛 = order_shares × factor）。
 /// P4 趋势入场价格范围
 const TREND_ENTRY_MIN: f64 = 0.48;
 const TREND_ENTRY_MAX: f64 = 0.70;
@@ -290,12 +289,14 @@ impl SmartStrategy {
         // 锁仓只需补足"差额"使两边相等；对边已有的份额不能重复买，否则会超买成单边赌注
         let lock_qty = (main_shares - opp_shares).max(0.0);
 
-        // ── P2：锁利（补差额至两边相等后 worst_pnl >= LOCK_MIN_PROFIT）────
+        // ── P2：锁利（补差额至两边相等后 worst_pnl >= 份额×系数）────
+        // 门槛随下单份额缩放：lock_min_profit_factor=0.2 时，设5需$1、设20需$4 才锁。
+        let lock_min_profit = shares * self.config.lock_min_profit_factor;
         if lock_qty > 0.0 {
             let p2_worst = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
-            if p2_worst >= LOCK_MIN_PROFIT {
+            if p2_worst >= lock_min_profit {
                 info!(
-                    "[SMART LOCK_PROFIT {mode}] {} 买{opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  锁定worst_pnl={p2_worst:+.2}  T-{seconds_left}s",
+                    "[SMART LOCK_PROFIT {mode}] {} 买{opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  锁定worst_pnl={p2_worst:+.2}≥{lock_min_profit:.2}  T-{seconds_left}s",
                     market.title
                 );
                 self.do_lock(&market, &pos, opp_dir, opp_ask, lock_qty, p2_worst, "lock_profit").await?;
@@ -316,9 +317,10 @@ impl SmartStrategy {
             let trade_count = trend_trades.len();
             let last_price  = trend_trades.last().map(|t| t.price).unwrap_or(0.0);
 
+            // 追单价格上限：超过 trend_chase_max_price 不再追（避免追高被迫天价锁）
             if trade_count < MAX_TREND_TRADES
                 && main_ask >= last_price + TREND_STEP
-                && main_ask <= TREND_ENTRY_MAX
+                && main_ask <= self.config.trend_chase_max_price
             {
                 let p4_worst = pos.worst_pnl_if_add(main_dir, main_ask, shares);
                 if p4_worst >= TREND_WORST_PNL_FLOOR {
@@ -348,18 +350,55 @@ impl SmartStrategy {
             }
         }
 
-        // ── 强制锁仓（最后 60s）：先补差额锁平，再可选冷门彩票 ─────────────
-        if seconds_left <= ENTRY_MIN_SECONDS_LEFT {
-            // 1) 补差额锁平核心仓位（只买差额，避免超买成单边赌注）
+        // ── 强制处理（最后 force_lock_seconds_left 秒）─────────────────────
+        if seconds_left <= self.config.force_lock_seconds_left {
+            // 1) 补差额：若能锁平为盈利则照旧对锁；若会锁亏，按 force_loss_mode 处理。
             if lock_qty > 0.0 {
                 let proj = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
-                let label = if proj >= 0.0 { "lock_profit" } else { "lock_loss" };
-                info!(
-                    "[SMART FORCE {mode}] {} 锁平 {opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  worst={proj:+.2}  T-{seconds_left}s",
-                    market.title
-                );
-                if !self.do_buy(&market, opp_dir, opp_ask, lock_qty, label, pos.price_to_beat).await? {
-                    return Ok(()); // 锁平下单失败，本轮不锁定，下轮重试
+                if proj >= 0.0 {
+                    // 对锁后仍保底盈利 → 照旧补对面锁平
+                    info!(
+                        "[SMART FORCE {mode}] {} 锁平 {opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  worst={proj:+.2}  T-{seconds_left}s",
+                        market.title
+                    );
+                    if !self.do_buy(&market, opp_dir, opp_ask, lock_qty, "lock_profit", pos.price_to_beat).await? {
+                        return Ok(());
+                    }
+                } else if self.config.force_loss_mode == "smooth" {
+                    // 锁亏改"按趋势锁利"：不补对面认亏，而是顺当前领先方向加注，争取赢回。
+                    // 领先方向 = ask 更高(更被市场看好)的一边。
+                    let (lead_dir, lead_ask) = if up_ask >= dn_ask { ("Up", up_ask) } else { ("Down", dn_ask) };
+                    let lead_capped = lead_ask.min(0.99);
+                    let have_lead = if lead_dir == "Up" { pos.up_shares } else { pos.down_shares };
+                    let cost_total = pos.up_cost_total + pos.down_cost_total;
+                    // 回本所需该边总份额: X*(1-ask) >= cost - have*ask  =>  X >= (cost-have*ask)/(1-ask)
+                    let need_total = if lead_capped < 0.999 {
+                        (cost_total - have_lead * lead_capped) / (1.0 - lead_capped)
+                    } else { have_lead };
+                    let want = (need_total - have_lead).max(0.0);
+                    // 预算封顶: 顺势加注最多再花 entry成本 × smooth_budget_mult
+                    let budget = cost_total * self.config.smooth_budget_mult;
+                    let max_by_budget = if lead_capped > 0.0 { budget / lead_capped } else { 0.0 };
+                    let buy = want.min(max_by_budget);
+                    if buy >= 1.0 {
+                        info!(
+                            "[SMART FORCE SMOOTH {mode}] {} 锁亏转顺势 买{lead_dir}@{lead_capped:.3} ×{buy:.0}份  原worst={proj:+.2}  T-{seconds_left}s",
+                            market.title
+                        );
+                        let _ = self.do_buy(&market, lead_dir, lead_capped, buy, "smooth", pos.price_to_beat).await?;
+                    } else {
+                        info!("[SMART FORCE SMOOTH {mode}] {} 锁亏但加注<1份，裸持到结算  worst={proj:+.2}  T-{seconds_left}s",
+                            market.title);
+                    }
+                } else {
+                    // 旧行为：等额对锁(锁亏)
+                    info!(
+                        "[SMART FORCE {mode}] {} 锁亏 {opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  worst={proj:+.2}  T-{seconds_left}s",
+                        market.title
+                    );
+                    if !self.do_buy(&market, opp_dir, opp_ask, lock_qty, "lock_loss", pos.price_to_beat).await? {
+                        return Ok(());
+                    }
                 }
             }
 
