@@ -120,7 +120,7 @@ fn interactive_menu() -> Result<()> {
             0 => edit_config()?,
             1 => show_config(),
             2 => test_connection()?,
-            3 => show_stats(),
+            3 => show_stats_menu(),
             4 => service_cmd("start"),
             5 => service_cmd("stop"),
             6 => service_cmd("restart"),
@@ -393,11 +393,61 @@ fn phase_label(p: &str) -> &'static str {
     }
 }
 
-fn show_stats() {
-    let path = state_file_path();
-    let text = match std::fs::read_to_string(&path) {
+/// 影子账路径：quant_state.json → quant_state_ideal.json
+fn ideal_state_path() -> std::path::PathBuf {
+    let p = state_file_path();
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("quant_state");
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("json");
+    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+    parent.join(format!("{stem}_ideal.{ext}"))
+}
+
+/// 菜单入口：实盘有影子账时提示可用 --ideal/--diff，默认显示真实账
+fn show_stats_menu() {
+    let ideal = ideal_state_path();
+    if ideal.exists() && std::fs::metadata(&ideal).map(|m| m.len() > 5).unwrap_or(false) {
+        println!("{}", style("（实盘双轨：jy stats=真实账  jy stats --ideal=理想账  jy stats --diff=对比）").dim());
+    }
+    show_stats_file(&state_file_path());
+}
+
+/// 读取某状态文件的汇总（盘数/胜负/净盈亏）
+fn read_totals(path: &std::path::Path) -> Option<(usize, usize, usize, f64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let map: std::collections::HashMap<String, position::MarketPosition> =
+        serde_json::from_str(&text).ok()?;
+    let (mut n, mut win, mut lose, mut pnl) = (0, 0, 0, 0.0f64);
+    for p in map.values() {
+        if let Some(v) = p.realized_pnl {
+            n += 1; pnl += v;
+            if v >= 0.0 { win += 1 } else { lose += 1 }
+        }
+    }
+    Some((n, win, lose, pnl))
+}
+
+/// 对比真实账 vs 理想账，量化滑点/未成交的代价
+fn show_stats_diff() {
+    let real = read_totals(&state_file_path());
+    let ideal = read_totals(&ideal_state_path());
+    match (real, ideal) {
+        (Some((rn, rw, rl, rp)), Some((_in, iw, il, ip))) => {
+            println!("{}", style("── 双轨对比（真实 vs 理想）──").bold());
+            println!("  理想账(假设全额按ask成交)  结算{:3}盘  胜{}/负{}  净 ${:+.2}", _in, iw, il, ip);
+            println!("  真实账(实际成交价/份额)    结算{:3}盘  胜{}/负{}  净 ${:+.2}", rn, rw, rl, rp);
+            let gap = rp - ip;
+            let g = if gap >= 0.0 { style(format!("${gap:+.2}")).green() } else { style(format!("${gap:+.2}")).red() };
+            println!("  ── 现实代价(真实−理想): {g}  ←滑点+未成交+手续费差");
+        }
+        (Some(_), None) => println!("{} 暂无理想账（仅实盘模式才生成影子账）", style("ℹ").cyan()),
+        _ => println!("{} 暂无数据", style("ℹ").cyan()),
+    }
+}
+
+fn show_stats_file(path: &std::path::Path) {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) => { println!("{} 读取状态文件失败 {}: {e}", style("✖").red(), path.display()); return; }
+        Err(_) => { println!("{} 暂无数据文件 {}", style("ℹ").cyan(), path.display()); return; }
     };
     let positions: std::collections::HashMap<String, position::MarketPosition> =
         match serde_json::from_str(&text) {
@@ -492,6 +542,12 @@ fn clear_sim_data() -> Result<()> {
     }
     std::fs::write(&path, "{}\n")?;
     println!("{} 已清空 {}", style("✔").green(), path.display());
+    // 同时清空影子账（实盘双轨）
+    let ideal = ideal_state_path();
+    if ideal.exists() {
+        std::fs::write(&ideal, "{}\n")?;
+        println!("{} 已清空 {}", style("✔").green(), ideal.display());
+    }
     if was_running {
         service_cmd("start");
         println!("{} 服务已重新启动，从空状态开始", style("✔").green());

@@ -8,7 +8,7 @@ use crate::ws::MarketWs;
 use crate::zscore::ZScoreModel;
 use anyhow::Result;
 use tracing::{info, warn};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -47,6 +47,17 @@ pub struct SmartStrategy {
     pub ws: MarketWs,
     pub cached_market: Option<Market>,
     pub executor: Arc<OrderExecutor>,
+    /// 双轨制影子账：实盘时记录"假设按 ask 全额成交"的理想账，与真实账对比。
+    /// 模拟(DRY_RUN)时不使用（主账本身即理想账）。
+    pub ideal_state: SmartStateStore,
+}
+
+/// 由主状态文件路径派生影子账路径：quant_state.json → quant_state_ideal.json
+fn ideal_path(p: &Path) -> PathBuf {
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("quant_state");
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("json");
+    let parent = p.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}_ideal.{ext}"))
 }
 
 impl SmartStrategy {
@@ -59,6 +70,7 @@ impl SmartStrategy {
         executor: Arc<OrderExecutor>,
     ) -> Result<Self> {
         let state = SmartStateStore::load(config.state_file.clone()).await?;
+        let ideal_state = SmartStateStore::load(ideal_path(&config.state_file)).await?;
         let client = ClobClient::new(
             &config.clob_api_url, &config.gamma_api_url, &config.market_slug_prefix,
         );
@@ -69,7 +81,7 @@ impl SmartStrategy {
         Ok(Self {
             config, state, client, cache, model,
             signal_file, first_allowed_start, ws,
-            cached_market: None, executor,
+            cached_market: None, executor, ideal_state,
         })
     }
 
@@ -329,7 +341,7 @@ impl SmartStrategy {
 
     // ── 通用：买入（不切换 Locked）────────────────────────────────────────
 
-    /// 下单（真实或模拟）。返回 true 表示可以记账，false 表示下单失败应跳过本次记账。
+    /// 下单（真实或模拟）。返回成交结果；None 表示无法下单（找不到 token 或网络错误）。
     async fn place_order(
         &self,
         market: &Market,
@@ -337,22 +349,26 @@ impl SmartStrategy {
         price: f64,
         shares: f64,
         phase_label: &str,
-    ) -> bool {
-        let Some(token) = market.token_for(dir) else {
-            warn!("[SMART] {} 找不到 {dir} 的 token_id，跳过下单", market.title);
-            return false;
+    ) -> Option<crate::executor::Fill> {
+        let token = match market.token_for(dir) {
+            Some(t) => t,
+            None => {
+                warn!("[SMART] {} 找不到 {dir} 的 token_id，跳过下单", market.title);
+                return None;
+            }
         };
         match self.executor.buy(token, price, shares).await {
             Ok(fill) => {
                 if !fill.simulated {
-                    info!("[SMART ORDER] {} {dir} {phase_label} id={} status={} ok={}",
-                        market.title, fill.order_id, fill.status, fill.success);
+                    info!("[SMART ORDER] {} {dir} {phase_label} id={} status={} ok={} 成交{:.1}份@{:.3}",
+                        market.title, fill.order_id, fill.status, fill.success,
+                        fill.filled_shares, fill.filled_price);
                 }
-                fill.success
+                Some(fill)
             }
             Err(e) => {
                 warn!("[SMART ORDER ERR] {} {dir} {phase_label}: {e}", market.title);
-                false
+                None
             }
         }
     }
@@ -366,34 +382,27 @@ impl SmartStrategy {
         phase_label: &str,
         price_to_beat: f64,
     ) -> Result<bool> {
-        // 真实/模拟下单（DRY_RUN 模拟立即成交；LIVE 真实提交，失败则不记账、下轮重试）
-        // 返回 true=已成交并记账，false=未成交
-        if !self.place_order(market, dir, price, shares, phase_label).await {
-            return Ok(false);
+        let fill = self.place_order(market, dir, price, shares, phase_label).await;
+
+        // A轨 影子账（仅实盘）：假设按 ask 全额成交，与真实账对比滑点/未成交代价。
+        // 模拟模式下主账本身即理想账，无需重复。
+        if !self.config.dry_run {
+            record_trade(&mut self.ideal_state, market, dir, price, shares, phase_label, price_to_beat, false);
+            self.ideal_state.save().await?;
         }
 
-        let fee    = taker_fee(price);
-        let full_c = full_cost_per_share(price);
-        let trade = TradeRecord {
-            side: dir.to_string(), shares, price,
-            fee_per_share: fee, full_cost_per_share: full_c,
-            total_cost: full_c * shares,
-            phase: phase_label.to_string(),
-            ts: chrono::Utc::now().timestamp(),
-            time_bj: beijing_now(),
-        };
+        // B轨 真实账：只有真正成交才记账，用真实成交价/份额
+        let Some(fill) = fill else { return Ok(false); };
+        if !fill.success { return Ok(false); }
+        let (rp, rs) = (fill.filled_price, fill.filled_shares);
+
         self.write_signal(&serde_json::json!({
             "phase": phase_label, "market": market.slug,
-            "direction": dir, "price": price, "shares": shares,
-            "full_cost": full_c,
-            "dry_run": self.config.dry_run, "ts": trade.ts,
+            "direction": dir, "price": rp, "shares": rs,
+            "full_cost": full_cost_per_share(rp),
+            "dry_run": self.config.dry_run, "ts": chrono::Utc::now().timestamp(),
         })).await?;
-        let pos = self.state.get_or_create(&market.slug, market.end_ts);
-        pos.add_trade(trade);
-        if matches!(pos.phase, Phase::Waiting) {
-            pos.price_to_beat = price_to_beat;
-            pos.phase = Phase::Holding;
-        }
+        record_trade(&mut self.state, market, dir, rp, rs, phase_label, price_to_beat, false);
         self.state.save().await?;
         Ok(true)
     }
@@ -413,33 +422,30 @@ impl SmartStrategy {
         let mode   = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         let secs   = (pos.end_ts - chrono::Utc::now().timestamp()).max(0);
 
-        // 先下单；失败则不记账、不打印锁仓成功日志
-        if !self.place_order(market, dir, price, shares, phase_label).await {
-            return Ok(());
+        let fill = self.place_order(market, dir, price, shares, phase_label).await;
+
+        // A轨 影子账（仅实盘）：假设按 ask 全额成交并锁定
+        if !self.config.dry_run {
+            record_trade(&mut self.ideal_state, market, dir, price, shares, phase_label, pos.price_to_beat, true);
+            self.ideal_state.save().await?;
         }
 
+        // B轨 真实账：失败则不记账、不打印锁仓成功日志、下轮重试
+        let Some(fill) = fill else { return Ok(()); };
+        if !fill.success { return Ok(()); }
+        let (rp, rs) = (fill.filled_price, fill.filled_shares);
+
         info!(
-            "[SMART LOCK {mode} {}] {} {dir}@{price:.3} ×{shares:.0}份  worst_pnl≈${projected_pnl:+.2}  T-{secs}s",
+            "[SMART LOCK {mode} {}] {} {dir}@{rp:.3} ×{rs:.0}份  worst_pnl≈${projected_pnl:+.2}  T-{secs}s",
             phase_label.to_uppercase(), market.title
         );
-
-        let fee    = taker_fee(price);
-        let full_c = full_cost_per_share(price);
-        let trade = TradeRecord {
-            side: dir.to_string(), shares, price,
-            fee_per_share: fee, full_cost_per_share: full_c,
-            total_cost: full_c * shares, phase: phase_label.to_string(),
-            ts: chrono::Utc::now().timestamp(), time_bj: beijing_now(),
-        };
         self.write_signal(&serde_json::json!({
             "phase": phase_label, "market": market.slug,
-            "direction": dir, "price": price, "shares": shares,
+            "direction": dir, "price": rp, "shares": rs,
             "projected_pnl": projected_pnl, "seconds_left": secs,
-            "dry_run": self.config.dry_run, "ts": trade.ts,
+            "dry_run": self.config.dry_run, "ts": chrono::Utc::now().timestamp(),
         })).await?;
-        let pos = self.state.get_or_create(&market.slug, market.end_ts);
-        pos.add_trade(trade);
-        pos.phase = Phase::Locked;
+        record_trade(&mut self.state, market, dir, rp, rs, phase_label, pos.price_to_beat, true);
         self.state.save().await?;
         Ok(())
     }
@@ -451,6 +457,7 @@ impl SmartStrategy {
         if pending.is_empty() { return Ok(()); }
 
         let mut changed = false;
+        let mut ideal_changed = false;
         for (slug, pos) in pending {
             let Some(winner) = self.client.fetch_winning_outcome(&slug).await else { continue };
             let pnl = if winner == "Up" { pos.pnl_if_up_wins() } else { pos.pnl_if_down_wins() };
@@ -491,6 +498,38 @@ impl SmartStrategy {
         let mut f = OpenOptions::new().create(true).append(true).open(&self.signal_file).await?;
         f.write_all((serde_json::to_string(v)? + "\n").as_bytes()).await?;
         Ok(())
+    }
+}
+
+/// 把一笔成交记入指定状态库（主账或影子账通用）。
+fn record_trade(
+    store: &mut SmartStateStore,
+    market: &Market,
+    dir: &str,
+    price: f64,
+    shares: f64,
+    phase_label: &str,
+    price_to_beat: f64,
+    is_lock: bool,
+) {
+    let fee    = taker_fee(price);
+    let full_c = full_cost_per_share(price);
+    let trade = TradeRecord {
+        side: dir.to_string(), shares, price,
+        fee_per_share: fee, full_cost_per_share: full_c,
+        total_cost: full_c * shares,
+        phase: phase_label.to_string(),
+        ts: chrono::Utc::now().timestamp(),
+        time_bj: beijing_now(),
+    };
+    let pos = store.get_or_create(&market.slug, market.end_ts);
+    pos.add_trade(trade);
+    if matches!(pos.phase, Phase::Waiting) {
+        pos.price_to_beat = price_to_beat;
+        pos.phase = Phase::Holding;
+    }
+    if is_lock {
+        pos.phase = Phase::Locked;
     }
 }
 

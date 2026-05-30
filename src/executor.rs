@@ -31,15 +31,21 @@ pub struct Fill {
     pub status: String,
     pub success: bool,
     pub simulated: bool,
+    /// 真实成交均价（实盘从 makingAmount/takingAmount 反推；模拟=请求价）
+    pub filled_price: f64,
+    /// 真实成交份额（实盘=takingAmount；模拟=请求份额）
+    pub filled_shares: f64,
 }
 
 impl Fill {
-    fn simulated() -> Self {
+    fn simulated(price: f64, shares: f64) -> Self {
         Self {
             order_id: "DRY_RUN".to_string(),
             status: "simulated".to_string(),
             success: true,
             simulated: true,
+            filled_price: price,
+            filled_shares: shares,
         }
     }
 }
@@ -103,7 +109,7 @@ impl OrderExecutor {
     /// 限价加 `MARKETABLE_BUFFER` 让 FOK 能穿透盘口若干档，提高成交率。
     pub async fn buy(&self, token_id: &str, price: f64, shares: f64) -> Result<Fill> {
         match self {
-            Self::DryRun => Ok(Fill::simulated()),
+            Self::DryRun => Ok(Fill::simulated(price, shares)),
             Self::Live { client, signer } => {
                 let tid = U256::from_str(token_id)
                     .with_context(|| format!("token_id 解析失败: {token_id}"))?;
@@ -126,6 +132,15 @@ impl OrderExecutor {
                     .context("提交订单失败")?;
 
                 let filled = resp.success && matches!(resp.status, OrderStatusType::Matched);
+
+                // 从真实成交额反推成交均价/份额：BUY → making=USDC支出, taking=买到份额
+                let making = resp.making_amount.and_then(|d| d.to_string().parse::<f64>().ok());
+                let taking = resp.taking_amount.and_then(|d| d.to_string().parse::<f64>().ok());
+                let (filled_price, filled_shares) = match (making, taking) {
+                    (Some(m), Some(t)) if t > 0.0 => (m / t, t),
+                    _ => (price, if filled { shares } else { 0.0 }),
+                };
+
                 if !filled {
                     warn!("[EXEC] 订单未成交(不记账): id={} status={} ok={} err={:?}",
                         resp.order_id, resp.status, resp.success, resp.error_msg);
@@ -135,6 +150,8 @@ impl OrderExecutor {
                     status: resp.status.to_string(),
                     success: filled,
                     simulated: false,
+                    filled_price,
+                    filled_shares,
                 })
             }
         }
