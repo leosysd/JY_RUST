@@ -473,6 +473,19 @@ impl SmartStrategy {
             p.phase = Phase::Settled;
             p.winner = Some(winner.clone());
             p.realized_pnl = Some(pnl);
+
+            // 同步结算影子账（实盘双轨；模拟时影子账为空，跳过）
+            if let Some(ipos) = self.ideal_state.get(&slug).cloned() {
+                if !matches!(ipos.phase, Phase::Settled) && !ipos.trades.is_empty() {
+                    let ipnl = if winner == "Up" { ipos.pnl_if_up_wins() } else { ipos.pnl_if_down_wins() };
+                    let ip = self.ideal_state.get_or_create(&slug, ipos.end_ts);
+                    ip.phase = Phase::Settled;
+                    ip.winner = Some(winner.clone());
+                    ip.realized_pnl = Some(ipnl);
+                    ideal_changed = true;
+                }
+            }
+
             self.write_signal(&serde_json::json!({
                 "phase":"settlement","slug":slug,"winner":winner,"pnl":pnl,
                 "ts":chrono::Utc::now().timestamp()
@@ -485,6 +498,9 @@ impl SmartStrategy {
             let s = self.state.summary();
             info!("[SMART STATS] 共{}盘 锁{} 赢{} 输{}  净PNL ${:.2}",
                 s.total, s.locked, s.win, s.lose, s.total_pnl);
+        }
+        if ideal_changed {
+            self.ideal_state.save().await?;
         }
         Ok(())
     }
