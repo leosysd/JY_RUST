@@ -123,6 +123,22 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
                 service_cmd("restart");
             }
         }
+        "set-param" => {
+            // 通用：jy set-param <KEY> <VALUE> [--restart]
+            let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            let val = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            if key.is_empty() || val.is_empty() {
+                eprintln!("用法: jy set-param <KEY> <VALUE> [--restart]");
+                eprintln!("常用键: {}", TUNABLE_PARAMS.iter().map(|p| p.0).collect::<Vec<_>>().join(" "));
+                std::process::exit(1);
+            }
+            set_env_val(key, val);
+            println!("{} {key}={val}", style("✔").green());
+            if args.contains(&"--restart".to_string()) {
+                service_cmd("restart");
+            }
+        }
+        "params" => show_params(),
         "update" => update_bot()?,
         _ => {
             eprintln!("未知命令: {}", args[0]);
@@ -130,6 +146,30 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 可调策略参数表：(env 键, 中文说明, 默认值)。用于 `jy params` 展示与交互式调参菜单。
+const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
+    ("SCALEIN_QTY",           "scale-in 每笔份额",                 "20"),
+    ("SCALEIN_MAX_SHARES",    "scale-in 单边累计份额上限",         "200"),
+    ("SCALEIN_STEP_SEC",      "scale-in 加仓间隔(秒)",             "15"),
+    ("SCALEIN_START_SECS",    "scale-in 起始(剩余秒 ≤ 此值才加仓)", "240"),
+    ("SCALEIN_STOP_SECS",     "scale-in 停止(剩余秒 ≤ 此值停加仓)", "60"),
+    ("TAKER_BUFFER",          "taker 吃单滑点缓冲(限价=ask+此值)",  "0.02"),
+    ("FORCE_LOCK_SECONDS_LEFT","强制处理线(剩余 ≤ 此秒触发)",       "60"),
+    ("QUANT_ORDER_SHARES",    "zscore 每单份额",                   "20"),
+    ("TREND_CHASE_MAX_PRICE", "zscore 追单价格上限",               "0.60"),
+    ("LOCK_MIN_PROFIT_FACTOR","zscore 锁利门槛系数(×份额)",        "0.2"),
+];
+
+/// 打印所有可调参数的当前值（未设置则显示默认）。
+fn show_params() {
+    println!("{}", style("── 策略可调参数 ──").bold());
+    for (key, desc, default) in TUNABLE_PARAMS {
+        let val = read_env_val(key).unwrap_or_else(|| format!("{default}(默认)"));
+        println!("  {:<26} = {:<14} {}", style(key).dim(), style(val).white(), style(desc).dim());
+    }
+    println!("\n  改单个: {}", style("jy set-param <KEY> <VALUE> [--restart]").cyan());
 }
 
 fn interactive_menu() -> Result<()> {
@@ -165,8 +205,9 @@ fn interactive_menu() -> Result<()> {
             "9.  切换 DRY_RUN 模式",
             "10. 切换模式（quant / copy）",
             "11. 切换入场策略（zscore / maker_scalein）",
-            "12. 清空模拟数据",
-            "13. 更新程序（从 GitHub 拉取最新版本）",
+            "12. 调策略参数（scale-in / 滑点 等）",
+            "13. 清空模拟数据",
+            "14. 更新程序（从 GitHub 拉取最新版本）",
             "0.  退出",
         ];
 
@@ -193,9 +234,10 @@ fn interactive_menu() -> Result<()> {
             8 => toggle_dry_run()?,
             9 => toggle_strategy()?,
             10 => toggle_entry_strategy()?,
-            11 => clear_sim_data()?,
-            12 => update_bot()?,
-            13 => break,
+            11 => tune_params()?,
+            12 => clear_sim_data()?,
+            13 => update_bot()?,
+            14 => break,
             _ => {}
         }
     }
@@ -347,6 +389,36 @@ fn toggle_entry_strategy() -> Result<()> {
     set_env_val("ENTRY_STRATEGY", new_val);
     println!("{} ENTRY_STRATEGY={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
+        service_cmd("restart");
+    }
+    Ok(())
+}
+
+/// 交互式调参：列出可调参数，选一个改值，可选重启。
+fn tune_params() -> Result<()> {
+    println!("{}", style("── 调策略参数 ──").bold());
+    let labels: Vec<String> = TUNABLE_PARAMS.iter().map(|(key, desc, default)| {
+        let val = read_env_val(key).unwrap_or_else(|| format!("{default}(默认)"));
+        format!("{key:<26} = {val:<14} {desc}")
+    }).collect();
+    let mut items: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    items.push("返回");
+    let sel = Select::with_theme(&theme())
+        .with_prompt("选择要修改的参数")
+        .items(&items)
+        .default(items.len() - 1)
+        .interact()?;
+    if sel >= TUNABLE_PARAMS.len() { return Ok(()); }
+
+    let (key, desc, default) = TUNABLE_PARAMS[sel];
+    let cur = read_env_val(key).unwrap_or_else(|| default.to_string());
+    let new_val: String = Input::with_theme(&theme())
+        .with_prompt(format!("{key}（{desc}）"))
+        .default(cur)
+        .interact_text()?;
+    set_env_val(key, new_val.trim());
+    println!("{} {key}={}", style("✔").green(), new_val.trim());
+    if Confirm::with_theme(&theme()).with_prompt("重启服务使其生效？").default(true).interact()? {
         service_cmd("restart");
     }
     Ok(())
