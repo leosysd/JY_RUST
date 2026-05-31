@@ -475,8 +475,8 @@ impl SmartStrategy {
         pos: MarketPosition,
         up_ask: f64,
         dn_ask: f64,
-        up_bid: f64,
-        dn_bid: f64,
+        _up_bid: f64,
+        _dn_bid: f64,
         seconds_left: i64,
     ) -> Result<()> {
         if matches!(pos.phase, Phase::Settled) { return Ok(()); }
@@ -507,15 +507,15 @@ impl SmartStrategy {
                 .chain(pos.trades.iter().map(|t| t.ts))
                 .max().unwrap_or(0);
             if now - last >= self.config.scalein_step_sec {
-                let (dir, ask, _bid) = if up_ask >= dn_ask { ("Up", up_ask, up_bid) } else { ("Down", dn_ask, dn_bid) };
-                // 单边累计份额（已成交 + 残留挂单）风控
-                let held = if dir == "Up" { pos.up_shares } else { pos.down_shares };
-                let pending: f64 = pos.open_orders.iter()
-                    .filter(|o| o.side == dir)
-                    .map(|o| (o.size - o.matched_recorded).max(0.0))
-                    .sum();
-                if held + pending < self.config.scalein_max_shares && ask > 0.02 {
-                    // 硬切 taker：直接传 ask，buy() 内部加 +0.02 缓冲穿透盘口立即吃单(FAK)。
+                // v1 双边捡便宜：两边分别判断，某边 ask ≤ cheap_max 且未超单边上限就买该边。
+                // 便宜边被买更多次→方向倒斜；两边都持有→对冲；只在便宜时吃(taker)→压低均价。
+                // 不再追 ask 高(贵)的一边——这是相对旧版单边追贵的核心修正。
+                let cheap = self.config.scalein_cheap_max;
+                let cap = self.config.scalein_max_shares;
+                for (dir, ask) in [("Up", up_ask), ("Down", dn_ask)] {
+                    if ask <= 0.02 || ask > cheap { continue; }
+                    let held = if dir == "Up" { pos.up_shares } else { pos.down_shares };
+                    if held >= cap { continue; }
                     self.scalein_place(market, dir, ask, self.config.scalein_qty, price_to_beat).await?;
                 }
             }

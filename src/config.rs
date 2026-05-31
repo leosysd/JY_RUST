@@ -64,6 +64,8 @@ pub struct Config {
     pub scalein_stop_secs: i64,
     /// scale-in 单边累计份额上限（风控：避免无限加仓）
     pub scalein_max_shares: f64,
+    /// v1 双边捡便宜：某边 ask ≤ 此值才买该边（压低均价、避免追高）。两边分别判断。
+    pub scalein_cheap_max: f64,
 
     // 系统
     pub poll_ms: u64,
@@ -219,6 +221,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         scalein_start_secs: env_i64("SCALEIN_START_SECS", 240),
         scalein_stop_secs: env_i64("SCALEIN_STOP_SECS", 60),
         scalein_max_shares: env_f64("SCALEIN_MAX_SHARES", 200.0),
+        scalein_cheap_max: env_f64("SCALEIN_CHEAP_MAX", 0.55),
         poll_ms: env_u64("POLL_MS", 1000),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
