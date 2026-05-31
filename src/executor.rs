@@ -244,6 +244,45 @@ impl OrderExecutor {
         }
     }
 
+    /// 拉本账户近期成交，聚合成 `order_id -> (累计成交份额, 成交价)`。
+    ///
+    /// 根治 Bug2：`query_order`(`data/order/{id}`) 对刚挂单/成交后从簿消失的单会 404，
+    /// 导致 maker 成交漏记。改走 `data/trades`(鉴权后只返回本账户成交)：我们是 post_only
+    /// 纯 maker，成交必出现在对手 taker 那笔 trade 的 `maker_orders[]` 里，按 `order_id` 对回挂单。
+    /// 同一挂单可能分多笔 trade 部分成交，故 `matched_amount` 累加。
+    /// 翻页最多 5 页（5 分钟盘单量小、maker 生命周期≤ttl，最近几页足以覆盖）。
+    pub async fn maker_fills(&self) -> Result<std::collections::HashMap<String, (f64, f64)>> {
+        use polymarket_client_sdk_v2::clob::types::request::TradesRequest;
+        let mut out: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new();
+        match self {
+            Self::DryRun => Ok(out),
+            Self::Live { client, .. } => {
+                let req = TradesRequest::builder().build();
+                let mut cursor: Option<String> = None;
+                let mut pages = 0u32;
+                loop {
+                    let page = client.trades(&req, cursor.clone()).await
+                        .context("查询成交流水失败")?;
+                    for tr in &page.data {
+                        for mo in &tr.maker_orders {
+                            let matched = mo.matched_amount.to_string().parse::<f64>().unwrap_or(0.0);
+                            let price = mo.price.to_string().parse::<f64>().unwrap_or(0.0);
+                            let e = out.entry(mo.order_id.clone()).or_insert((0.0, price));
+                            e.0 += matched;
+                            if price > 0.0 { e.1 = price; }
+                        }
+                    }
+                    pages += 1;
+                    if page.next_cursor.is_empty() || page.data.is_empty() || pages >= 5 {
+                        break;
+                    }
+                    cursor = Some(page.next_cursor.clone());
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// 撤单。返回是否确实撤掉（已成交的单撤不掉，返回 false，靠下次 query 兜底收割）。
     pub async fn cancel(&self, order_id: &str) -> Result<bool> {
         match self {

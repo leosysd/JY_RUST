@@ -525,37 +525,43 @@ impl SmartStrategy {
         Ok(())
     }
 
-    /// 收割 open_orders 成交：查 size_matched 增量记账；完成/超时则移除（超时先撤单）。
+    /// 收割 open_orders 成交：用 trades 对账查增量记账；完成/超时则移除（超时先撤单）。
+    ///
+    /// Bug2 修复：弃用 per-order `query_order`(`data/order/{id}` 会 404)，改一次性拉
+    /// `maker_fills()`(`data/trades`，本账户权威成交)，按 order_id 取累计成交份额，
+    /// 减去已记账得增量。拉表失败则本 tick 全部保留、不误判。
     async fn harvest_open_orders(&mut self, market: &Market) -> Result<()> {
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
         if pos.open_orders.is_empty() { return Ok(()); }
         let ex = self.executor.clone();
         let now = chrono::Utc::now().timestamp();
+
+        let fills = match ex.maker_fills().await {
+            Ok(f) => f,
+            Err(e) => { warn!("[MAKER] 拉成交流水失败，本tick保留全部挂单: {e:#}"); return Ok(()); }
+        };
+
         let mut still_open: Vec<crate::position::OpenOrder> = vec![];
         let mut newly: Vec<(String, f64, f64, String)> = vec![]; // (dir, price, shares, phase)
 
         for oo in &pos.open_orders {
-            // 刚挂的单 data-api 尚未索引会 404；存活 <3s 先不查，避免瞬时误判+刷错误日志。
+            // 刚挂的单 data-api 尚未索引；存活 <3s 先不动，避免漏看刚成交就误删。
             if now - oo.placed_ts < 3 { still_open.push(oo.clone()); continue; }
-            let st = match ex.query_order(&oo.order_id).await {
-                Ok(s) => s,
-                Err(e) => { warn!("[MAKER] 查单失败 id={} {e:#}", oo.order_id); still_open.push(oo.clone()); continue; }
-            };
-            let inc = st.size_matched - oo.matched_recorded;
+            let (matched, fp) = fills.get(&oo.order_id).copied().unwrap_or((0.0, 0.0));
+            let inc = matched - oo.matched_recorded;
             if inc > 0.0 {
-                let fill_price = if st.price > 0.0 { st.price } else { oo.price };
+                let fill_price = if fp > 0.0 { fp } else { oo.price };
                 newly.push((oo.side.clone(), fill_price, inc, oo.phase.clone()));
             }
-            let done = st.status == "matched" || st.status == "canceled"
-                || st.size_matched >= oo.size - 0.001;
+            let done = matched >= oo.size - 0.001;
             let timed_out = now - oo.placed_ts >= self.config.maker_ttl_sec;
             if done {
-                // 全成或已取消 → 不保留
+                // 全成 → 不保留
             } else if timed_out {
                 let _ = ex.cancel(&oo.order_id).await; // 撤超时单，剩余下 tick 重挂
             } else {
                 let mut k = oo.clone();
-                k.matched_recorded = st.size_matched;
+                k.matched_recorded = matched;
                 still_open.push(k);
             }
         }
@@ -607,22 +613,24 @@ impl SmartStrategy {
     }
 
     /// 撤掉某市场所有挂单（force 边界清场）。
-    /// 撤单前先 query 收割最终成交：maker 单可能在撤单瞬间刚好（部分）成交，
-    /// 若直接 clear 会丢失这部分成交、少记盈亏。故先 harvest 再撤再 clear。
+    /// 先撤单，再用 trades 对账收割最终成交：maker 单可能在撤单瞬间刚好（部分）成交，
+    /// 若直接 clear 会丢失这部分成交、少记盈亏。故先撤再对账再 clear。
     async fn cancel_all_open(&mut self, market: &Market) -> Result<()> {
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
         if pos.open_orders.is_empty() { return Ok(()); }
         let ex = self.executor.clone();
-        let mut newly: Vec<(String, f64, f64, String)> = vec![];
         for oo in &pos.open_orders {
             let _ = ex.cancel(&oo.order_id).await;
-            // 撤单后再查一次：撤不掉(已成交)或部分成交的份额在此收割
-            if let Ok(st) = ex.query_order(&oo.order_id).await {
-                let inc = st.size_matched - oo.matched_recorded;
-                if inc > 0.0 {
-                    let fp = if st.price > 0.0 { st.price } else { oo.price };
-                    newly.push((oo.side.clone(), fp, inc, oo.phase.clone()));
-                }
+        }
+        // 撤单后拉一次成交流水兜底：撤不掉(已成交)或部分成交的份额在此收割
+        let fills = ex.maker_fills().await.unwrap_or_default();
+        let mut newly: Vec<(String, f64, f64, String)> = vec![];
+        for oo in &pos.open_orders {
+            let (matched, fp) = fills.get(&oo.order_id).copied().unwrap_or((0.0, 0.0));
+            let inc = matched - oo.matched_recorded;
+            if inc > 0.0 {
+                let fill_price = if fp > 0.0 { fp } else { oo.price };
+                newly.push((oo.side.clone(), fill_price, inc, oo.phase.clone()));
             }
         }
         for (dir, price, shares, phase) in &newly {
