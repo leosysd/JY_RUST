@@ -525,44 +525,66 @@ impl SmartStrategy {
         Ok(())
     }
 
-    /// 收割 open_orders 成交：用 trades 对账查增量记账；完成/超时则移除（超时先撤单）。
+    /// 收割 open_orders 成交：用 `orders()` 列表对账查增量记账。
     ///
-    /// Bug2 修复：弃用 per-order `query_order`(`data/order/{id}` 会 404)，改一次性拉
-    /// `maker_fills()`(`data/trades`，本账户权威成交)，按 order_id 取累计成交份额，
-    /// 减去已记账得增量。拉表失败则本 tick 全部保留、不误判。
+    /// Bug2 修复（orders 版）：`maker_fills()` 返回**仍挂在簿上**的单的 size_matched。
+    /// 因为全成交的单会从 orders 列表消失，故用 `seen_live` 区分两种"消失"：
+    ///   - 在列表里：确认 seen_live=true，按 size_matched 记增量；超时则撤单（已成部分已记）。
+    ///   - 不在列表里 + seen_live=true：判定全成交 → 补记剩余 (size - matched_recorded)。
+    ///   - 不在列表里 + seen_live=false + 已过 ttl：可能挂单失败/被拒，保守不补记直接移除。
+    ///   - 不在列表里 + seen_live=false + 未过 ttl：刚挂未被索引，保留等待。
+    /// 拉表失败则本 tick 全部保留、不误判。
     async fn harvest_open_orders(&mut self, market: &Market) -> Result<()> {
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
         if pos.open_orders.is_empty() { return Ok(()); }
         let ex = self.executor.clone();
         let now = chrono::Utc::now().timestamp();
 
-        let fills = match ex.maker_fills().await {
+        let live = match ex.maker_fills().await {
             Ok(f) => f,
-            Err(e) => { warn!("[MAKER] 拉成交流水失败，本tick保留全部挂单: {e:#}"); return Ok(()); }
+            Err(e) => { warn!("[MAKER] 拉挂单失败，本tick保留全部挂单: {e:#}"); return Ok(()); }
         };
 
         let mut still_open: Vec<crate::position::OpenOrder> = vec![];
         let mut newly: Vec<(String, f64, f64, String)> = vec![]; // (dir, price, shares, phase)
 
         for oo in &pos.open_orders {
-            // 刚挂的单 data-api 尚未索引；存活 <3s 先不动，避免漏看刚成交就误删。
-            if now - oo.placed_ts < 3 { still_open.push(oo.clone()); continue; }
-            let (matched, fp) = fills.get(&oo.order_id).copied().unwrap_or((0.0, 0.0));
-            let inc = matched - oo.matched_recorded;
-            if inc > 0.0 {
-                let fill_price = if fp > 0.0 { fp } else { oo.price };
-                newly.push((oo.side.clone(), fill_price, inc, oo.phase.clone()));
-            }
-            let done = matched >= oo.size - 0.001;
             let timed_out = now - oo.placed_ts >= self.config.maker_ttl_sec;
-            if done {
-                // 全成 → 不保留
-            } else if timed_out {
-                let _ = ex.cancel(&oo.order_id).await; // 撤超时单，剩余下 tick 重挂
-            } else {
-                let mut k = oo.clone();
-                k.matched_recorded = matched;
-                still_open.push(k);
+            match live.get(&oo.order_id).copied() {
+                // ── 仍挂在簿上：按 size_matched 记增量 ──
+                Some((matched, fp)) => {
+                    let inc = matched - oo.matched_recorded;
+                    if inc > 0.0 {
+                        let fill_price = if fp > 0.0 { fp } else { oo.price };
+                        newly.push((oo.side.clone(), fill_price, inc, oo.phase.clone()));
+                    }
+                    if matched >= oo.size - 0.001 {
+                        // 全成 → 不保留
+                    } else if timed_out {
+                        let _ = ex.cancel(&oo.order_id).await; // 撤超时单，已成部分已记，剩余作罢
+                    } else {
+                        let mut k = oo.clone();
+                        k.matched_recorded = matched;
+                        k.seen_live = true;
+                        still_open.push(k);
+                    }
+                }
+                // ── 不在簿上 ──
+                None => {
+                    if oo.seen_live {
+                        // 曾确认挂上、现消失 → 判定全成交，补记剩余份额
+                        let inc = oo.size - oo.matched_recorded;
+                        if inc > 0.0 {
+                            newly.push((oo.side.clone(), oo.price, inc, oo.phase.clone()));
+                        }
+                        // 不保留
+                    } else if timed_out {
+                        // 从没见过且已超时：挂单大概率失败/被拒，保守不补记，移除
+                    } else {
+                        // 刚挂未被索引，保留等待
+                        still_open.push(oo.clone());
+                    }
+                }
             }
         }
         // 注：maker 成交暂仍按 record_trade 的 taker 口径记 7% 费（保守，偏高估）。
@@ -601,7 +623,7 @@ impl SmartStrategy {
             p.open_orders.push(crate::position::OpenOrder {
                 order_id: fill.order_id, side: dir.to_string(), price,
                 size: qty.round().max(1.0), matched_recorded: 0.0, placed_ts: now,
-                phase: "scalein".to_string(),
+                phase: "scalein".to_string(), seen_live: false,
             });
             if matches!(p.phase, Phase::Waiting) {
                 p.phase = Phase::Holding;
@@ -613,28 +635,40 @@ impl SmartStrategy {
     }
 
     /// 撤掉某市场所有挂单（force 边界清场）。
-    /// 先撤单，再用 trades 对账收割最终成交：maker 单可能在撤单瞬间刚好（部分）成交，
-    /// 若直接 clear 会丢失这部分成交、少记盈亏。故先撤再对账再 clear。
+    /// 用 orders() 语义必须**先对账再撤单**：撤单后单子从 orders 列表消失，无法再查 size_matched。
+    /// 故先拉一次 live 收割已成部分(含 seen_live 消失=全成)，再撤剩余，最后 clear。
     async fn cancel_all_open(&mut self, market: &Market) -> Result<()> {
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
         if pos.open_orders.is_empty() { return Ok(()); }
         let ex = self.executor.clone();
-        for oo in &pos.open_orders {
-            let _ = ex.cancel(&oo.order_id).await;
-        }
-        // 撤单后拉一次成交流水兜底：撤不掉(已成交)或部分成交的份额在此收割
-        let fills = ex.maker_fills().await.unwrap_or_default();
+
+        // 撤单前先对账：拿仍挂着的 size_matched，消失且 seen_live 的判全成。
+        let live = ex.maker_fills().await.unwrap_or_default();
         let mut newly: Vec<(String, f64, f64, String)> = vec![];
         for oo in &pos.open_orders {
-            let (matched, fp) = fills.get(&oo.order_id).copied().unwrap_or((0.0, 0.0));
-            let inc = matched - oo.matched_recorded;
-            if inc > 0.0 {
-                let fill_price = if fp > 0.0 { fp } else { oo.price };
-                newly.push((oo.side.clone(), fill_price, inc, oo.phase.clone()));
+            match live.get(&oo.order_id).copied() {
+                Some((matched, fp)) => {
+                    let inc = matched - oo.matched_recorded;
+                    if inc > 0.0 {
+                        let fill_price = if fp > 0.0 { fp } else { oo.price };
+                        newly.push((oo.side.clone(), fill_price, inc, oo.phase.clone()));
+                    }
+                }
+                None if oo.seen_live => {
+                    let inc = oo.size - oo.matched_recorded;
+                    if inc > 0.0 {
+                        newly.push((oo.side.clone(), oo.price, inc, oo.phase.clone()));
+                    }
+                }
+                None => {}
             }
         }
         for (dir, price, shares, phase) in &newly {
             record_trade(&mut self.state, market, dir, *price, *shares, phase, 0.0, false);
+        }
+        // 收割完再撤剩余挂单
+        for oo in &pos.open_orders {
+            let _ = ex.cancel(&oo.order_id).await;
         }
         let p = self.state.get_or_create(&market.slug, market.end_ts);
         p.open_orders.clear();

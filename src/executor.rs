@@ -244,33 +244,30 @@ impl OrderExecutor {
         }
     }
 
-    /// 拉本账户近期成交，聚合成 `order_id -> (累计成交份额, 成交价)`。
+    /// 拉本账户**当前仍挂在簿上**的单，聚合成 `order_id -> (已成交份额, 挂单价)`。
     ///
-    /// 根治 Bug2：`query_order`(`data/order/{id}`) 对刚挂单/成交后从簿消失的单会 404，
-    /// 导致 maker 成交漏记。改走 `data/trades`(鉴权后只返回本账户成交)：我们是 post_only
-    /// 纯 maker，成交必出现在对手 taker 那笔 trade 的 `maker_orders[]` 里，按 `order_id` 对回挂单。
-    /// 同一挂单可能分多笔 trade 部分成交，故 `matched_amount` 累加。
-    /// 翻页最多 5 页（5 分钟盘单量小、maker 生命周期≤ttl，最近几页足以覆盖）。
+    /// Bug2 修复历程：①旧 `query_order`(`data/order/{id}`) 单查刚挂/已成的单会 404；
+    /// ②`data/trades` 又因官方 SDK 严格解析遇空字符串崩(invalid Decimal "")。
+    /// 最终改走 `client.orders()`(`data/orders` 列表，返回 OpenOrderResponse 能正常解析、不 404)。
+    /// 注意语义：orders 只返回**未全成**的单——单子全部成交后会从列表消失。
+    /// 故调用方(harvest)需配合 `seen_live` 标记：曾出现在本表、之后消失 = 全成交补记。
+    /// 翻页最多 5 页（5 分钟盘挂单数很少）。
     pub async fn maker_fills(&self) -> Result<std::collections::HashMap<String, (f64, f64)>> {
-        use polymarket_client_sdk_v2::clob::types::request::TradesRequest;
+        use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
         let mut out: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new();
         match self {
             Self::DryRun => Ok(out),
             Self::Live { client, .. } => {
-                let req = TradesRequest::builder().build();
+                let req = OrdersRequest::builder().build();
                 let mut cursor: Option<String> = None;
                 let mut pages = 0u32;
                 loop {
-                    let page = client.trades(&req, cursor.clone()).await
-                        .context("查询成交流水失败")?;
-                    for tr in &page.data {
-                        for mo in &tr.maker_orders {
-                            let matched = mo.matched_amount.to_string().parse::<f64>().unwrap_or(0.0);
-                            let price = mo.price.to_string().parse::<f64>().unwrap_or(0.0);
-                            let e = out.entry(mo.order_id.clone()).or_insert((0.0, price));
-                            e.0 += matched;
-                            if price > 0.0 { e.1 = price; }
-                        }
+                    let page = client.orders(&req, cursor.clone()).await
+                        .context("查询挂单失败")?;
+                    for o in &page.data {
+                        let matched = o.size_matched.to_string().parse::<f64>().unwrap_or(0.0);
+                        let price = o.price.to_string().parse::<f64>().unwrap_or(0.0);
+                        out.insert(o.id.clone(), (matched, price));
                     }
                     pages += 1;
                     if page.next_cursor.is_empty() || page.data.is_empty() || pages >= 5 {
