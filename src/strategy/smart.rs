@@ -111,7 +111,7 @@ impl SmartStrategy {
         let up_token = market.token_ids[up_idx].clone();
         let dn_token = market.token_ids[dn_idx].clone();
 
-        let (up_ask, dn_ask) = {
+        let (up_ask, dn_ask, up_bid, dn_bid) = {
             let cache = self.cache.read().await;
             let Some(ua) = cache.get(&up_token).and_then(|b| b.best_ask()) else {
                 info!("[SMART] {} WS盘口未就绪...", market.title);
@@ -121,8 +121,12 @@ impl SmartStrategy {
                 info!("[SMART] {} WS盘口未就绪...", market.title);
                 return Ok(());
             };
+            let ub = cache.get(&up_token).and_then(|b| b.best_bid())
+                .map(|d| f64::from(d.try_into().unwrap_or(0.0f32))).unwrap_or(0.0);
+            let db = cache.get(&dn_token).and_then(|b| b.best_bid())
+                .map(|d| f64::from(d.try_into().unwrap_or(0.0f32))).unwrap_or(0.0);
             (f64::from(ua.try_into().unwrap_or(0.5f32)),
-             f64::from(da.try_into().unwrap_or(0.5f32)))
+             f64::from(da.try_into().unwrap_or(0.5f32)), ub, db)
         };
 
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
@@ -132,7 +136,7 @@ impl SmartStrategy {
 
         // 路线二：maker scale-in 策略（与旧 z-score 单发并存，ENTRY_STRATEGY 切换）。
         if self.config.entry_strategy == "maker_scalein" {
-            self.decide_maker(&market, pos, up_ask, dn_ask, seconds_left).await?;
+            self.decide_maker(&market, pos, up_ask, dn_ask, up_bid, dn_bid, seconds_left).await?;
             return Ok(());
         }
 
@@ -467,6 +471,8 @@ impl SmartStrategy {
         pos: MarketPosition,
         up_ask: f64,
         dn_ask: f64,
+        up_bid: f64,
+        dn_bid: f64,
         seconds_left: i64,
     ) -> Result<()> {
         if matches!(pos.phase, Phase::Settled) { return Ok(()); }
@@ -497,7 +503,7 @@ impl SmartStrategy {
                 .chain(pos.trades.iter().map(|t| t.ts))
                 .max().unwrap_or(0);
             if now - last >= self.config.scalein_step_sec {
-                let (dir, ask) = if up_ask >= dn_ask { ("Up", up_ask) } else { ("Down", dn_ask) };
+                let (dir, ask, bid) = if up_ask >= dn_ask { ("Up", up_ask, up_bid) } else { ("Down", dn_ask, dn_bid) };
                 // 单边累计份额（已成交 + 挂单未成交）风控
                 let held = if dir == "Up" { pos.up_shares } else { pos.down_shares };
                 let pending: f64 = pos.open_orders.iter()
@@ -505,8 +511,13 @@ impl SmartStrategy {
                     .map(|o| (o.size - o.matched_recorded).max(0.0))
                     .sum();
                 if held + pending < self.config.scalein_max_shares && ask > 0.02 {
-                    // maker 买单挂 ask 下一档；post_only 保证不吃单（被拒则下 tick 再试）
-                    let price = (ask - 0.01).max(0.01);
+                    // maker 买单挂在买一侧：取 min(ask-0.01, bid+0.01) 既贴近成交又严格低于 ask
+                    // (post_only 保证不吃单/不穿盘口)；无买盘则退到 ask-0.01。
+                    let price = if bid > 0.0 {
+                        (ask - 0.01).min(bid + 0.01).max(0.01)
+                    } else {
+                        (ask - 0.01).max(0.01)
+                    };
                     self.scalein_place(market, dir, price, self.config.scalein_qty, price_to_beat).await?;
                 }
             }
@@ -524,6 +535,8 @@ impl SmartStrategy {
         let mut newly: Vec<(String, f64, f64, String)> = vec![]; // (dir, price, shares, phase)
 
         for oo in &pos.open_orders {
+            // 刚挂的单 data-api 尚未索引会 404；存活 <3s 先不查，避免瞬时误判+刷错误日志。
+            if now - oo.placed_ts < 3 { still_open.push(oo.clone()); continue; }
             let st = match ex.query_order(&oo.order_id).await {
                 Ok(s) => s,
                 Err(e) => { warn!("[MAKER] 查单失败 id={} {e:#}", oo.order_id); still_open.push(oo.clone()); continue; }

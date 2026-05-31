@@ -45,6 +45,9 @@ impl OrderBook {
     pub fn best_ask(&self) -> Option<Decimal> {
         self.asks.first().map(|(p, _)| *p)
     }
+    pub fn best_bid(&self) -> Option<Decimal> {
+        self.bids.first().map(|(p, _)| *p)
+    }
 }
 
 pub type BookCache = Arc<RwLock<HashMap<String, OrderBook>>>;
