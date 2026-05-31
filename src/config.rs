@@ -108,11 +108,12 @@ fn env_f64(key: &str, default: f64) -> f64 {
 }
 
 pub fn load(env_path: Option<&str>) -> Result<Config> {
-    if let Some(p) = env_path {
-        dotenvy::from_path(p).ok();
-    } else {
-        dotenvy::dotenv().ok();
-    }
+    // env_path 为 None 时默认用规范路径，与 CLI(cli/main.rs ENV_PATH) 完全一致。
+    // 否则 bot 不带 .env 参数启动会退回 CWD 解析(dotenv 搜 CWD + base="."),
+    // 把 quant_state.json 写进工作目录,而 CLI 仍读 /opt/polymarket-copy/quant_state.json
+    // → stats 永远"暂无数据文件"。见其他 VPS 模拟无统计表问题。
+    let env_path = env_path.unwrap_or("/opt/polymarket-copy/.env");
+    dotenvy::from_path(env_path).ok();
 
     let private_key = match std::env::var("PRIVATE_KEY") {
         Ok(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
@@ -142,8 +143,9 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
     }
 
     let base = PathBuf::from(
-        env_path
-            .and_then(|p| std::path::Path::new(p).parent().map(|p| p.to_str().unwrap_or(".").to_string()))
+        std::path::Path::new(env_path)
+            .parent()
+            .map(|p| p.to_str().unwrap_or(".").to_string())
             .unwrap_or_else(|| ".".to_string()),
     );
 
