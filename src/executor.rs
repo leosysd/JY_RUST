@@ -164,6 +164,122 @@ impl OrderExecutor {
             }
         }
     }
+
+    // ── 路线二 maker 能力层（GTC + post_only，零 taker 费）──────────────────
+    //
+    // 设计见 reference_maker_state_machine。挂单后状态由 query_order 轮询，
+    // 超时由 cancel 撤单。DryRun 下 place_maker 仍立即全额成交（沿用理想账语义），
+    // 因此 DryRun 不会进入“挂单等收割”分支，maker 成交率必须 LIVE 小额实测。
+
+    /// 挂 maker 限价单（GTC + post_only）。
+    /// post_only 保证只做 maker：若该价会立即吃单，交易所直接拒绝（success=false），
+    /// 从而永不付 taker 费。返回 Fill：
+    ///   - DryRun：立即全额成交（filled_shares=shares）。
+    ///   - LIVE 挂单成功：success=true、filled_shares=0（挂在簿上，等 query_order 收割）。
+    ///   - LIVE 被拒（会吃单/越界）：success=false。
+    pub async fn place_maker(&self, token_id: &str, price: f64, shares: f64) -> Result<Fill> {
+        match self {
+            Self::DryRun => Ok(Fill::simulated(price, shares)),
+            Self::Live { client, signer } => {
+                let tid = U256::from_str(token_id)
+                    .with_context(|| format!("token_id 解析失败: {token_id}"))?;
+                // maker 价对齐 0.01 tick；不加缓冲，就挂在该价位等成交。
+                let limit = ((price.clamp(0.01, 0.99)) * 100.0).round() / 100.0;
+                let order_shares = shares.round().max(1.0);
+                let p = SdkDecimal::from_str(&format!("{limit:.2}"))
+                    .context("价格转换失败")?;
+                let s = SdkDecimal::from_str(&format!("{order_shares:.0}"))
+                    .context("份额转换失败")?;
+
+                let resp = client
+                    .limit_order()
+                    .token_id(tid)
+                    .side(Side::Buy)
+                    .price(p)
+                    .size(s)
+                    .order_type(OrderType::GTC)
+                    .post_only(true)
+                    .build_sign_and_post(signer)
+                    .await
+                    .context("提交 maker 订单失败")?;
+
+                let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
+                let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+                let (filled_price, filled_shares) = if taking > 0.0 {
+                    (making / taking, taking)
+                } else {
+                    (limit, 0.0)
+                };
+                if !resp.success {
+                    warn!("[EXEC MAKER] 挂单被拒: id={} status={} err={:?}",
+                        resp.order_id, resp.status, resp.error_msg);
+                }
+                Ok(Fill {
+                    order_id: resp.order_id,
+                    status: resp.status.to_string(),
+                    success: resp.success,
+                    simulated: false,
+                    filled_price,
+                    filled_shares,
+                })
+            }
+        }
+    }
+
+    /// 查一张挂单的成交进度。DryRun 视为已成交（占位，DryRun 不走轮询路径）。
+    pub async fn query_order(&self, order_id: &str) -> Result<OrderState> {
+        match self {
+            Self::DryRun => Ok(OrderState {
+                status: "matched".into(), size: 0.0, size_matched: 0.0, price: 0.0,
+            }),
+            Self::Live { client, .. } => {
+                let o = client.order(order_id).await.context("查询订单失败")?;
+                Ok(OrderState {
+                    status: format!("{:?}", o.status).to_lowercase(),
+                    size: o.original_size.to_string().parse().unwrap_or(0.0),
+                    size_matched: o.size_matched.to_string().parse().unwrap_or(0.0),
+                    price: o.price.to_string().parse().unwrap_or(0.0),
+                })
+            }
+        }
+    }
+
+    /// 撤单。返回是否确实撤掉（已成交的单撤不掉，返回 false，靠下次 query 兜底收割）。
+    pub async fn cancel(&self, order_id: &str) -> Result<bool> {
+        match self {
+            Self::DryRun => Ok(true),
+            Self::Live { client, .. } => {
+                let r = client.cancel_order(order_id).await.context("撤单失败")?;
+                Ok(r.canceled.iter().any(|id| id == order_id))
+            }
+        }
+    }
+
+    /// 查询某 token 的真实手续费率（bps）。用于核对代码内写死的 7% 假费与实际值。
+    pub async fn fee_rate_bps(&self, token_id: &str) -> Result<u32> {
+        match self {
+            Self::DryRun => Ok(0),
+            Self::Live { client, .. } => {
+                let tid = U256::from_str(token_id)
+                    .with_context(|| format!("token_id 解析失败: {token_id}"))?;
+                let r = client.fee_rate_bps(tid).await.context("查询费率失败")?;
+                Ok(r.base_fee)
+            }
+        }
+    }
+}
+
+/// 一张 maker 挂单的当前状态（query_order 返回）。
+#[derive(Debug, Clone)]
+pub struct OrderState {
+    /// live / matched / canceled / unmatched / delayed / unknown
+    pub status: String,
+    /// 原始下单份额
+    pub size: f64,
+    /// 已成交份额（轮询此值的增量即可知新成交）
+    pub size_matched: f64,
+    /// 挂单价
+    pub price: f64,
 }
 
 /// FOK 限价相对 ask 的上浮，使其可穿透盘口若干档成交。

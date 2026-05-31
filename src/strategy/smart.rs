@@ -130,6 +130,12 @@ impl SmartStrategy {
         // 逐秒盘口快照（节流到 1 秒/条）：为离线回放对冲/锁仓时机提供完整盘口序列。
         self.log_book(&market, &pos, up_ask, dn_ask, seconds_left).await;
 
+        // 路线二：maker scale-in 策略（与旧 z-score 单发并存，ENTRY_STRATEGY 切换）。
+        if self.config.entry_strategy == "maker_scalein" {
+            self.decide_maker(&market, pos, up_ask, dn_ask, seconds_left).await?;
+            return Ok(());
+        }
+
         match pos.phase {
             Phase::Waiting  => self.decide_waiting(&market, pos, up_ask, dn_ask, seconds_left).await?,
             Phase::Holding  => self.decide_holding(&market, pos, up_ask, dn_ask, seconds_left).await?,
@@ -447,6 +453,157 @@ impl SmartStrategy {
             market.title,
             if main_dir == "Up" { pos.up_avg_full() } else { pos.down_avg_full() }
         );
+        Ok(())
+    }
+
+    // ── 路线二：maker scale-in 策略（ENTRY_STRATEGY=maker_scalein）───────────
+    //
+    // JetFadil 式：5 分钟窗口内每隔 N 秒按当前领先侧挂 maker 单（GTC+post_only，零 taker 费）
+    // 顺势加仓；每 tick 收割成交、撤超时单重挂；force 线撤单裸持到结算（单边顺势，符合原型）。
+    // 与旧 z 策略完全隔离，旧逻辑一行不动。
+    async fn decide_maker(
+        &mut self,
+        market: &Market,
+        pos: MarketPosition,
+        up_ask: f64,
+        dn_ask: f64,
+        seconds_left: i64,
+    ) -> Result<()> {
+        if matches!(pos.phase, Phase::Settled) { return Ok(()); }
+
+        let price_to_beat = self.model.chainlink_at(market.start_ts)
+            .or_else(|| self.model.chainlink_latest())
+            .unwrap_or(0.0);
+
+        // 1) 收割已挂 maker 单的成交（更新 open_orders）
+        self.harvest_open_orders(market).await?;
+
+        // 2) force 边界：撤所有挂单，裸持到结算（maker 顺势策略不对锁，符合 JetFadil 模式）
+        if seconds_left <= self.config.force_lock_seconds_left {
+            self.cancel_all_open(market).await?;
+            let p = self.state.get_or_create(&market.slug, market.end_ts);
+            if !matches!(p.phase, Phase::Settled) { p.phase = Phase::Locked; }
+            self.state.save().await?;
+            return Ok(());
+        }
+
+        // 3) scale-in 窗口：(stop, start] 内每隔 step 秒加仓当前领先侧
+        if seconds_left <= self.config.scalein_start_secs
+            && seconds_left > self.config.scalein_stop_secs
+        {
+            let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
+            let now = chrono::Utc::now().timestamp();
+            let last = pos.open_orders.iter().map(|o| o.placed_ts)
+                .chain(pos.trades.iter().map(|t| t.ts))
+                .max().unwrap_or(0);
+            if now - last >= self.config.scalein_step_sec {
+                let (dir, ask) = if up_ask >= dn_ask { ("Up", up_ask) } else { ("Down", dn_ask) };
+                // 单边累计份额（已成交 + 挂单未成交）风控
+                let held = if dir == "Up" { pos.up_shares } else { pos.down_shares };
+                let pending: f64 = pos.open_orders.iter()
+                    .filter(|o| o.side == dir)
+                    .map(|o| (o.size - o.matched_recorded).max(0.0))
+                    .sum();
+                if held + pending < self.config.scalein_max_shares && ask > 0.02 {
+                    // maker 买单挂 ask 下一档；post_only 保证不吃单（被拒则下 tick 再试）
+                    let price = (ask - 0.01).max(0.01);
+                    self.scalein_place(market, dir, price, self.config.scalein_qty, price_to_beat).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 收割 open_orders 成交：查 size_matched 增量记账；完成/超时则移除（超时先撤单）。
+    async fn harvest_open_orders(&mut self, market: &Market) -> Result<()> {
+        let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
+        if pos.open_orders.is_empty() { return Ok(()); }
+        let ex = self.executor.clone();
+        let now = chrono::Utc::now().timestamp();
+        let mut still_open: Vec<crate::position::OpenOrder> = vec![];
+        let mut newly: Vec<(String, f64, f64, String)> = vec![]; // (dir, price, shares, phase)
+
+        for oo in &pos.open_orders {
+            let st = match ex.query_order(&oo.order_id).await {
+                Ok(s) => s,
+                Err(e) => { warn!("[MAKER] 查单失败 id={} {e:#}", oo.order_id); still_open.push(oo.clone()); continue; }
+            };
+            let inc = st.size_matched - oo.matched_recorded;
+            if inc > 0.0 {
+                let fill_price = if st.price > 0.0 { st.price } else { oo.price };
+                newly.push((oo.side.clone(), fill_price, inc, oo.phase.clone()));
+            }
+            let done = st.status == "matched" || st.status == "canceled"
+                || st.size_matched >= oo.size - 0.001;
+            let timed_out = now - oo.placed_ts >= self.config.maker_ttl_sec;
+            if done {
+                // 全成或已取消 → 不保留
+            } else if timed_out {
+                let _ = ex.cancel(&oo.order_id).await; // 撤超时单，剩余下 tick 重挂
+            } else {
+                let mut k = oo.clone();
+                k.matched_recorded = st.size_matched;
+                still_open.push(k);
+            }
+        }
+        // 注：maker 成交暂仍按 record_trade 的 taker 口径记 7% 费（保守，偏高估）。
+        //     实测确认 maker 费率后再校准记账。
+        for (dir, price, shares, phase) in &newly {
+            record_trade(&mut self.state, market, dir, *price, *shares, phase, 0.0, false);
+        }
+        let p = self.state.get_or_create(&market.slug, market.end_ts);
+        p.open_orders = still_open;
+        self.state.save().await?;
+        Ok(())
+    }
+
+    /// 挂一笔 scale-in maker 单：DRY_RUN/即时成交直接记账，LIVE 挂单成功则入 open_orders。
+    async fn scalein_place(
+        &mut self, market: &Market, dir: &str, price: f64, qty: f64, price_to_beat: f64,
+    ) -> Result<()> {
+        let Some(token) = market.token_for(dir) else { return Ok(()); };
+        let fill = match self.executor.place_maker(token, price, qty).await {
+            Ok(f) => f,
+            Err(e) => { warn!("[MAKER] 挂单失败 {dir} {e:#}"); return Ok(()); }
+        };
+        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+        if fill.filled_shares > 0.0 {
+            // DRY_RUN 或即时成交 → 直接记账
+            info!("[SMART SCALEIN {mode}] {} {dir}@{:.3} ×{:.0}份 即时成交",
+                market.title, fill.filled_price, fill.filled_shares);
+            record_trade(&mut self.state, market, dir, fill.filled_price, fill.filled_shares, "scalein", price_to_beat, false);
+            self.state.save().await?;
+        } else if fill.success {
+            // LIVE 挂在簿上 → 进 open_orders 等收割
+            info!("[SMART SCALEIN {mode}] {} 挂 {dir}@{price:.3} ×{qty:.0}份 id={}",
+                market.title, fill.order_id);
+            let now = chrono::Utc::now().timestamp();
+            let p = self.state.get_or_create(&market.slug, market.end_ts);
+            p.open_orders.push(crate::position::OpenOrder {
+                order_id: fill.order_id, side: dir.to_string(), price,
+                size: qty.round().max(1.0), matched_recorded: 0.0, placed_ts: now,
+                phase: "scalein".to_string(),
+            });
+            if matches!(p.phase, Phase::Waiting) {
+                p.phase = Phase::Holding;
+                p.price_to_beat = price_to_beat;
+            }
+            self.state.save().await?;
+        }
+        Ok(())
+    }
+
+    /// 撤掉某市场所有挂单（force 边界清场）。
+    async fn cancel_all_open(&mut self, market: &Market) -> Result<()> {
+        let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
+        if pos.open_orders.is_empty() { return Ok(()); }
+        let ex = self.executor.clone();
+        for oo in &pos.open_orders {
+            let _ = ex.cancel(&oo.order_id).await;
+        }
+        let p = self.state.get_or_create(&market.slug, market.end_ts);
+        p.open_orders.clear();
+        self.state.save().await?;
         Ok(())
     }
 

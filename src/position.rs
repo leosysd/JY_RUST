@@ -23,6 +23,19 @@ pub struct TradeRecord {
     pub time_bj: String,
 }
 
+/// 一张挂在簿上的 maker 订单（路线二）。持久化于 state，跨 tick 追踪成交进度。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenOrder {
+    pub order_id: String,
+    pub side: String,        // "Up" / "Down"
+    pub price: f64,
+    pub size: f64,
+    /// 已记账的成交份额；每 tick 查 size_matched，增量部分补记成交。
+    pub matched_recorded: f64,
+    pub placed_ts: i64,
+    pub phase: String,       // 触发该挂单的策略阶段标签（如 "scalein"）
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum Phase {
     #[default]
@@ -48,6 +61,10 @@ pub struct MarketPosition {
 
     pub trades: Vec<TradeRecord>,
     pub phase: Phase,
+
+    /// 路线二：当前挂在簿上未结的 maker 单。旧 state 文件无此字段时默认空。
+    #[serde(default)]
+    pub open_orders: Vec<OpenOrder>,
 
     // 结算
     pub winner: Option<String>,

@@ -49,6 +49,22 @@ pub struct Config {
     /// 磨平预算倍数：smooth 模式顺势加注最多再花 entry成本 × 此值
     pub smooth_budget_mult: f64,
 
+    // ── 路线二：maker scale-in 策略（与 z-score 单发并存，env 切换）──────────
+    /// 入场策略："zscore"=旧的 z 信号单发(默认,行为不变)；"maker_scalein"=JetFadil式 maker 顺势加仓
+    pub entry_strategy: String,
+    /// maker 挂单存活秒数：超过此时长仍未全成 → 撤单按新盘口重挂
+    pub maker_ttl_sec: i64,
+    /// scale-in 加仓间隔（秒）：每隔此秒数挂一笔
+    pub scalein_step_sec: i64,
+    /// scale-in 每笔份额
+    pub scalein_qty: f64,
+    /// scale-in 起始时点（剩余秒）：seconds_left ≤ 此值才开始加仓
+    pub scalein_start_secs: i64,
+    /// scale-in 停止时点（剩余秒）：seconds_left ≤ 此值停止加仓，撤单并交给 force 兜底
+    pub scalein_stop_secs: i64,
+    /// scale-in 单边累计份额上限（风控：避免无限加仓）
+    pub scalein_max_shares: f64,
+
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -164,6 +180,13 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         force_lock_seconds_left: env_i64("FORCE_LOCK_SECONDS_LEFT", 60),
         force_loss_mode: env("FORCE_LOSS_MODE", "smooth").to_lowercase(),
         smooth_budget_mult: env_f64("SMOOTH_BUDGET_MULT", 0.5),
+        entry_strategy: env("ENTRY_STRATEGY", "zscore").to_lowercase(),
+        maker_ttl_sec: env_i64("MAKER_TTL_SEC", 10),
+        scalein_step_sec: env_i64("SCALEIN_STEP_SEC", 15),
+        scalein_qty: env_f64("SCALEIN_QTY", 20.0),
+        scalein_start_secs: env_i64("SCALEIN_START_SECS", 240),
+        scalein_stop_secs: env_i64("SCALEIN_STOP_SECS", 60),
+        scalein_max_shares: env_f64("SCALEIN_MAX_SHARES", 200.0),
         poll_ms: env_u64("POLL_MS", 1000),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
