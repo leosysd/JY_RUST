@@ -10,6 +10,8 @@ mod position;
 mod state;
 #[path = "../executor.rs"]
 mod executor;
+#[path = "../recorder.rs"]
+mod recorder;
 #[path = "../ws.rs"]
 mod ws;
 #[path = "../zscore.rs"]

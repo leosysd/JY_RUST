@@ -70,6 +70,12 @@ pub struct Config {
     pub state_file: PathBuf,
     pub signal_file: PathBuf,
     pub log_file: PathBuf,
+
+    // ── 全盘口数据采集（与交易无关，常驻 WS 录制；按天分 JSONL）──────────────
+    /// 是否开启 tick 级盘口录制（默认开）。安装后一启动即采集，不受 DRY_RUN 影响。
+    pub book_record_enabled: bool,
+    /// 录制输出目录：每天一个 quant_book-YYYYMMDD.jsonl
+    pub book_record_dir: PathBuf,
 }
 
 fn env(key: &str, default: &str) -> String {
@@ -215,5 +221,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
         log_file: base.join(env("LOG_FILE", "logs/jy-bot.log")),
+        book_record_enabled: env_bool("BOOK_RECORD_ENABLED", true),
+        book_record_dir: base.join(env("BOOK_RECORD_DIR", "data/books")),
     })
 }

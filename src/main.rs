@@ -3,6 +3,7 @@ mod config;
 mod executor;
 mod feeds;
 mod position;
+mod recorder;
 mod state;
 mod strategy;
 mod ws;
@@ -66,7 +67,13 @@ async fn run_quant(
     let _cl = chainlink.clone().run();
     let _bn = binance.clone().run();
 
-    let ws = MarketWs::new(&config.market_ws_url, cache.clone());
+    // 全盘口 tick 采集器：与交易无关，一启动即录制每个订阅盘口（含不交易时段）。
+    let recorder = if config.book_record_enabled {
+        Some(recorder::Recorder::spawn(config.book_record_dir.clone()))
+    } else {
+        None
+    };
+    let ws = MarketWs::new(&config.market_ws_url, cache.clone(), recorder);
     let _ws = ws.run();
 
     let mut strategy =

@@ -1,4 +1,5 @@
-use crate::clob::{parse_book, BookCache};
+use crate::clob::{parse_book, BookCache, OrderBook};
+use crate::recorder::Recorder;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::collections::HashSet;
@@ -12,6 +13,8 @@ struct Inner {
     subscribed: Mutex<HashSet<String>>,
     cache: BookCache,
     reconnect: tokio::sync::Notify,
+    /// 可选 tick 级盘口录制器（None=不采集）。
+    recorder: Option<Recorder>,
 }
 
 /// WebSocket 盘口缓存，Arc 包装可随意 clone。
@@ -19,12 +22,13 @@ struct Inner {
 pub struct MarketWs(Arc<Inner>);
 
 impl MarketWs {
-    pub fn new(url: &str, cache: BookCache) -> Self {
+    pub fn new(url: &str, cache: BookCache, recorder: Option<Recorder>) -> Self {
         Self(Arc::new(Inner {
             url: url.to_string(),
             subscribed: Mutex::new(HashSet::new()),
             cache,
             reconnect: tokio::sync::Notify::new(),
+            recorder,
         }))
     }
 
@@ -111,23 +115,58 @@ impl MarketWs {
             _ => return,
         };
 
-        let mut cache = self.0.cache.write().await;
-        for event in &events {
-            let ev_type = event.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
-            if ev_type == "book" {
-                if let Some(asset_id) = event.get("asset_id").and_then(|v| v.as_str()) {
-                    cache.insert(asset_id.to_string(), parse_book(event));
+        // 收集本批更新到的 asset，写完 cache 后统一生成 tick 快照投递给采集器。
+        let mut touched: Vec<String> = Vec::new();
+        {
+            let mut cache = self.0.cache.write().await;
+            for event in &events {
+                let ev_type = event.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+                if ev_type == "book" {
+                    if let Some(asset_id) = event.get("asset_id").and_then(|v| v.as_str()) {
+                        cache.insert(asset_id.to_string(), parse_book(event));
+                        touched.push(asset_id.to_string());
+                    }
+                } else if ev_type == "price_change" {
+                    // 增量更新：用当前 asks/bids 字段覆盖缓存中对应层级
+                    if let Some(asset_id) = event.get("asset_id").and_then(|v| v.as_str()) {
+                        if let Some(book) = cache.get_mut(asset_id) {
+                            apply_price_change(book, event);
+                            touched.push(asset_id.to_string());
+                        }
+                    }
                 }
-            } else if ev_type == "price_change" {
-                // 增量更新：用当前 asks/bids 字段覆盖缓存中对应层级
-                if let Some(asset_id) = event.get("asset_id").and_then(|v| v.as_str()) {
-                    if let Some(book) = cache.get_mut(asset_id) {
-                        apply_price_change(book, event);
+            }
+            // tick 采集：在持锁期间从最新 book 生成快照行（避免再加锁）。
+            if let Some(rec) = &self.0.recorder {
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                for asset_id in &touched {
+                    if let Some(book) = cache.get(asset_id) {
+                        rec.record(book_snapshot_line(asset_id, ts_ms, book));
                     }
                 }
             }
         }
     }
+}
+
+/// 把一档盘口压成一行 JSON：top-of-book 价/量 + 两侧深度汇总（档数与总量）。
+/// 足以离线重建顶档与流动性，体积可控。
+fn book_snapshot_line(asset_id: &str, ts_ms: i64, book: &OrderBook) -> String {
+    let to_f = |d: rust_decimal::Decimal| d.to_string().parse::<f64>().unwrap_or(0.0);
+    let bb = book.bids.first().map(|(p, _)| to_f(*p)).unwrap_or(0.0);
+    let bb_sz = book.bids.first().map(|(_, s)| to_f(*s)).unwrap_or(0.0);
+    let ba = book.asks.first().map(|(p, _)| to_f(*p)).unwrap_or(0.0);
+    let ba_sz = book.asks.first().map(|(_, s)| to_f(*s)).unwrap_or(0.0);
+    let bid_depth: f64 = book.bids.iter().map(|(_, s)| to_f(*s)).sum();
+    let ask_depth: f64 = book.asks.iter().map(|(_, s)| to_f(*s)).sum();
+    json!({
+        "ts_ms": ts_ms,
+        "asset": asset_id,
+        "bb": bb, "bb_sz": bb_sz,
+        "ba": ba, "ba_sz": ba_sz,
+        "bids_n": book.bids.len(), "asks_n": book.asks.len(),
+        "bid_depth": bid_depth, "ask_depth": ask_depth,
+    }).to_string()
 }
 
 fn apply_price_change(book: &mut crate::clob::OrderBook, event: &serde_json::Value) {
