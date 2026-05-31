@@ -113,8 +113,13 @@ impl OrderExecutor {
             Self::Live { client, signer } => {
                 let tid = U256::from_str(token_id)
                     .with_context(|| format!("token_id 解析失败: {token_id}"))?;
-                // marketable 限价：在 ask 上加缓冲并对齐到 0.01 tick，封顶 0.99
-                let limit = ((price + MARKETABLE_BUFFER).min(0.99) * 100.0).round() / 100.0;
+                // marketable 限价：在 ask 上加缓冲并对齐到 0.01 tick，封顶 0.99。
+                // 缓冲(滑点容忍)可经 env TAKER_BUFFER 调整，默认 MARKETABLE_BUFFER(0.02)。
+                let buffer = std::env::var("TAKER_BUFFER").ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .filter(|b| *b >= 0.0 && *b <= 0.5)
+                    .unwrap_or(MARKETABLE_BUFFER);
+                let limit = ((price + buffer).min(0.99) * 100.0).round() / 100.0;
                 // 份额取整：Polymarket 要求 BUY 金额(price×shares)≤2位小数。
                 // 价格已是2位小数，份额取整 → 乘积必然≤2位小数，金额合法。
                 // 成交返回的零头(如5.158729)若直接下单会算出4位小数金额被拒。
