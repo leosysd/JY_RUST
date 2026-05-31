@@ -19,7 +19,7 @@ const ARB_THRESHOLD: f64 = 0.995;
 /// P2 锁利门槛系数现由 config.lock_min_profit_factor 控制（门槛 = order_shares × factor）。
 /// P4 趋势入场价格范围
 const TREND_ENTRY_MIN: f64 = 0.48;
-const TREND_ENTRY_MAX: f64 = 0.70;
+const TREND_ENTRY_MAX: f64 = 0.65;
 /// P4 趋势追单步长（价格涨 0.05 才追下一笔）
 const TREND_STEP: f64 = 0.05;
 /// P4 最多追多少笔
