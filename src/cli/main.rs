@@ -24,12 +24,41 @@ use std::path::PathBuf;
 
 const SERVICE: &str = "jy-bot";
 
-/// .env 路径（缓存解析结果）。与 bot 共用 config::default_env_path() 探测逻辑，
-/// 不再写死 /opt/polymarket-copy——其他 VPS 用 /opt/jy-data 等布局也能找到状态文件。
+/// .env 路径（缓存解析结果）。优先级：
+/// JY_ENV_PATH 环境变量 → 从 systemd 单元 ExecStart 解析 bot 实际启动用的 .env
+/// （任何安装目录都对得上）→ config::default_env_path() 探测常见布局。
+/// 不再写死 /opt/polymarket-copy。
 fn env_path() -> &'static str {
     use std::sync::OnceLock;
     static P: OnceLock<String> = OnceLock::new();
-    P.get_or_init(config::default_env_path).as_str()
+    P.get_or_init(|| {
+        if let Ok(p) = std::env::var("JY_ENV_PATH") {
+            if !p.trim().is_empty() {
+                return p.trim().to_string();
+            }
+        }
+        if let Some(p) = env_path_from_systemd() {
+            if std::path::Path::new(&p).exists() {
+                return p;
+            }
+        }
+        config::default_env_path()
+    })
+    .as_str()
+}
+
+/// 从 systemd 单元的 ExecStart 解析出 bot 启动时带的 .env 路径（取以 .env 结尾的参数）。
+/// 这保证 CLI 读的 state 目录与 bot 写的完全一致，不依赖固定安装路径。
+fn env_path_from_systemd() -> Option<String> {
+    let out = std::process::Command::new("systemctl")
+        .args(["show", SERVICE, "-p", "ExecStart", "--value"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.split(|c: char| c.is_whitespace() || c == ';' || c == '{' || c == '}')
+        .map(|t| t.trim())
+        .find(|t| t.ends_with(".env"))
+        .map(|t| t.to_string())
 }
 
 fn theme() -> ColorfulTheme {
