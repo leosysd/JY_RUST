@@ -107,6 +107,22 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
             set_env_val("BOT_MODE", val);
             println!("{} BOT_MODE={val}", style("✔").green());
         }
+        "set-entry-strategy" => {
+            let val = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            let v = match val.to_lowercase().as_str() {
+                "zscore" | "z" => "zscore",
+                "maker_scalein" | "maker" | "scalein" => "maker_scalein",
+                other => {
+                    eprintln!("未知入场策略: {other}（可选 zscore | maker_scalein）");
+                    std::process::exit(1);
+                }
+            };
+            set_env_val("ENTRY_STRATEGY", v);
+            println!("{} ENTRY_STRATEGY={v}", style("✔").green());
+            if args.contains(&"--restart".to_string()) {
+                service_cmd("restart");
+            }
+        }
         "update" => update_bot()?,
         _ => {
             eprintln!("未知命令: {}", args[0]);
@@ -127,10 +143,12 @@ fn interactive_menu() -> Result<()> {
         let running = is_service_running();
         let dry_run = read_env_val("DRY_RUN").unwrap_or("1".into());
         let mode = read_env_val("BOT_MODE").unwrap_or_else(|| "quant".into());
+        let entry = read_env_val("ENTRY_STRATEGY").unwrap_or_else(|| "zscore".into());
         println!(
-            "  服务: {}  模式: {}  DRY_RUN: {}",
+            "  服务: {}  模式: {}  入场: {}  DRY_RUN: {}",
             if running { style("运行中").green().bold() } else { style("已停止").red().bold() },
             style(&mode).yellow(),
+            style(&entry).yellow(),
             if dry_run == "0" { style("实盘").red().bold() } else { style("模拟").green() },
         );
         println!();
@@ -146,8 +164,9 @@ fn interactive_menu() -> Result<()> {
             "8.  查看实时日志",
             "9.  切换 DRY_RUN 模式",
             "10. 切换模式（quant / copy）",
-            "11. 清空模拟数据",
-            "12. 更新程序（从 GitHub 拉取最新版本）",
+            "11. 切换入场策略（zscore / maker_scalein）",
+            "12. 清空模拟数据",
+            "13. 更新程序（从 GitHub 拉取最新版本）",
             "0.  退出",
         ];
 
@@ -173,9 +192,10 @@ fn interactive_menu() -> Result<()> {
             }
             8 => toggle_dry_run()?,
             9 => toggle_strategy()?,
-            10 => clear_sim_data()?,
-            11 => update_bot()?,
-            12 => break,
+            10 => toggle_entry_strategy()?,
+            11 => clear_sim_data()?,
+            12 => update_bot()?,
+            13 => break,
             _ => {}
         }
     }
@@ -241,7 +261,7 @@ fn edit_config() -> Result<()> {
 fn show_config() {
     println!("{}", style("── 当前配置 ──").bold());
     let keys = [
-        "BOT_MODE", "DRY_RUN", "TARGET_WALLET",
+        "BOT_MODE", "ENTRY_STRATEGY", "DRY_RUN", "TARGET_WALLET",
         "DEPOSIT_WALLET_ADDRESS", "COPY_RATIO",
         "QUANT_ORDER_SHARES", "SIGNATURE_TYPE",
         "CLOB_API_URL", "CLOB_V2_API_URL",
@@ -307,6 +327,25 @@ fn toggle_strategy() -> Result<()> {
     let new_val = if choice == 1 { "copy" } else { "quant" };
     set_env_val("BOT_MODE", new_val);
     println!("{} BOT_MODE={new_val}", style("✔").green());
+    if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
+        service_cmd("restart");
+    }
+    Ok(())
+}
+
+fn toggle_entry_strategy() -> Result<()> {
+    let curr = read_env_val("ENTRY_STRATEGY").unwrap_or_else(|| "zscore".into());
+    let choice = Select::with_theme(&theme())
+        .with_prompt("选择入场策略")
+        .items(&[
+            "zscore        - z-score 方向入场 + 锁利/追单/减险（旧逻辑）",
+            "maker_scalein - JetFadil 式 maker 顺势加仓（零 taker 费）",
+        ])
+        .default(if curr == "maker_scalein" { 1 } else { 0 })
+        .interact()?;
+    let new_val = if choice == 1 { "maker_scalein" } else { "zscore" };
+    set_env_val("ENTRY_STRATEGY", new_val);
+    println!("{} ENTRY_STRATEGY={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
         service_cmd("restart");
     }
