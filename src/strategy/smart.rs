@@ -594,12 +594,26 @@ impl SmartStrategy {
     }
 
     /// 撤掉某市场所有挂单（force 边界清场）。
+    /// 撤单前先 query 收割最终成交：maker 单可能在撤单瞬间刚好（部分）成交，
+    /// 若直接 clear 会丢失这部分成交、少记盈亏。故先 harvest 再撤再 clear。
     async fn cancel_all_open(&mut self, market: &Market) -> Result<()> {
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
         if pos.open_orders.is_empty() { return Ok(()); }
         let ex = self.executor.clone();
+        let mut newly: Vec<(String, f64, f64, String)> = vec![];
         for oo in &pos.open_orders {
             let _ = ex.cancel(&oo.order_id).await;
+            // 撤单后再查一次：撤不掉(已成交)或部分成交的份额在此收割
+            if let Ok(st) = ex.query_order(&oo.order_id).await {
+                let inc = st.size_matched - oo.matched_recorded;
+                if inc > 0.0 {
+                    let fp = if st.price > 0.0 { st.price } else { oo.price };
+                    newly.push((oo.side.clone(), fp, inc, oo.phase.clone()));
+                }
+            }
+        }
+        for (dir, price, shares, phase) in &newly {
+            record_trade(&mut self.state, market, dir, *price, *shares, phase, 0.0, false);
         }
         let p = self.state.get_or_create(&market.slug, market.end_ts);
         p.open_orders.clear();
@@ -741,6 +755,8 @@ impl SmartStrategy {
             p.phase = Phase::Settled;
             p.winner = Some(winner.clone());
             p.realized_pnl = Some(pnl);
+            // 路线二：结算时清理残留挂单引用（防 maker open_orders 跨盘口泄漏到 state）
+            p.open_orders.clear();
 
             // 同步结算影子账（实盘双轨；模拟时影子账为空，跳过）
             if let Some(ipos) = self.ideal_state.get(&slug).cloned() {
