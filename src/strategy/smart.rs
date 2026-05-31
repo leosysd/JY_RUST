@@ -131,8 +131,10 @@ impl SmartStrategy {
 
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
 
-        // 逐秒盘口快照（节流到 1 秒/条）：为离线回放对冲/锁仓时机提供完整盘口序列。
-        self.log_book(&market, &pos, up_ask, dn_ask, seconds_left).await;
+        // 旧版逐秒盘口快照（默认关，已被 recorder tick 采集器取代）。
+        if self.config.book_legacy_log_enabled {
+            self.log_book(&market, &pos, up_ask, dn_ask, seconds_left).await;
+        }
 
         // 路线二：maker scale-in 策略（与旧 z-score 单发并存，ENTRY_STRATEGY 切换）。
         if self.config.entry_strategy == "maker_scalein" {

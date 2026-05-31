@@ -76,6 +76,8 @@ pub struct Config {
     pub book_record_enabled: bool,
     /// 录制输出目录：每天一个 quant_book-YYYYMMDD.jsonl
     pub book_record_dir: PathBuf,
+    /// 旧版单文件逐秒盘口日志（quant_book.jsonl，仅当前盘）。默认关：已被 tick 采集器取代。
+    pub book_legacy_log_enabled: bool,
 }
 
 fn env(key: &str, default: &str) -> String {
@@ -223,5 +225,6 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         log_file: base.join(env("LOG_FILE", "logs/jy-bot.log")),
         book_record_enabled: env_bool("BOOK_RECORD_ENABLED", true),
         book_record_dir: base.join(env("BOOK_RECORD_DIR", "data/books")),
+        book_legacy_log_enabled: env_bool("BOOK_LEGACY_LOG_ENABLED", false),
     })
 }
