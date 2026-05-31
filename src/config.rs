@@ -134,8 +134,8 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
     // 否则 bot 不带 .env 参数启动会退回 CWD 解析(dotenv 搜 CWD + base="."),
     // 把 quant_state.json 写进工作目录,而 CLI 仍读 /opt/polymarket-copy/quant_state.json
     // → stats 永远"暂无数据文件"。见其他 VPS 模拟无统计表问题。
-    let env_path = env_path.unwrap_or("/opt/polymarket-copy/.env");
-    dotenvy::from_path(env_path).ok();
+    let env_path: String = env_path.map(|s| s.to_string()).unwrap_or_else(default_env_path);
+    dotenvy::from_path(&env_path).ok();
 
     let private_key = match std::env::var("PRIVATE_KEY") {
         Ok(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
