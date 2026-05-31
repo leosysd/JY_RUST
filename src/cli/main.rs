@@ -22,8 +22,15 @@ use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use std::path::PathBuf;
 
-const ENV_PATH: &str = "/opt/polymarket-copy/.env";
 const SERVICE: &str = "jy-bot";
+
+/// .env 路径（缓存解析结果）。与 bot 共用 config::default_env_path() 探测逻辑，
+/// 不再写死 /opt/polymarket-copy——其他 VPS 用 /opt/jy-data 等布局也能找到状态文件。
+fn env_path() -> &'static str {
+    use std::sync::OnceLock;
+    static P: OnceLock<String> = OnceLock::new();
+    P.get_or_init(config::default_env_path).as_str()
+}
 
 fn theme() -> ColorfulTheme {
     ColorfulTheme::default()
@@ -196,7 +203,7 @@ fn edit_config() -> Result<()> {
     set_env_val("QUANT_ORDER_SHARES", &order_shares);
     set_env_val("COPY_RATIO", &copy_ratio);
 
-    println!("{} 配置已保存到 {ENV_PATH}", style("✔").green());
+    println!("{} 配置已保存到 {}", style("✔").green(), env_path());
     Ok(())
 }
 
@@ -221,7 +228,7 @@ fn test_connection() -> Result<()> {
     println!("{}", style("── 测试连接 ──").bold());
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let cfg = config::load(Some(ENV_PATH)).unwrap();
+        let cfg = config::load(Some(env_path())).unwrap();
         let client = clob::ClobClient::new(&cfg.clob_api_url, &cfg.gamma_api_url, &cfg.market_slug_prefix);
         print!("  CLOB API... ");
         match client.find_current_market().await {
@@ -322,7 +329,7 @@ fn state_file_path() -> PathBuf {
     if p.is_absolute() {
         p
     } else {
-        PathBuf::from(ENV_PATH)
+        PathBuf::from(env_path())
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join(f)
@@ -560,8 +567,9 @@ fn clear_sim_data() -> Result<()> {
 }
 
 fn read_env_val(key: &str) -> Option<String> {
-    if std::path::Path::new(ENV_PATH).exists() {
-        if let Ok(content) = std::fs::read_to_string(ENV_PATH) {
+    let path = env_path();
+    if std::path::Path::new(path).exists() {
+        if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines() {
                 if let Some(rest) = line.strip_prefix(&format!("{key}=")) {
                     return Some(rest.trim().to_string());
@@ -573,7 +581,7 @@ fn read_env_val(key: &str) -> Option<String> {
 }
 
 fn set_env_val(key: &str, val: &str) {
-    let path = PathBuf::from(ENV_PATH);
+    let path = PathBuf::from(env_path());
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let entry = format!("{key}={val}");

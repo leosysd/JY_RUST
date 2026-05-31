@@ -76,6 +76,28 @@ fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// 解析 .env 路径：优先环境变量 JY_ENV_PATH，其次按常见安装布局探测第一个存在的，
+/// 都没有则回退旧默认 /opt/polymarket-copy/.env。bot 与 CLI 共用此函数，保证两边一致，
+/// 不再写死单一目录（其他 VPS 用 /opt/jy-data 时也能对上）。
+pub fn default_env_path() -> String {
+    if let Ok(p) = std::env::var("JY_ENV_PATH") {
+        if !p.trim().is_empty() {
+            return p.trim().to_string();
+        }
+    }
+    for cand in [
+        "/opt/polymarket-copy/.env",
+        "/opt/jy-data/.env",
+        "/opt/jy-rust/.env",
+        ".env",
+    ] {
+        if std::path::Path::new(cand).exists() {
+            return cand.to_string();
+        }
+    }
+    "/opt/polymarket-copy/.env".to_string()
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key).as_deref() {
         Ok("1") | Ok("true") | Ok("yes") => true,
@@ -143,7 +165,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
     }
 
     let base = PathBuf::from(
-        std::path::Path::new(env_path)
+        std::path::Path::new(&env_path)
             .parent()
             .map(|p| p.to_str().unwrap_or(".").to_string())
             .unwrap_or_else(|| ".".to_string()),
