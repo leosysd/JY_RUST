@@ -48,6 +48,11 @@ pub struct Config {
     pub force_loss_mode: String,
     /// 磨平预算倍数：smooth 模式顺势加注最多再花 entry成本 × 此值
     pub smooth_budget_mult: f64,
+    /// 早止损系数：worst_pnl ≤ -(order_shares×此值) 时不等T-60,立即补对面锁平认小亏。
+    /// 0=关(旧行为,死扛到强制线)。数据显示锁亏100%卡T-60天价锁,早止损可把单次亏从-1.85压小。
+    pub stop_loss_factor: f64,
+    /// 早止损价格上限：对面 ask > 此值(天价)则不锁、裸持到结算,避免高价接盘放大亏损。
+    pub stop_loss_max_opp: f64,
 
     // ── 路线二：maker scale-in 策略（与 z-score 单发并存，env 切换）──────────
     /// 入场策略："zscore"=旧的 z 信号单发(默认,行为不变)；"maker_scalein"=JetFadil式 maker 顺势加仓
@@ -214,6 +219,8 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         force_lock_seconds_left: env_i64("FORCE_LOCK_SECONDS_LEFT", 60),
         force_loss_mode: env("FORCE_LOSS_MODE", "smooth").to_lowercase(),
         smooth_budget_mult: env_f64("SMOOTH_BUDGET_MULT", 0.5),
+        stop_loss_factor: env_f64("STOP_LOSS_FACTOR", 0.0),
+        stop_loss_max_opp: env_f64("STOP_LOSS_MAX_OPP", 0.75),
         entry_strategy: env("ENTRY_STRATEGY", "zscore").to_lowercase(),
         maker_ttl_sec: env_i64("MAKER_TTL_SEC", 10),
         scalein_step_sec: env_i64("SCALEIN_STEP_SEC", 15),

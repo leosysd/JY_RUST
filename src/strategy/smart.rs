@@ -336,6 +336,29 @@ impl SmartStrategy {
             }
         }
 
+        // ── P2.5：早止损（不等 T-60 强制线）────────────────────────────────
+        // 数据：旧实盘29场锁亏100%卡T-60被迫天价锁(中位0.66,最贵0.99)，单次均-1.85，
+        // 是最大失血点。这里在亏损还小时提前补对面锁平，把单次大亏压成可控小亏。
+        // 仅当 stop_loss_factor>0 启用；对面天价(>stop_loss_max_opp)则不锁、裸持(避免高价接盘)。
+        if self.config.stop_loss_factor > 0.0
+            && lock_qty > 0.0
+            && seconds_left > self.config.force_lock_seconds_left
+        {
+            let stop_line = -(shares * self.config.stop_loss_factor);
+            if cur_worst <= stop_line && opp_ask <= self.config.stop_loss_max_opp {
+                let proj = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
+                // 只在"现在锁比死扛到底更好"时才提前锁(proj 高于当前最坏)
+                if proj > cur_worst {
+                    info!(
+                        "[SMART STOPLOSS {mode}] {} 早止损 买{opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  worst {cur_worst:+.2}→{proj:+.2}(线{stop_line:.2})  T-{seconds_left}s",
+                        market.title
+                    );
+                    self.do_lock(&market, &pos, opp_dir, opp_ask, lock_qty, proj, "lock_loss").await?;
+                    return Ok(());
+                }
+            }
+        }
+
         // 当前趋势信号（用于决定"追单"还是"减险"）
         let trend_dir = self.model.compute(pos.price_to_beat, seconds_left)
             .and_then(|s| s.direction());
