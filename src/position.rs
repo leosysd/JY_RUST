@@ -34,6 +34,10 @@ pub struct OpenOrder {
     pub matched_recorded: f64,
     pub placed_ts: i64,
     pub phase: String,       // 触发该挂单的策略阶段标签（如 "scalein"）
+    /// 是否曾在 orders() 列表里确认挂上过。用于区分"全成交消失"与"刚挂未索引"。
+    /// serde default：兼容旧 state 文件（无此字段时为 false）。
+    #[serde(default)]
+    pub seen_live: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
