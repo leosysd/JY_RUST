@@ -285,39 +285,12 @@ impl SmartStrategy {
             "[SMART ENTRY {mode}] {} {dir}@{entry_ask:.3} ×{shares:.0}份  z={:.3}  T-{seconds_left}s",
             market.title, sig.z
         );
-        // 入场信号快照：记录 z-score 全套字段，用于离线分析"信号强度 vs 方向准确率"。
-        // 纯记录，不影响下单。结算后可 join winner 验证。
-        // 量价信号(B方案):前段 Binance 买卖压力 imbalance + 动量，离线验证能否预测方向。
-        let now_ts = chrono::Utc::now().timestamp();
-        let flow = self.model.binance_flow(now_ts, 60);
-        let mom = self.model.binance_momentum(now_ts, 60).unwrap_or(0.0);
-        // 量价方向预测:imbalance>0 或 动量>0 → 看涨(Up)。后续按命中率决定权重。
-        let flow_dir = if flow.imbalance > 0.05 { "Up" } else if flow.imbalance < -0.05 { "Down" } else { "flat" };
-        self.write_signal(&serde_json::json!({
-            "phase": "entry_signal",
-            "market": market.slug,
-            "direction": dir,
-            "entry_ask": entry_ask,
-            "z": sig.z,
-            "p_up": sig.p_up,
-            "p_down": sig.p_down,
-            "e": sig.e,
-            "v": sig.v,
-            "ct": sig.ct,
-            "xt": sig.xt,
-            "b": sig.b,
-            "sigma120": sig.sigma120,
-            "basis60": sig.basis60,
-            "seconds_left": seconds_left,
-            // 量价信号字段
-            "flow_imbalance": flow.imbalance,
-            "flow_buy_vol": flow.buy_vol,
-            "flow_sell_vol": flow.sell_vol,
-            "flow_trades": flow.trades,
-            "flow_dir": flow_dir,
-            "momentum60": mom,
-            "ts": now_ts,
-        })).await?;
+        // 入场信号快照:丰富特征(为 LightGBM 铺路),结算后 join winner 作训练标签。
+        let mut feat = self.build_features(&sig, dir, entry_ask, up_ask, dn_ask, seconds_left);
+        feat["phase"] = serde_json::json!("entry_signal");
+        feat["market"] = serde_json::json!(market.slug);
+        feat["strategy"] = serde_json::json!("zscore");
+        self.write_signal(&feat).await?;
         self.do_buy(&market, dir, entry_ask, shares, "entry", price_to_beat).await?;
         Ok(())
     }
@@ -573,15 +546,12 @@ impl SmartStrategy {
         info!("[EV_SOLO {mode}] {} 单边买{dir}@{ask:.3}×{qty:.0} z={:.3} 估EV{ev_per:+.3}/份 T-{seconds_left}s",
             market.title, sig.z);
 
-        // 记录入场信号(含量价,结算后 join winner 验证胜率)
-        let now_ts = chrono::Utc::now().timestamp();
-        let flow = self.model.binance_flow(now_ts, 60);
-        self.write_signal(&serde_json::json!({
-            "phase":"entry_signal","market":market.slug,"direction":dir,
-            "entry_ask":ask,"z":sig.z,"p_up":sig.p_up,"p_down":sig.p_down,
-            "flow_imbalance":flow.imbalance,"momentum60":self.model.binance_momentum(now_ts,60).unwrap_or(0.0),
-            "strategy":"ev_solo","seconds_left":seconds_left,"ts":now_ts,
-        })).await?;
+        // 记录入场信号(丰富特征,为 LightGBM 铺路;结算后 join winner 作训练标签)
+        let mut feat = self.build_features(&sig, dir, ask, up_ask, dn_ask, seconds_left);
+        feat["phase"] = serde_json::json!("entry_signal");
+        feat["market"] = serde_json::json!(market.slug);
+        feat["strategy"] = serde_json::json!("ev_solo");
+        self.write_signal(&feat).await?;
 
         // 买单边,然后标 Locked 裸持到结算(不进任何后续决策)
         if self.do_buy(&market, dir, ask, qty, "ev_solo", price_to_beat).await? {
@@ -1049,6 +1019,45 @@ impl SmartStrategy {
         let mut f = OpenOptions::new().create(true).append(true).open(&self.signal_file).await?;
         f.write_all((serde_json::to_string(v)? + "\n").as_bytes()).await?;
         Ok(())
+    }
+
+    /// 构造入场时刻的丰富特征集(为 LightGBM 铺路)。纯记录,无副作用。
+    /// 含: z全套、多窗口量价、多窗口动量、盘口衍生、时间特征。
+    fn build_features(
+        &self, sig: &crate::zscore::ZSignal, dir: &str,
+        entry_ask: f64, up_ask: f64, dn_ask: f64, seconds_left: i64,
+    ) -> serde_json::Value {
+        let now = chrono::Utc::now().timestamp();
+        // 多窗口量价
+        let f30 = self.model.binance_flow(now, 30);
+        let f60 = self.model.binance_flow(now, 60);
+        let f120 = self.model.binance_flow(now, 120);
+        // 多窗口动量
+        let m10 = self.model.binance_momentum(now, 10).unwrap_or(0.0);
+        let m30 = self.model.binance_momentum(now, 30).unwrap_or(0.0);
+        let m60 = self.model.binance_momentum(now, 60).unwrap_or(0.0);
+        let m120 = self.model.binance_momentum(now, 120).unwrap_or(0.0);
+        // 时间特征(北京小时)
+        let bj_hour = ((now + 8*3600) / 3600) % 24;
+        serde_json::json!({
+            "ts": now, "direction": dir, "entry_ask": entry_ask,
+            // 盘口
+            "up_ask": up_ask, "dn_ask": dn_ask, "ask_sum": up_ask + dn_ask,
+            // z全套
+            "z": sig.z, "p_up": sig.p_up, "p_down": sig.p_down,
+            "e": sig.e, "v": sig.v, "ct": sig.ct, "xt": sig.xt, "b": sig.b,
+            "sigma120": sig.sigma120, "basis60": sig.basis60,
+            // 衍生:价差
+            "ct_minus_b": sig.ct - sig.b,        // chainlink相对开盘
+            "xt_minus_ct": sig.xt - sig.ct,      // binance-chainlink basis
+            // 多窗口量价不平衡
+            "flow_imb_30": f30.imbalance, "flow_imb_60": f60.imbalance, "flow_imb_120": f120.imbalance,
+            "flow_buy_60": f60.buy_vol, "flow_sell_60": f60.sell_vol, "flow_trades_60": f60.trades,
+            // 多窗口动量
+            "mom_10": m10, "mom_30": m30, "mom_60": m60, "mom_120": m120,
+            // 时间
+            "seconds_left": seconds_left, "bj_hour": bj_hour,
+        })
     }
 
     /// 写 token→slug/outcome/end_ts 映射到 book 目录的 token_map.jsonl(复盘join赢家用)。
