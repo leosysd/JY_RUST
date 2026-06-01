@@ -57,39 +57,9 @@ pub struct Config {
     /// 默认120 → 只在盘后半段(已过≥180s)才允许止损。300秒盘:配合force_lock=60,止损窗口为剩余[60,120]。
     pub stop_loss_max_seconds_left: i64,
 
-    // ── 路线二：maker scale-in 策略（与 z-score 单发并存，env 切换）──────────
-    /// 入场策略："zscore"=旧的 z 信号单发(默认,行为不变)；"maker_scalein"=JetFadil式 maker 顺势加仓
+    // ── 入场策略选择 ──────────────────────────────────────────────────────
+    /// "zscore"=z信号+锁利/追单/减险(baseline);"ev_solo"=z定方向+纯单边裸持(正期望主策略)
     pub entry_strategy: String,
-    /// maker 挂单存活秒数：超过此时长仍未全成 → 撤单按新盘口重挂
-    pub maker_ttl_sec: i64,
-    /// scale-in 加仓间隔（秒）：每隔此秒数挂一笔
-    pub scalein_step_sec: i64,
-    /// scale-in 每笔份额
-    pub scalein_qty: f64,
-    /// scale-in 起始时点（剩余秒）：seconds_left ≤ 此值才开始加仓
-    pub scalein_start_secs: i64,
-    /// scale-in 停止时点（剩余秒）：seconds_left ≤ 此值停止加仓，撤单并交给 force 兜底
-    pub scalein_stop_secs: i64,
-    /// scale-in 单边累计份额上限（风控：避免无限加仓）
-    pub scalein_max_shares: f64,
-    /// v1 双边捡便宜：某边 ask ≤ 此值才买该边（压低均价、避免追高）。两边分别判断。
-    pub scalein_cheap_max: f64,
-
-    // ── 路线三：dual_hedge 双边对冲吃价差（复刻 JetFadil 实证打法）──────────────
-    /// 每笔下单份额(每个加仓 tick 买这么多到落后的一边)。
-    pub dh_qty: f64,
-    /// 加仓间隔(秒):每隔此秒数评估一次是否补仓。JetFadil 中位 28 笔/盘 → 约每 8-10s 一笔。
-    pub dh_step_sec: i64,
-    /// 起始时点(剩余秒):seconds_left ≤ 此值才开始建仓(默认 280,留开盘 20s 让盘口稳定)。
-    pub dh_start_secs: i64,
-    /// 停止时点(剩余秒):seconds_left ≤ 此值停止建仓,裸持到结算(默认 60)。
-    pub dh_stop_secs: i64,
-    /// 单边份额上限(风控,大本金按需调大)。
-    pub dh_max_shares: f64,
-    /// 吃价差阈值:仅当"此刻该边ask+对面ask < 此值"才补该边(抓瞬时低点)。
-    /// 默认 1.00 → 只在两边瞬时ask和<1(出现真实套利窗口)时吃。这是判生死的旋钮:
-    /// 若极少触发说明价差窗口稀缺、策略无戏;调>1则放宽(吃微亏对冲)。
-    pub dh_max_pair_cost: f64,
 
     // ── 路线四:ev_solo 纯单边裸持(数学上唯一正期望路径)──────────────────────
     // z-score定方向→只买该边、不对冲、裸持到结算。靠 z-score 方向胜率(实测154场57.8%)
@@ -252,19 +222,6 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         stop_loss_max_opp: env_f64("STOP_LOSS_MAX_OPP", 0.75),
         stop_loss_max_seconds_left: env_i64("STOP_LOSS_MAX_SECONDS_LEFT", 120),
         entry_strategy: env("ENTRY_STRATEGY", "zscore").to_lowercase(),
-        maker_ttl_sec: env_i64("MAKER_TTL_SEC", 10),
-        scalein_step_sec: env_i64("SCALEIN_STEP_SEC", 15),
-        scalein_qty: env_f64("SCALEIN_QTY", 20.0),
-        scalein_start_secs: env_i64("SCALEIN_START_SECS", 240),
-        scalein_stop_secs: env_i64("SCALEIN_STOP_SECS", 60),
-        scalein_max_shares: env_f64("SCALEIN_MAX_SHARES", 200.0),
-        scalein_cheap_max: env_f64("SCALEIN_CHEAP_MAX", 0.55),
-        dh_qty: env_f64("DH_QTY", 20.0),
-        dh_step_sec: env_i64("DH_STEP_SEC", 8),
-        dh_start_secs: env_i64("DH_START_SECS", 280),
-        dh_stop_secs: env_i64("DH_STOP_SECS", 60),
-        dh_max_shares: env_f64("DH_MAX_SHARES", 400.0),
-        dh_max_pair_cost: env_f64("DH_MAX_PAIR_COST", 1.00),
         ev_solo_max_ask: env_f64("EV_SOLO_MAX_ASK", 0.52),
         ev_solo_min_ask: env_f64("EV_SOLO_MIN_ASK", 0.35),
         ev_solo_qty: env_f64("EV_SOLO_QTY", 20.0),

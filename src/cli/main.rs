@@ -111,11 +111,9 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
             let val = args.get(1).map(|s| s.as_str()).unwrap_or("");
             let v = match val.to_lowercase().as_str() {
                 "zscore" | "z" => "zscore",
-                "maker_scalein" | "maker" | "scalein" => "maker_scalein",
-                "dual_hedge" | "dual" | "hedge" | "dh" => "dual_hedge",
                 "ev_solo" | "ev" | "solo" => "ev_solo",
                 other => {
-                    eprintln!("未知入场策略: {other}（可选 zscore | maker_scalein | dual_hedge | ev_solo）");
+                    eprintln!("未知入场策略: {other}（可选 zscore | ev_solo）");
                     std::process::exit(1);
                 }
             };
@@ -152,16 +150,7 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
 
 /// 可调策略参数表：(env 键, 中文说明, 默认值)。用于 `jy params` 展示与交互式调参菜单。
 const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
-    ("SCALEIN_QTY",           "scale-in 每笔份额",                 "20"),
-    ("SCALEIN_MAX_SHARES",    "scale-in 单边累计份额上限",         "200"),
-    ("SCALEIN_STEP_SEC",      "scale-in 加仓间隔(秒)",             "15"),
-    ("SCALEIN_START_SECS",    "scale-in 起始(剩余秒 ≤ 此值才加仓)", "240"),
-    ("SCALEIN_STOP_SECS",     "scale-in 停止(剩余秒 ≤ 此值停加仓)", "60"),
     ("TAKER_BUFFER",          "taker 吃单滑点缓冲(限价=ask+此值)",  "0.02"),
-    ("DH_QTY",                "dual_hedge 每笔份额",               "20"),
-    ("DH_STEP_SEC",           "dual_hedge 加仓间隔(秒)",           "8"),
-    ("DH_MAX_SHARES",         "dual_hedge 单边份额上限",           "400"),
-    ("DH_MAX_PAIR_COST",      "dual_hedge 锁差阈值(两边均价和≤才买)","0.99"),
     ("EV_SOLO_MAX_ASK",       "ev_solo 入场价上限(≤才买)",         "0.52"),
     ("EV_SOLO_MIN_ASK",       "ev_solo 入场价下限(≥才买)",         "0.35"),
     ("EV_SOLO_QTY",           "ev_solo 单边份额",                  "20"),
@@ -213,8 +202,8 @@ fn interactive_menu() -> Result<()> {
             "8.  查看实时日志",
             "9.  切换 DRY_RUN 模式",
             "10. 切换模式（quant / copy）",
-            "11. 切换入场策略（zscore / maker_scalein）",
-            "12. 调策略参数（scale-in / 滑点 等）",
+            "11. 切换入场策略（zscore / ev_solo）",
+            "12. 调策略参数（ev_solo / 滑点 等）",
             "13. 清空模拟数据",
             "14. 更新程序（从 GitHub 拉取最新版本）",
             "0.  退出",
@@ -389,12 +378,12 @@ fn toggle_entry_strategy() -> Result<()> {
     let choice = Select::with_theme(&theme())
         .with_prompt("选择入场策略")
         .items(&[
-            "zscore        - z-score 方向入场 + 锁利/追单/减险（旧逻辑）",
-            "maker_scalein - JetFadil 式 maker 顺势加仓（零 taker 费）",
+            "zscore  - z-score 方向入场 + 锁利/追单/减险（baseline）",
+            "ev_solo - z-score 定方向 + 纯单边裸持（正期望主策略）",
         ])
-        .default(if curr == "maker_scalein" { 1 } else { 0 })
+        .default(if curr == "ev_solo" { 1 } else { 0 })
         .interact()?;
-    let new_val = if choice == 1 { "maker_scalein" } else { "zscore" };
+    let new_val = if choice == 1 { "ev_solo" } else { "zscore" };
     set_env_val("ENTRY_STRATEGY", new_val);
     println!("{} ENTRY_STRATEGY={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
