@@ -212,6 +212,8 @@ impl SmartStrategy {
         if is_new {
             self.ws.ensure_subscribed(&market.token_ids).await;
             info!("[SMART] 新盘口 {} 已订阅WS", market.slug);
+            // 写 token→slug+outcome+end_ts 映射(复盘用,一劳永逸:book只有token,靠此join赢家)
+            self.write_token_map(&market).await;
         }
         self.cached_market = Some(market.clone());
         Some(market)
@@ -1047,6 +1049,27 @@ impl SmartStrategy {
         let mut f = OpenOptions::new().create(true).append(true).open(&self.signal_file).await?;
         f.write_all((serde_json::to_string(v)? + "\n").as_bytes()).await?;
         Ok(())
+    }
+
+    /// 写 token→slug/outcome/end_ts 映射到 book 目录的 token_map.jsonl(复盘join赢家用)。
+    /// book 录的只有 token,靠此映射把逐tick价格关联到盘口+方向,再join结算赢家。
+    async fn write_token_map(&self, market: &Market) {
+        let dir = &self.config.book_record_dir;
+        let _ = fs::create_dir_all(dir).await;
+        let path = dir.join("token_map.jsonl");
+        let mut lines = String::new();
+        for (i, tok) in market.token_ids.iter().enumerate() {
+            let outcome = market.outcomes.get(i).cloned().unwrap_or_default();
+            let rec = serde_json::json!({
+                "token": tok, "slug": market.slug, "outcome": outcome,
+                "end_ts": market.end_ts, "ts": chrono::Utc::now().timestamp(),
+            });
+            lines.push_str(&rec.to_string());
+            lines.push('\n');
+        }
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path).await {
+            let _ = f.write_all(lines.as_bytes()).await;
+        }
     }
 }
 
