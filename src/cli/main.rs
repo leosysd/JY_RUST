@@ -113,8 +113,9 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
                 "zscore" | "z" => "zscore",
                 "maker_scalein" | "maker" | "scalein" => "maker_scalein",
                 "dual_hedge" | "dual" | "hedge" | "dh" => "dual_hedge",
+                "ev_solo" | "ev" | "solo" => "ev_solo",
                 other => {
-                    eprintln!("未知入场策略: {other}（可选 zscore | maker_scalein | dual_hedge）");
+                    eprintln!("未知入场策略: {other}（可选 zscore | maker_scalein | dual_hedge | ev_solo）");
                     std::process::exit(1);
                 }
             };
@@ -161,6 +162,9 @@ const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
     ("DH_STEP_SEC",           "dual_hedge 加仓间隔(秒)",           "8"),
     ("DH_MAX_SHARES",         "dual_hedge 单边份额上限",           "400"),
     ("DH_MAX_PAIR_COST",      "dual_hedge 锁差阈值(两边均价和≤才买)","0.99"),
+    ("EV_SOLO_MAX_ASK",       "ev_solo 入场价上限(≤才买)",         "0.52"),
+    ("EV_SOLO_MIN_ASK",       "ev_solo 入场价下限(≥才买)",         "0.35"),
+    ("EV_SOLO_QTY",           "ev_solo 单边份额",                  "20"),
     ("FORCE_LOCK_SECONDS_LEFT","强制处理线(剩余 ≤ 此秒触发)",       "60"),
     ("QUANT_ORDER_SHARES",    "zscore 每单份额",                   "20"),
     ("TREND_CHASE_MAX_PRICE", "zscore 追单价格上限",               "0.60"),

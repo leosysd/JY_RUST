@@ -148,6 +148,12 @@ impl SmartStrategy {
             return Ok(());
         }
 
+        // 路线四：ev_solo 纯单边裸持（数学上唯一正期望路径）。
+        if self.config.entry_strategy == "ev_solo" {
+            self.decide_ev_solo(&market, pos, up_ask, dn_ask, seconds_left).await?;
+            return Ok(());
+        }
+
         match pos.phase {
             Phase::Waiting  => self.decide_waiting(&market, pos, up_ask, dn_ask, seconds_left).await?,
             Phase::Holding  => self.decide_holding(&market, pos, up_ask, dn_ask, seconds_left).await?,
@@ -518,6 +524,69 @@ impl SmartStrategy {
             market.title,
             if main_dir == "Up" { pos.up_avg_full() } else { pos.down_avg_full() }
         );
+        Ok(())
+    }
+
+    // ── 路线四：ev_solo 纯单边裸持（数学上唯一正期望路径）──────────────────────
+    //
+    // z-score 定方向 → 只买该边、不对冲、不锁利、不止损 → 裸持到结算。
+    // 依据: 154场实测 z-score 方向胜率 57.8%(>50%有edge)。
+    // 数学: 对冲腿在7%费下每份边际EV必<0(已证明),故彻底单边。
+    // EV/份 = 胜率×(1-fc) - (1-胜率)×fc。仅在 ev_solo_min_ask≤ask≤max_ask 时入场。
+    // 纯记录 entry_signal(含z/价/方向),结算后 join winner 验证胜率是否稳。
+    async fn decide_ev_solo(
+        &mut self,
+        market: &Market,
+        pos: MarketPosition,
+        up_ask: f64,
+        dn_ask: f64,
+        seconds_left: i64,
+    ) -> Result<()> {
+        // 只在 Waiting 时入场;入场后裸持(Holding/Locked 不做任何动作)
+        if !matches!(pos.phase, Phase::Waiting) { return Ok(()); }
+        if seconds_left < ENTRY_MIN_SECONDS_LEFT { return Ok(()); }
+
+        let price_to_beat = self.model.chainlink_at(market.start_ts)
+            .or_else(|| self.model.chainlink_latest())
+            .unwrap_or(0.0);
+        if price_to_beat < 1000.0 { return Ok(()); }
+
+        let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
+        let Some(dir) = sig.direction() else {
+            info!("[EV_SOLO] {} z={:.3} 信号不足,不入场", market.title, sig.z);
+            return Ok(());
+        };
+        let ask = if dir == "Up" { up_ask } else { dn_ask };
+        // 价位过滤:只在 [min,max] 入场(避开贵价负EV区 + 过低赔率差区)
+        if ask < self.config.ev_solo_min_ask || ask > self.config.ev_solo_max_ask {
+            info!("[EV_SOLO] {} {dir}@{ask:.3} 不在入场区[{:.2},{:.2}],跳过 z={:.3}",
+                market.title, self.config.ev_solo_min_ask, self.config.ev_solo_max_ask, sig.z);
+            return Ok(());
+        }
+
+        let qty = self.config.ev_solo_qty;
+        let fc = full_cost_per_share(ask);
+        let ev_per = 0.578 * (1.0 - fc) - 0.422 * fc; // 用实测胜率估每份EV(仅日志参考)
+        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+        info!("[EV_SOLO {mode}] {} 单边买{dir}@{ask:.3}×{qty:.0} z={:.3} 估EV{ev_per:+.3}/份 T-{seconds_left}s",
+            market.title, sig.z);
+
+        // 记录入场信号(含量价,结算后 join winner 验证胜率)
+        let now_ts = chrono::Utc::now().timestamp();
+        let flow = self.model.binance_flow(now_ts, 60);
+        self.write_signal(&serde_json::json!({
+            "phase":"entry_signal","market":market.slug,"direction":dir,
+            "entry_ask":ask,"z":sig.z,"p_up":sig.p_up,"p_down":sig.p_down,
+            "flow_imbalance":flow.imbalance,"momentum60":self.model.binance_momentum(now_ts,60).unwrap_or(0.0),
+            "strategy":"ev_solo","seconds_left":seconds_left,"ts":now_ts,
+        })).await?;
+
+        // 买单边,然后标 Locked 裸持到结算(不进任何后续决策)
+        if self.do_buy(&market, dir, ask, qty, "ev_solo", price_to_beat).await? {
+            let p = self.state.get_or_create(&market.slug, market.end_ts);
+            p.phase = Phase::Locked;
+            self.state.save().await?;
+        }
         Ok(())
     }
 

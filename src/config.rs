@@ -91,6 +91,16 @@ pub struct Config {
     /// 若极少触发说明价差窗口稀缺、策略无戏;调>1则放宽(吃微亏对冲)。
     pub dh_max_pair_cost: f64,
 
+    // ── 路线四:ev_solo 纯单边裸持(数学上唯一正期望路径)──────────────────────
+    // z-score定方向→只买该边、不对冲、裸持到结算。靠 z-score 方向胜率(实测154场57.8%)
+    // 在合适价位形成正EV。对冲腿在7%费下每份必亏(已数学证明),故彻底不对冲。
+    /// 入场价上限:仅当看好侧 ask ≤ 此值才入场(避开贵价负EV区,实测0.52-0.58区负EV)。
+    pub ev_solo_max_ask: f64,
+    /// 入场价下限:太便宜(<此值)往往是方向已成定局、赔率差,跳过。
+    pub ev_solo_min_ask: f64,
+    /// 单边份额。
+    pub ev_solo_qty: f64,
+
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -255,6 +265,9 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         dh_stop_secs: env_i64("DH_STOP_SECS", 60),
         dh_max_shares: env_f64("DH_MAX_SHARES", 400.0),
         dh_max_pair_cost: env_f64("DH_MAX_PAIR_COST", 1.00),
+        ev_solo_max_ask: env_f64("EV_SOLO_MAX_ASK", 0.52),
+        ev_solo_min_ask: env_f64("EV_SOLO_MIN_ASK", 0.35),
+        ev_solo_qty: env_f64("EV_SOLO_QTY", 20.0),
         poll_ms: env_u64("POLL_MS", 1000),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
