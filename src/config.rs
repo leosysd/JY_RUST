@@ -75,6 +75,21 @@ pub struct Config {
     /// v1 双边捡便宜：某边 ask ≤ 此值才买该边（压低均价、避免追高）。两边分别判断。
     pub scalein_cheap_max: f64,
 
+    // ── 路线三：dual_hedge 双边对冲吃价差（复刻 JetFadil 实证打法）──────────────
+    /// 每笔下单份额(每个加仓 tick 买这么多到落后的一边)。
+    pub dh_qty: f64,
+    /// 加仓间隔(秒):每隔此秒数评估一次是否补仓。JetFadil 中位 28 笔/盘 → 约每 8-10s 一笔。
+    pub dh_step_sec: i64,
+    /// 起始时点(剩余秒):seconds_left ≤ 此值才开始建仓(默认 280,留开盘 20s 让盘口稳定)。
+    pub dh_start_secs: i64,
+    /// 停止时点(剩余秒):seconds_left ≤ 此值停止建仓,裸持到结算(默认 60)。
+    pub dh_stop_secs: i64,
+    /// 单边份额上限(风控,大本金按需调大)。
+    pub dh_max_shares: f64,
+    /// 锁差阈值:仅当"买入后两边均价和 ≤ 此值"才买(吃价差核心,>1 则该笔不划算不买)。
+    /// 默认 0.99 → 只在两边合计能保底盈利时建仓。这是 JetFadil 对冲微利的关键。
+    pub dh_max_pair_cost: f64,
+
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -233,6 +248,12 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         scalein_stop_secs: env_i64("SCALEIN_STOP_SECS", 60),
         scalein_max_shares: env_f64("SCALEIN_MAX_SHARES", 200.0),
         scalein_cheap_max: env_f64("SCALEIN_CHEAP_MAX", 0.55),
+        dh_qty: env_f64("DH_QTY", 20.0),
+        dh_step_sec: env_i64("DH_STEP_SEC", 8),
+        dh_start_secs: env_i64("DH_START_SECS", 280),
+        dh_stop_secs: env_i64("DH_STOP_SECS", 60),
+        dh_max_shares: env_f64("DH_MAX_SHARES", 400.0),
+        dh_max_pair_cost: env_f64("DH_MAX_PAIR_COST", 0.99),
         poll_ms: env_u64("POLL_MS", 1000),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),

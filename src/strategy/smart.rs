@@ -142,6 +142,12 @@ impl SmartStrategy {
             return Ok(());
         }
 
+        // 路线三：dual_hedge 双边对冲吃价差（复刻 JetFadil）。
+        if self.config.entry_strategy == "dual_hedge" {
+            self.decide_dual_hedge(&market, pos, up_ask, dn_ask, seconds_left).await?;
+            return Ok(());
+        }
+
         match pos.phase {
             Phase::Waiting  => self.decide_waiting(&market, pos, up_ask, dn_ask, seconds_left).await?,
             Phase::Holding  => self.decide_holding(&market, pos, up_ask, dn_ask, seconds_left).await?,
@@ -512,6 +518,89 @@ impl SmartStrategy {
             market.title,
             if main_dir == "Up" { pos.up_avg_full() } else { pos.down_avg_full() }
         );
+        Ok(())
+    }
+
+    // ── 路线三：dual_hedge 双边对冲吃价差（复刻 JetFadil 实证打法）──────────────
+    //
+    // JetFadil 实证(9.4h/3386笔/114盘): 99%双边、两边份额差仅4-12%、~28笔/盘、全价位、taker。
+    // 本质=双边对冲吃价差,不赌方向(胜率50.6%)。靠大本金+低费+高频摊薄微利(ROI~1.1%)。
+    //
+    // 逻辑: 窗口(stop,start]内每隔 step 秒,买"落后的一边"(份额少的)使两边趋于平衡,
+    // 且仅当"买入后两边均价和 ≤ dh_max_pair_cost"才买(保证对冲后保底盈利,不追高)。
+    // force线停手裸持到结算。两边均价和<1 时无论涨跌都赚(差额×份额)。
+    async fn decide_dual_hedge(
+        &mut self,
+        market: &Market,
+        pos: MarketPosition,
+        up_ask: f64,
+        dn_ask: f64,
+        seconds_left: i64,
+    ) -> Result<()> {
+        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+
+        // force 线:停止建仓,标记锁定,裸持到结算
+        if seconds_left <= self.config.dh_stop_secs {
+            if !pos.trades.is_empty() {
+                let p = self.state.get_or_create(&market.slug, market.end_ts);
+                if matches!(p.phase, Phase::Holding) {
+                    p.phase = Phase::Locked;
+                    self.state.save().await?;
+                    let pair = pos.up_avg_full() + pos.down_avg_full();
+                    info!("[DH {mode}] {} 停止建仓裸持: Up{:.0}@{:.3} Dn{:.0}@{:.3} 均价和{:.3} worst{:+.2} T-{seconds_left}s",
+                        market.title, pos.up_shares, pos.up_avg_full(),
+                        pos.down_shares, pos.down_avg_full(), pair, pos.worst_pnl());
+                }
+            }
+            return Ok(());
+        }
+
+        // 仅在建仓窗口内
+        if seconds_left > self.config.dh_start_secs { return Ok(()); }
+
+        // 限频:距上一笔成交 ≥ step 秒
+        let now = chrono::Utc::now().timestamp();
+        let last = pos.trades.iter().map(|t| t.ts).max().unwrap_or(0);
+        if now - last < self.config.dh_step_sec { return Ok(()); }
+
+        // 选"落后的一边"补仓(让两边份额趋于平衡=对冲)
+        let (dir, ask) = if pos.up_shares <= pos.down_shares { ("Up", up_ask) } else { ("Down", dn_ask) };
+        if ask <= 0.0 || ask >= 1.0 { return Ok(()); }
+
+        // 单边份额上限
+        let held = if dir == "Up" { pos.up_shares } else { pos.down_shares };
+        if held >= self.config.dh_max_shares { return Ok(()); }
+
+        // 锁差核心:模拟买入后两边均价和,>阈值不划算则不买(吃价差,不追高)
+        let qty = self.config.dh_qty;
+        let fc = full_cost_per_share(ask);
+        let (new_up_avg, new_dn_avg) = if dir == "Up" {
+            let us = pos.up_shares + qty;
+            let uc = pos.up_cost_total + fc * qty;
+            (if us > 0.0 { uc / us } else { 0.0 }, pos.down_avg_full())
+        } else {
+            let ds = pos.down_shares + qty;
+            let dc = pos.down_cost_total + fc * qty;
+            (pos.up_avg_full(), if ds > 0.0 { dc / ds } else { 0.0 })
+        };
+        // 只在两边都已有仓时才用均价和门槛;首笔(对面还空)无条件建第一腿
+        let opp_has = if dir == "Up" { pos.down_shares > 0.0 } else { pos.up_shares > 0.0 };
+        if opp_has {
+            let pair = new_up_avg + new_dn_avg;
+            if pair > self.config.dh_max_pair_cost {
+                // 这一笔会让均价和超阈值,不划算,跳过等更好价位
+                return Ok(());
+            }
+        } else {
+            // 建第一腿:只在该边不太贵时建(避免在 0.9 起手),用 pair 阈值的一半近似上限
+            if fc > self.config.dh_max_pair_cost {
+                return Ok(());
+            }
+        }
+
+        info!("[DH {mode}] {} 补{dir}@{ask:.3}×{qty:.0} (Up{:.0}/Dn{:.0} 买后均价和{:.3}) T-{seconds_left}s",
+            market.title, pos.up_shares, pos.down_shares, new_up_avg + new_dn_avg);
+        self.do_buy(&market, dir, ask, qty, "dual_hedge", 0.0).await?;
         Ok(())
     }
 

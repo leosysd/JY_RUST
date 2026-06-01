@@ -112,8 +112,9 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
             let v = match val.to_lowercase().as_str() {
                 "zscore" | "z" => "zscore",
                 "maker_scalein" | "maker" | "scalein" => "maker_scalein",
+                "dual_hedge" | "dual" | "hedge" | "dh" => "dual_hedge",
                 other => {
-                    eprintln!("未知入场策略: {other}（可选 zscore | maker_scalein）");
+                    eprintln!("未知入场策略: {other}（可选 zscore | maker_scalein | dual_hedge）");
                     std::process::exit(1);
                 }
             };
@@ -156,6 +157,10 @@ const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
     ("SCALEIN_START_SECS",    "scale-in 起始(剩余秒 ≤ 此值才加仓)", "240"),
     ("SCALEIN_STOP_SECS",     "scale-in 停止(剩余秒 ≤ 此值停加仓)", "60"),
     ("TAKER_BUFFER",          "taker 吃单滑点缓冲(限价=ask+此值)",  "0.02"),
+    ("DH_QTY",                "dual_hedge 每笔份额",               "20"),
+    ("DH_STEP_SEC",           "dual_hedge 加仓间隔(秒)",           "8"),
+    ("DH_MAX_SHARES",         "dual_hedge 单边份额上限",           "400"),
+    ("DH_MAX_PAIR_COST",      "dual_hedge 锁差阈值(两边均价和≤才买)","0.99"),
     ("FORCE_LOCK_SECONDS_LEFT","强制处理线(剩余 ≤ 此秒触发)",       "60"),
     ("QUANT_ORDER_SHARES",    "zscore 每单份额",                   "20"),
     ("TREND_CHASE_MAX_PRICE", "zscore 追单价格上限",               "0.60"),
