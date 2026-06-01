@@ -13,6 +13,8 @@ struct Inner {
     subscribed: Mutex<HashSet<String>>,
     cache: BookCache,
     reconnect: tokio::sync::Notify,
+    /// 盘口更新信号:每次收到 book/price_change 后 notify,主循环据此事件驱动决策(替代轮询)。
+    book_updated: tokio::sync::Notify,
     /// 可选 tick 级盘口录制器（None=不采集）。
     recorder: Option<Recorder>,
 }
@@ -28,8 +30,14 @@ impl MarketWs {
             subscribed: Mutex::new(HashSet::new()),
             cache,
             reconnect: tokio::sync::Notify::new(),
+            book_updated: tokio::sync::Notify::new(),
             recorder,
         }))
+    }
+
+    /// 等待下一次盘口更新(事件驱动)。主循环 await 此方法,盘口一变即被唤醒决策。
+    pub async fn wait_book_update(&self) {
+        self.0.book_updated.notified().await;
     }
 
     /// 订阅新 token，若有新增则触发重连（重连后服务端会推完整快照）。
@@ -145,6 +153,10 @@ impl MarketWs {
                     }
                 }
             }
+        }
+        // 事件驱动:本批有盘口更新 → 唤醒主循环立即决策(替代轮询滞后)。
+        if !touched.is_empty() {
+            self.0.book_updated.notify_one();
         }
     }
 }

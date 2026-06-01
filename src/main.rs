@@ -75,15 +75,30 @@ async fn run_quant(
     };
     let ws = MarketWs::new(&config.market_ws_url, cache.clone(), recorder);
     let _ws = ws.run();
+    let ws_evt = ws.clone(); // 事件驱动:主循环用此句柄等盘口更新信号
 
     let mut strategy =
         SmartStrategy::new(config, cache, chainlink, binance, ws, exec).await?;
 
+    // 事件驱动循环:盘口一更新即被唤醒决策(看到机会延迟≈0);
+    // 兜底超时(poll,默认配置值)保证冷场时仍定期跑(处理结算/找新盘);
+    // 节流(min_gap)避免高频盘口下每秒决策几十次空转。
+    let min_gap = tokio::time::Duration::from_millis(50);
     loop {
+        let t0 = tokio::time::Instant::now();
         if let Err(e) = strategy.run_once().await {
             error!("[JY-BOT ERROR] {e}");
         }
-        tokio::time::sleep(poll).await;
+        // 等"盘口更新信号"或"兜底超时",谁先到
+        tokio::select! {
+            _ = ws_evt.wait_book_update() => {}
+            _ = tokio::time::sleep(poll) => {}
+        }
+        // 节流:距上次决策不足 min_gap 则补足(防高频盘口空转)
+        let elapsed = t0.elapsed();
+        if elapsed < min_gap {
+            tokio::time::sleep(min_gap - elapsed).await;
+        }
     }
 }
 
