@@ -336,26 +336,30 @@ impl SmartStrategy {
             }
         }
 
-        // ── P2.5：早止损（不等 T-60 强制线）────────────────────────────────
+        // ── P2.5：早止损（方向押错时，不等 T-60 强制线提前锁亏）──────────────
         // 数据：旧实盘29场锁亏100%卡T-60被迫天价锁(中位0.66,最贵0.99)，单次均-1.85，
-        // 是最大失血点。这里在亏损还小时提前补对面锁平，把单次大亏压成可控小亏。
-        // 仅当 stop_loss_factor>0 启用；对面天价(>stop_loss_max_opp)则不锁、裸持(避免高价接盘)。
+        // 是最大失血点。这里在方向刚转坏、亏损还小时提前补对面锁平，把大亏压成可控小亏。
+        //
+        // 触发信号 = "未实现方向亏损" = 主边份额 ×(主边现价 − 主边入场均价)。
+        // 关键:不能用 worst_pnl —— 单边裸仓的 worst_pnl 恒为 ≈-满仓成本(假设对面赢),
+        // 入场第一秒就 <止损线 会导致开盘秒锁(已修的bug)。用现价跌幅才不误触发:
+        // 刚入场时现价≈入场价→未实现≈0;只有价格真跌破入场价到阈值才止损。
         if self.config.stop_loss_factor > 0.0
             && lock_qty > 0.0
             && seconds_left > self.config.force_lock_seconds_left
         {
+            let main_avg = if main_dir == "Up" { pos.up_avg_full() } else { pos.down_avg_full() };
+            // 主边现价用 main_ask 近似(买一侧);跌破入场价即方向走坏
+            let unrealized = main_shares * (main_ask - main_avg);
             let stop_line = -(shares * self.config.stop_loss_factor);
-            if cur_worst <= stop_line && opp_ask <= self.config.stop_loss_max_opp {
+            if unrealized <= stop_line && opp_ask <= self.config.stop_loss_max_opp {
                 let proj = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
-                // 只在"现在锁比死扛到底更好"时才提前锁(proj 高于当前最坏)
-                if proj > cur_worst {
-                    info!(
-                        "[SMART STOPLOSS {mode}] {} 早止损 买{opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  worst {cur_worst:+.2}→{proj:+.2}(线{stop_line:.2})  T-{seconds_left}s",
-                        market.title
-                    );
-                    self.do_lock(&market, &pos, opp_dir, opp_ask, lock_qty, proj, "lock_loss").await?;
-                    return Ok(());
-                }
+                info!(
+                    "[SMART STOPLOSS {mode}] {} 方向亏{unrealized:+.2}≤{stop_line:.2} 止损买{opp_dir}@{opp_ask:.3} ×{lock_qty:.0}份  锁定{proj:+.2}  T-{seconds_left}s",
+                    market.title
+                );
+                self.do_lock(&market, &pos, opp_dir, opp_ask, lock_qty, proj, "lock_loss").await?;
+                return Ok(());
             }
         }
 
