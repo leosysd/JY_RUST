@@ -563,42 +563,39 @@ impl SmartStrategy {
         let last = pos.trades.iter().map(|t| t.ts).max().unwrap_or(0);
         if now - last < self.config.dh_step_sec { return Ok(()); }
 
-        // 选"落后的一边"补仓(让两边份额趋于平衡=对冲)
-        let (dir, ask) = if pos.up_shares <= pos.down_shares { ("Up", up_ask) } else { ("Down", dn_ask) };
+        // 选"落后的一边"补仓(强制双边平衡=对冲)。不再用均价和门槛卡死(那会退化成单边)。
+        let (dir, ask, opp_ask) = if pos.up_shares <= pos.down_shares {
+            ("Up", up_ask, dn_ask)
+        } else {
+            ("Down", dn_ask, up_ask)
+        };
         if ask <= 0.0 || ask >= 1.0 { return Ok(()); }
 
         // 单边份额上限
         let held = if dir == "Up" { pos.up_shares } else { pos.down_shares };
         if held >= self.config.dh_max_shares { return Ok(()); }
 
-        // 锁差核心:模拟买入后两边均价和,>阈值不划算则不买(吃价差,不追高)
+        // ── 吃价差核心:只在"这一刻该边便宜"时吃 ──────────────────────────
+        // 判据: 该边 ask + 对面 ask < dh_max_pair_cost。
+        // 意味着此刻同时持有两边的瞬时成本和<1 → 这是 JetFadil "抓两边瞬时低点"的本质。
+        // ask 之和几乎总>1(买卖价差),所以多数 tick 会跳过、只在价差收窄/该边被砸时才吃。
+        // 这正是判生死的机制:能频繁吃到 → 均价和压到<1 稳赚;吃不到 → 不下单不亏。
+        let spot_pair = ask + opp_ask;
+        if spot_pair >= self.config.dh_max_pair_cost {
+            return Ok(()); // 此刻不便宜,等更好价位(不下单)
+        }
+
         let qty = self.config.dh_qty;
         let fc = full_cost_per_share(ask);
         let (new_up_avg, new_dn_avg) = if dir == "Up" {
             let us = pos.up_shares + qty;
-            let uc = pos.up_cost_total + fc * qty;
-            (if us > 0.0 { uc / us } else { 0.0 }, pos.down_avg_full())
+            (if us>0.0 {(pos.up_cost_total+fc*qty)/us} else {0.0}, pos.down_avg_full())
         } else {
             let ds = pos.down_shares + qty;
-            let dc = pos.down_cost_total + fc * qty;
-            (pos.up_avg_full(), if ds > 0.0 { dc / ds } else { 0.0 })
+            (pos.up_avg_full(), if ds>0.0 {(pos.down_cost_total+fc*qty)/ds} else {0.0})
         };
-        // 只在两边都已有仓时才用均价和门槛;首笔(对面还空)无条件建第一腿
-        let opp_has = if dir == "Up" { pos.down_shares > 0.0 } else { pos.up_shares > 0.0 };
-        if opp_has {
-            let pair = new_up_avg + new_dn_avg;
-            if pair > self.config.dh_max_pair_cost {
-                // 这一笔会让均价和超阈值,不划算,跳过等更好价位
-                return Ok(());
-            }
-        } else {
-            // 建第一腿:只在该边不太贵时建(避免在 0.9 起手),用 pair 阈值的一半近似上限
-            if fc > self.config.dh_max_pair_cost {
-                return Ok(());
-            }
-        }
 
-        info!("[DH {mode}] {} 补{dir}@{ask:.3}×{qty:.0} (Up{:.0}/Dn{:.0} 买后均价和{:.3}) T-{seconds_left}s",
+        info!("[DH {mode}] {} 补{dir}@{ask:.3}×{qty:.0} 此刻ask和{spot_pair:.3} (Up{:.0}/Dn{:.0} 买后均价和{:.3}) T-{seconds_left}s",
             market.title, pos.up_shares, pos.down_shares, new_up_avg + new_dn_avg);
         self.do_buy(&market, dir, ask, qty, "dual_hedge", 0.0).await?;
         Ok(())

@@ -86,8 +86,9 @@ pub struct Config {
     pub dh_stop_secs: i64,
     /// 单边份额上限(风控,大本金按需调大)。
     pub dh_max_shares: f64,
-    /// 锁差阈值:仅当"买入后两边均价和 ≤ 此值"才买(吃价差核心,>1 则该笔不划算不买)。
-    /// 默认 0.99 → 只在两边合计能保底盈利时建仓。这是 JetFadil 对冲微利的关键。
+    /// 吃价差阈值:仅当"此刻该边ask+对面ask < 此值"才补该边(抓瞬时低点)。
+    /// 默认 1.00 → 只在两边瞬时ask和<1(出现真实套利窗口)时吃。这是判生死的旋钮:
+    /// 若极少触发说明价差窗口稀缺、策略无戏;调>1则放宽(吃微亏对冲)。
     pub dh_max_pair_cost: f64,
 
     // 系统
@@ -253,7 +254,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         dh_start_secs: env_i64("DH_START_SECS", 280),
         dh_stop_secs: env_i64("DH_STOP_SECS", 60),
         dh_max_shares: env_f64("DH_MAX_SHARES", 400.0),
-        dh_max_pair_cost: env_f64("DH_MAX_PAIR_COST", 0.99),
+        dh_max_pair_cost: env_f64("DH_MAX_PAIR_COST", 1.00),
         poll_ms: env_u64("POLL_MS", 1000),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
