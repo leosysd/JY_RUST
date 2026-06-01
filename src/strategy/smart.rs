@@ -53,6 +53,8 @@ pub struct SmartStrategy {
     pub book_log_file: PathBuf,
     /// 盘口日志节流：上次写入的 unix 秒（POLL_MS<1000 时避免重复写同一秒）。
     pub last_book_log_ts: i64,
+    /// 已采集训练样本的盘口(每盘只记一次特征快照,防重复)。LightGBM训练数据。
+    pub sampled_slugs: std::collections::HashSet<String>,
 }
 
 /// 由主状态文件路径派生影子账路径：quant_state.json → quant_state_ideal.json
@@ -90,6 +92,7 @@ impl SmartStrategy {
             signal_file, first_allowed_start, ws,
             cached_market: None, executor, ideal_state,
             book_log_file, last_book_log_ts: 0,
+            sampled_slugs: std::collections::HashSet::new(),
         })
     }
 
@@ -126,6 +129,14 @@ impl SmartStrategy {
         };
 
         let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
+
+        // ── 每盘记一条训练样本(特征快照,不管下不下单;LightGBM训练数据)──────────
+        // 在固定窗口[240,290]记,每盘只记一次(sampled_slugs去重)。标签由Python训练时
+        // 用slug join settlement(quant_signals.jsonl)拿。3-4天可攒1000+,无选择偏差。
+        if seconds_left >= 240 && seconds_left <= 290 && !self.sampled_slugs.contains(&market.slug) {
+            self.record_train_sample(&market, up_ask, dn_ask, seconds_left).await;
+            self.sampled_slugs.insert(market.slug.clone());
+        }
 
         // 路线四：ev_solo 纯单边裸持（数学上唯一正期望路径）。
         if self.config.entry_strategy == "ev_solo" {
@@ -678,6 +689,27 @@ impl SmartStrategy {
         let mut f = OpenOptions::new().create(true).append(true).open(&self.signal_file).await?;
         f.write_all((serde_json::to_string(v)? + "\n").as_bytes()).await?;
         Ok(())
+    }
+
+    /// 每盘记一条训练样本(特征快照)到 book 目录的 train_samples.jsonl。
+    /// 纯记录、不影响交易。z信号缺失时跳过(无特征)。标签由训练脚本join settlement。
+    async fn record_train_sample(&self, market: &Market, up_ask: f64, dn_ask: f64, seconds_left: i64) {
+        let price_to_beat = self.model.chainlink_at(market.start_ts)
+            .or_else(|| self.model.chainlink_latest()).unwrap_or(0.0);
+        if price_to_beat < 1000.0 { return; }
+        let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return; };
+        // 方向取 z 倾向(>0看Up),仅作记录;入场价取该方向 ask
+        let dir = if sig.z >= 0.0 { "Up" } else { "Down" };
+        let entry_ask = if dir == "Up" { up_ask } else { dn_ask };
+        let mut feat = self.build_features(&sig, dir, entry_ask, up_ask, dn_ask, seconds_left);
+        feat["slug"] = serde_json::json!(market.slug);
+        feat["end_ts"] = serde_json::json!(market.end_ts);
+        feat["kind"] = serde_json::json!("train_sample");
+        let path = self.config.book_record_dir.join("train_samples.jsonl");
+        if let Some(p) = path.parent() { let _ = fs::create_dir_all(p).await; }
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path).await {
+            let _ = f.write_all((feat.to_string() + "\n").as_bytes()).await;
+        }
     }
 
     /// 构造入场时刻的丰富特征集(为 LightGBM 铺路)。纯记录,无副作用。
