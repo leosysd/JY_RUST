@@ -273,6 +273,12 @@ impl SmartStrategy {
         );
         // 入场信号快照：记录 z-score 全套字段，用于离线分析"信号强度 vs 方向准确率"。
         // 纯记录，不影响下单。结算后可 join winner 验证。
+        // 量价信号(B方案):前段 Binance 买卖压力 imbalance + 动量，离线验证能否预测方向。
+        let now_ts = chrono::Utc::now().timestamp();
+        let flow = self.model.binance_flow(now_ts, 60);
+        let mom = self.model.binance_momentum(now_ts, 60).unwrap_or(0.0);
+        // 量价方向预测:imbalance>0 或 动量>0 → 看涨(Up)。后续按命中率决定权重。
+        let flow_dir = if flow.imbalance > 0.05 { "Up" } else if flow.imbalance < -0.05 { "Down" } else { "flat" };
         self.write_signal(&serde_json::json!({
             "phase": "entry_signal",
             "market": market.slug,
@@ -289,7 +295,14 @@ impl SmartStrategy {
             "sigma120": sig.sigma120,
             "basis60": sig.basis60,
             "seconds_left": seconds_left,
-            "ts": chrono::Utc::now().timestamp(),
+            // 量价信号字段
+            "flow_imbalance": flow.imbalance,
+            "flow_buy_vol": flow.buy_vol,
+            "flow_sell_vol": flow.sell_vol,
+            "flow_trades": flow.trades,
+            "flow_dir": flow_dir,
+            "momentum60": mom,
+            "ts": now_ts,
         })).await?;
         self.do_buy(&market, dir, entry_ask, shares, "entry", price_to_beat).await?;
         Ok(())

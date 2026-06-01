@@ -45,6 +45,18 @@ impl ZScoreModel {
         self.chainlink.latest().map(|p| p.price)
     }
 
+    /// 暴露 Binance 量价买卖压力信号(用于量价方向验证)。
+    pub fn binance_flow(&self, now: i64, window_sec: i64) -> crate::feeds::FlowSignal {
+        self.binance.flow(now, window_sec)
+    }
+
+    /// Binance 价格动量 = 现价 − window_sec 秒前价。>0 涨势。
+    pub fn binance_momentum(&self, now: i64, window_sec: i64) -> Option<f64> {
+        let cur = self.binance.latest()?.price;
+        let past = self.binance.at_ts(now - window_sec)?;
+        Some(cur - past)
+    }
+
     /// 计算当前 z-score 信号
     /// price_to_beat: 本轮开盘时的 Chainlink 价格 (B)
     /// seconds_left: 距结算剩余秒数
