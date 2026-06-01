@@ -53,6 +53,9 @@ pub struct Config {
     pub stop_loss_factor: f64,
     /// 早止损价格上限：对面 ask > 此值(天价)则不锁、裸持到结算,避免高价接盘放大亏损。
     pub stop_loss_max_opp: f64,
+    /// 早止损最早触发时点：剩余秒数 > 此值时绝不止损(给行情时间,避免开盘段被正常波动晃出)。
+    /// 默认120 → 只在盘后半段(已过≥180s)才允许止损。300秒盘:配合force_lock=60,止损窗口为剩余[60,120]。
+    pub stop_loss_max_seconds_left: i64,
 
     // ── 路线二：maker scale-in 策略（与 z-score 单发并存，env 切换）──────────
     /// 入场策略："zscore"=旧的 z 信号单发(默认,行为不变)；"maker_scalein"=JetFadil式 maker 顺势加仓
@@ -221,6 +224,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         smooth_budget_mult: env_f64("SMOOTH_BUDGET_MULT", 0.5),
         stop_loss_factor: env_f64("STOP_LOSS_FACTOR", 0.0),
         stop_loss_max_opp: env_f64("STOP_LOSS_MAX_OPP", 0.75),
+        stop_loss_max_seconds_left: env_i64("STOP_LOSS_MAX_SECONDS_LEFT", 120),
         entry_strategy: env("ENTRY_STRATEGY", "zscore").to_lowercase(),
         maker_ttl_sec: env_i64("MAKER_TTL_SEC", 10),
         scalein_step_sec: env_i64("SCALEIN_STEP_SEC", 15),

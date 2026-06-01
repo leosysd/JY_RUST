@@ -342,11 +342,17 @@ impl SmartStrategy {
         //
         // 触发信号 = "未实现方向亏损" = 主边份额 ×(主边现价 − 主边入场均价)。
         // 关键:不能用 worst_pnl —— 单边裸仓的 worst_pnl 恒为 ≈-满仓成本(假设对面赢),
-        // 入场第一秒就 <止损线 会导致开盘秒锁(已修的bug)。用现价跌幅才不误触发:
-        // 刚入场时现价≈入场价→未实现≈0;只有价格真跌破入场价到阈值才止损。
+        // 入场第一秒就 <止损线 会导致开盘秒锁。用现价跌幅才不误触发。
+        //
+        // 时间门槛(stop_loss_max_seconds_left):前段(剩余>此值)绝不止损,给5分钟行情时间,
+        // 避免开盘段被正常波动晃出(之前剩280s就止损=刚入场就投降的问题)。
+        // 只在盘后半段、方向确实没回来时才认小亏,而不是死扛到T-60天价锁。
+        // naked 模式下完全关闭早止损(去掉锁亏=方向错就裸持,不提前补对面)。
         if self.config.stop_loss_factor > 0.0
+            && self.config.force_loss_mode != "naked"
             && lock_qty > 0.0
             && seconds_left > self.config.force_lock_seconds_left
+            && seconds_left <= self.config.stop_loss_max_seconds_left
         {
             let main_avg = if main_dir == "Up" { pos.up_avg_full() } else { pos.down_avg_full() };
             // 主边现价用 main_ask 近似(买一侧);跌破入场价即方向走坏
@@ -423,6 +429,13 @@ impl SmartStrategy {
                     if !self.do_buy(&market, opp_dir, opp_ask, lock_qty, "lock_profit", pos.price_to_beat).await? {
                         return Ok(());
                     }
+                } else if self.config.force_loss_mode == "naked" {
+                    // 去掉锁亏:方向押错不补对面、不花钱对锁,裸持到结算认那一边成本。
+                    // 赌"行情常回来";最坏=入场那笔成本归零,但不再追加确定支出去锁亏。
+                    info!(
+                        "[SMART FORCE NAKED {mode}] {} 不锁亏裸持到结算 主{main_dir}{main_shares:.0}份 worst={proj:+.2}  T-{seconds_left}s",
+                        market.title
+                    );
                 } else if self.config.force_loss_mode == "smooth" {
                     // 锁亏改"按趋势锁利"：不补对面认亏，而是顺当前领先方向加注，争取赢回。
                     // 领先方向 = ask 更高(更被市场看好)的一边。
