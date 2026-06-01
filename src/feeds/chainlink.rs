@@ -6,7 +6,12 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
 const RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
-const HISTORY_SEC: i64 = 180;
+/// 历史保留时长。必须 > 盘口时长(300s)+富余,否则盘后半段取不到真开盘价。
+/// 原 180s 是 bug:过 180s 后 chainlink_at(start_ts) 找不到开盘价会取最旧旧价→z方向变形。
+const HISTORY_SEC: i64 = 420;
+/// at_ts 容差:目标时间最近的样本若偏离超过此秒数,视为"没有该时刻价格",返回 None。
+/// 防止拿一个时间差很大的旧价格凑数(那会让 price_to_beat 失真)。
+const AT_TS_TOLERANCE_SEC: i64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct PricePoint {
@@ -29,12 +34,16 @@ impl ChainlinkFeed {
         self.history.lock().unwrap().back().cloned()
     }
 
-    /// 获取指定时间戳附近的价格
+    /// 获取指定时间戳附近的价格。最近样本偏离超过 AT_TS_TOLERANCE_SEC 则返回 None
+    /// (宁可不入场,也不拿错误的旧价当开盘价 → 避免 z-score 方向变形)。
     pub fn at_ts(&self, target_ts: i64) -> Option<f64> {
         let h = self.history.lock().unwrap();
-        h.iter()
-            .min_by_key(|p| (p.ts - target_ts).abs())
-            .map(|p| p.price)
+        let p = h.iter().min_by_key(|p| (p.ts - target_ts).abs())?;
+        if (p.ts - target_ts).abs() <= AT_TS_TOLERANCE_SEC {
+            Some(p.price)
+        } else {
+            None
+        }
     }
 
     /// 获取全部历史（用于 σ 计算）

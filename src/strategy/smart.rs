@@ -184,11 +184,11 @@ impl SmartStrategy {
     ) -> Result<()> {
         if seconds_left < ENTRY_MIN_SECONDS_LEFT { return Ok(()); }
 
-        let price_to_beat = self.model.chainlink_at(market.start_ts)
-            .or_else(|| self.model.chainlink_latest())
-            .unwrap_or(0.0);
+        // 必须用真开盘价(start_ts处的chainlink),取不到就跳过——不退回"最新价"凑数,
+        // 否则 price_to_beat 失真→z方向变形(原 .or_else(latest) 是隐患,已去掉)。
+        let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
         if price_to_beat < 1000.0 {
-            info!("[SMART] {} Chainlink未就绪，跳过", market.title);
+            info!("[SMART] {} 无真开盘价(chainlink过期/未就绪)，跳过", market.title);
             return Ok(());
         }
 
@@ -471,9 +471,8 @@ impl SmartStrategy {
         if !matches!(pos.phase, Phase::Waiting) { return Ok(()); }
         if seconds_left < ENTRY_MIN_SECONDS_LEFT { return Ok(()); }
 
-        let price_to_beat = self.model.chainlink_at(market.start_ts)
-            .or_else(|| self.model.chainlink_latest())
-            .unwrap_or(0.0);
+        // 真开盘价取不到则跳过(不退回最新价,见 decide_waiting 注释)。
+        let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
         if price_to_beat < 1000.0 { return Ok(()); }
 
         let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
@@ -694,8 +693,8 @@ impl SmartStrategy {
     /// 每盘记一条训练样本(特征快照)到 book 目录的 train_samples.jsonl。
     /// 纯记录、不影响交易。z信号缺失时跳过(无特征)。标签由训练脚本join settlement。
     async fn record_train_sample(&self, market: &Market, up_ask: f64, dn_ask: f64, seconds_left: i64) {
-        let price_to_beat = self.model.chainlink_at(market.start_ts)
-            .or_else(|| self.model.chainlink_latest()).unwrap_or(0.0);
+        // 训练样本也要真开盘价(否则特征里的 ct-b/z 失真,污染训练集)。
+        let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
         if price_to_beat < 1000.0 { return; }
         let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return; };
         // 方向取 z 倾向(>0看Up),仅作记录;入场价取该方向 ask

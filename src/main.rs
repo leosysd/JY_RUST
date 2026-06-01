@@ -14,7 +14,6 @@ use clob::new_book_cache;
 use executor::OrderExecutor;
 use feeds::{BinanceFeed, ChainlinkFeed};
 use std::sync::Arc;
-use strategy::copy::CopyStrategy;
 use strategy::smart::SmartStrategy;
 use tracing::{error, info};
 use ws::MarketWs;
@@ -48,10 +47,8 @@ async fn main() -> Result<()> {
     let poll = tokio::time::Duration::from_millis(config.poll_ms);
     info!("[JY-BOT] 开始轮询，间隔 {}ms", config.poll_ms);
 
-    match config.bot_mode.as_str() {
-        "copy" => run_copy(config, exec, poll).await,
-        _      => run_quant(config, exec, poll).await,
-    }
+    // copy 跟单模式已删除(轮询慢、跟的钱包亏钱)。只剩 quant。
+    run_quant(config, exec, poll).await
 }
 
 /// 量化模式：BTC 5m 趋势追单 + 锁利
@@ -102,19 +99,3 @@ async fn run_quant(
     }
 }
 
-/// 跟单模式：镜像目标钱包的成交
-async fn run_copy(
-    config: config::Config,
-    exec: Arc<OrderExecutor>,
-    poll: tokio::time::Duration,
-) -> Result<()> {
-    let mut strategy = CopyStrategy::new(config, exec);
-    strategy.bootstrap().await?;
-
-    loop {
-        if let Err(e) = strategy.run_once().await {
-            error!("[JY-BOT ERROR] {e}");
-        }
-        tokio::time::sleep(poll).await;
-    }
-}
