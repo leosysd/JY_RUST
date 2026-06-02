@@ -532,7 +532,7 @@ impl SmartStrategy {
     ) -> Result<()> {
         // 只在 Waiting 时入场;入场后裸持(Holding/Locked 不做任何动作)
         if !matches!(pos.phase, Phase::Waiting) { return Ok(()); }
-        if seconds_left < ENTRY_MIN_SECONDS_LEFT { return Ok(()); }
+        if seconds_left < self.config.ev_solo_min_seconds_left { return Ok(()); }
 
         // 真开盘价取不到则跳过(不退回最新价,见 decide_waiting 注释)。
         let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
@@ -549,6 +549,19 @@ impl SmartStrategy {
             debug!("[EV_SOLO] {} {dir}@{ask:.3} 不在入场区[{:.2},{:.2}],跳过 z={:.3}",
                 market.title, self.config.ev_solo_min_ask, self.config.ev_solo_max_ask, sig.z);
             return Ok(());
+        }
+
+        // flow_imb_30 同向闸:开盘前30s资金流与 z 方向明确相悖(signed<0)则跳过。
+        // 实测该信号一致59%/矛盾51%,是目前最有方向预测力的单特征(AUC 0.528)。
+        if self.config.ev_solo_flow_gate {
+            let now = chrono::Utc::now().timestamp();
+            let imb = self.model.binance_flow(now, 30).imbalance;
+            let signed = if dir == "Up" { imb } else { -imb };
+            if signed < 0.0 {
+                debug!("[EV_SOLO] {} {dir} flow闸拦截:flow_imb_30={imb:.3} 反向,跳过 z={:.3}",
+                    market.title, sig.z);
+                return Ok(());
+            }
         }
 
         let qty = self.config.ev_solo_qty;

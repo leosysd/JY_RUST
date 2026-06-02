@@ -63,6 +63,12 @@ pub struct Config {
     pub ev_solo_min_ask: f64,
     /// 单边份额。
     pub ev_solo_qty: f64,
+    /// ev_solo 入场最早时点(剩余秒数 ≥ 此值才入场)。默认240=只打开盘头60秒,
+    /// 砍掉晚入场尾巴(实测 T<240 胜率塌方到 25~50%)。
+    pub ev_solo_min_seconds_left: i64,
+    /// flow_imb_30 同向闸:开盘前30秒资金流与 z 方向明确相悖则跳过入场。
+    /// 依据实测 flow_imb_30 一致59%/矛盾51%(目前最强方向单信号,AUC 0.528)。默认开。
+    pub ev_solo_flow_gate: bool,
 
     // 系统
     pub poll_ms: u64,
@@ -206,8 +212,10 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         stop_loss_max_seconds_left: env_i64("STOP_LOSS_MAX_SECONDS_LEFT", 120),
         entry_strategy: env("ENTRY_STRATEGY", "ev_solo").to_lowercase(),
         ev_solo_max_ask: env_f64("EV_SOLO_MAX_ASK", 0.52),
-        ev_solo_min_ask: env_f64("EV_SOLO_MIN_ASK", 0.35),
+        ev_solo_min_ask: env_f64("EV_SOLO_MIN_ASK", 0.44),
         ev_solo_qty: env_f64("EV_SOLO_QTY", 20.0),
+        ev_solo_min_seconds_left: env_i64("EV_SOLO_MIN_SECONDS_LEFT", 240),
+        ev_solo_flow_gate: env_bool("EV_SOLO_FLOW_GATE", true),
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
