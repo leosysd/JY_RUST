@@ -2,6 +2,7 @@ mod clob;
 mod config;
 mod executor;
 mod feeds;
+mod model;
 mod position;
 mod recorder;
 mod state;

@@ -61,6 +61,23 @@ pub struct SmartStrategy {
     /// 上次结算检查的 unix 秒。决策主循环据此节流结算网络请求(见 SETTLEMENT_CHECK_INTERVAL),
     /// 让结算查询不再每 tick 阻塞、拖慢下一盘入场。
     pub last_settlement_check: i64,
+    /// LightGBM 影子模型(model/ 目录就绪时加载)。每盘记一条"模型预测 vs z vs 结果",
+    /// 不参与下单;待影子胜率稳超 z 再接管。None=模型未训出,影子静默跳过。
+    pub shadow: Option<crate::model::LgbModel>,
+    /// 影子模型目录,及已加载 model.txt 的 mtime(0=未加载)。用于热重载:
+    /// 训练 timer 训出新模型后,bot 在下个新盘自动加载,无需重启(见 maybe_reload_shadow)。
+    pub model_dir: PathBuf,
+    pub shadow_mtime: i64,
+}
+
+/// 读 model.txt 的修改时间(unix 秒);不存在则 0。用于热重载判新。
+fn model_mtime(dir: &std::path::Path) -> i64 {
+    std::fs::metadata(dir.join("model.txt"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// 由主状态文件路径派生影子账路径：quant_state.json → quant_state_ideal.json
@@ -97,6 +114,18 @@ impl SmartStrategy {
         if let Some(p) = signal_file.parent() {
             let _ = fs::create_dir_all(p).await;
         }
+        // 影子模型:数据目录下的 model/(train.py 输出处)。未训出则 None,影子静默跳过。
+        let model_dir = config
+            .state_file
+            .parent()
+            .map(|p| p.join("model"))
+            .unwrap_or_else(|| PathBuf::from("model"));
+        let shadow_mtime = model_mtime(&model_dir);
+        let shadow = crate::model::LgbModel::load(&model_dir);
+        match &shadow {
+            Some(_) => info!("[SHADOW] LightGBM 模型已加载({}),影子预测开启", model_dir.display()),
+            None => info!("[SHADOW] 暂无模型({} 未就绪),影子跳过(训出后自动热加载)", model_dir.display()),
+        }
         Ok(Self {
             config, state, client, cache, model,
             signal_file, first_allowed_start, ws,
@@ -104,6 +133,7 @@ impl SmartStrategy {
             book_log_file, last_book_log_ts: 0,
             sampled_slugs: std::collections::HashSet::new(),
             last_settlement_check: 0,
+            shadow, model_dir, shadow_mtime,
         })
     }
 
@@ -180,9 +210,25 @@ impl SmartStrategy {
             info!("[SMART] 新盘口 {} 已订阅WS", market.slug);
             // 写 token→slug+outcome+end_ts 映射(复盘用,一劳永逸:book只有token,靠此join赢家)
             self.write_token_map(&market).await;
+            // 新盘时检查训练 timer 是否训出/更新了模型,变了就热加载(免重启依赖)。
+            self.maybe_reload_shadow();
         }
         self.cached_market = Some(market.clone());
         Some(market)
+    }
+
+    /// 热重载影子模型:model.txt 的 mtime 变化(训练 timer 训出新版)时重新加载。
+    /// 每新盘调一次(5min/次),开销可忽略;让 06-06 训出的模型无需重启 bot 即生效。
+    fn maybe_reload_shadow(&mut self) {
+        let mt = model_mtime(&self.model_dir);
+        if mt == self.shadow_mtime {
+            return;
+        }
+        self.shadow_mtime = mt;
+        self.shadow = crate::model::LgbModel::load(&self.model_dir);
+        if self.shadow.is_some() {
+            info!("[SHADOW] 检测到模型更新(mtime={mt}),已热加载,影子预测开启");
+        }
     }
 
     // ── Waiting：无仓位时的决策 ───────────────────────────────────────────
@@ -732,6 +778,23 @@ impl SmartStrategy {
         let entry_ask = if dir == "Up" { up_ask } else { dn_ask };
         let mut feat = self.build_features(&sig, dir, entry_ask, up_ask, dn_ask, seconds_left);
         self.add_book_depth(&mut feat, market).await;
+        // 影子预测:模型就绪时记一条"模型置信 vs z vs(待结算)结果"到 signal 文件,不参与下单。
+        // 结算后用 market join settlement(winner)即可评估模型挑盘能力,达标再接管。
+        if let Some(m) = &self.shadow {
+            if let Some(p) = m.predict_proba(&feat) {
+                let rec = serde_json::json!({
+                    "phase": "shadow",
+                    "market": market.slug,
+                    "ts": chrono::Utc::now().timestamp(),
+                    "z": sig.z,
+                    "z_dir": dir,                 // 模型对 z 方向打置信分,方向同 z
+                    "model_p": p,                 // 校准后 P(z 方向正确)
+                    "model_bet": p >= m.threshold, // 是否达下注阈值
+                    "thr": m.threshold,
+                });
+                let _ = self.write_signal(&rec).await;
+            }
+        }
         feat["slug"] = serde_json::json!(market.slug);
         feat["end_ts"] = serde_json::json!(market.end_ts);
         feat["kind"] = serde_json::json!("train_sample");

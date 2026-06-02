@@ -16,6 +16,8 @@ mod recorder;
 mod ws;
 #[path = "../zscore.rs"]
 mod zscore;
+#[path = "../model.rs"]
+mod model;
 #[path = "../strategy/mod.rs"]
 mod strategy;
 
