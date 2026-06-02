@@ -31,10 +31,13 @@ ev_solo 策略实盘运行中(爱尔兰 Lightsail,20份/场,DRY_RUN=0);同时攒
 ## 待做(按优先级)
 1. **LightGBM 影子模式**:模型出来后,bot 加载 model.txt,每盘预测并记录"模型预测 vs 实际赢家",不下单。验证模型胜率是否 > z-score baseline。
 2. **模型接管下注**:影子验证有效后,让模型预测+阈值决定下不下/下哪边(替代或叠加 z-score)。
-3. **【待决策】迁加拿大 VPS 降延迟**:实测同 /time 接口 TTFB —— 爱尔兰234ms vs 加拿大(vital-wall-2)~150ms,
-   **加拿大快84ms**(推翻"330ms网络降不动"的旧判断:那234ms里大半是跨大西洋网络,非纯服务端)。
-   迁过去下单往返预计330→~246ms,扑空更少。成本:重装bot/迁私钥配置/停爱尔兰/迁或重攒样本;同钱包不可两台同跑。
-   **决策门槛:先等 ev_solo 修复后数据确认有 edge,有才值得迁提速,没edge迁了也白迁。**
+3. **【低优先,等edge确认后再说】机房延迟优化**:traceroute查清真相——
+   clob.polymarket.com 走 Cloudflare CDN,两台VPS到本地Cloudflare边缘都<1ms(无绕路);
+   234ms(爱尔兰)vs 155ms(加拿大温哥华)的差,100%来自"Cloudflare边缘→Polymarket后端"的回源:
+   Polymarket后端在北美,欧洲边缘要跨大西洋回源故慢。结论:机房要选离Polymarket后端(北美)近的,
+   理论最优=美东VPS(可能<100ms),温哥华次优(155ms),爱尔兰最差(234ms)。
+   **但延迟只影响扑空率,不影响方向对错=不是从亏变赚的关键。先确认ev_solo有edge,有才值得迁。**
+   加拿大机=vital-wall-2/温哥华(非东部),密码已在对话暴露需改。
 4. **模型推理 Python→Rust**(方式A):正式上线时把 LightGBM 推理移入 bot(lleaves/ONNX),自包含+低延迟,去掉Python旁路。
 5. TAKER_BUFFER 调优(减FAK扑空):现0.02;若扑空仍高可调0.03-0.04更易成交,代价滑点+。
 
