@@ -22,11 +22,21 @@ pub struct PricePoint {
 #[derive(Clone)]
 pub struct ChainlinkFeed {
     pub history: Arc<Mutex<VecDeque<PricePoint>>>,
+    /// 新价到达信号:每收到一批 Chainlink 价即 notify,供主循环事件驱动决策。
+    updated: Arc<tokio::sync::Notify>,
 }
 
 impl ChainlinkFeed {
     pub fn new() -> Self {
-        Self { history: Arc::new(Mutex::new(VecDeque::new())) }
+        Self {
+            history: Arc::new(Mutex::new(VecDeque::new())),
+            updated: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// 取得"新价"通知句柄,主循环 await 它即可在 Chainlink 价更新时被唤醒。
+    pub fn updated_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.updated.clone()
     }
 
     /// 获取最新价格（当前 Chainlink BTC/USD）
@@ -112,25 +122,31 @@ impl ChainlinkFeed {
             .and_then(|d| d.as_array().cloned())
             .unwrap_or_else(|| vec![serde_json::Value::Object(payload.clone())]);
 
-        let mut h = self.history.lock().unwrap();
-        for row in &rows_val {
-            let ts_raw = match row.get("timestamp").or_else(|| row.get("ts"))
-                .and_then(|v| v.as_f64()) {
-                Some(t) => t, None => continue,
-            };
-            let price = match row.get("value").or_else(|| row.get("price"))
-                .and_then(|v| v.as_f64()) {
-                Some(p) => p, None => continue,
-            };
-            let ts = if ts_raw > 1e10 { (ts_raw / 1000.0) as i64 } else { ts_raw as i64 };
-            h.push_back(PricePoint { ts, price });
-        }
+        let mut got = false;
+        {
+            let mut h = self.history.lock().unwrap();
+            for row in &rows_val {
+                let ts_raw = match row.get("timestamp").or_else(|| row.get("ts"))
+                    .and_then(|v| v.as_f64()) {
+                    Some(t) => t, None => continue,
+                };
+                let price = match row.get("value").or_else(|| row.get("price"))
+                    .and_then(|v| v.as_f64()) {
+                    Some(p) => p, None => continue,
+                };
+                let ts = if ts_raw > 1e10 { (ts_raw / 1000.0) as i64 } else { ts_raw as i64 };
+                h.push_back(PricePoint { ts, price });
+                got = true;
+            }
 
-        while h.front().map(|p| p.ts < cutoff).unwrap_or(false) { h.pop_front(); }
-        let mut v: Vec<_> = h.drain(..).collect();
-        v.sort_by_key(|p| p.ts);
-        v.dedup_by_key(|p| p.ts);
-        h.extend(v);
+            while h.front().map(|p| p.ts < cutoff).unwrap_or(false) { h.pop_front(); }
+            let mut v: Vec<_> = h.drain(..).collect();
+            v.sort_by_key(|p| p.ts);
+            v.dedup_by_key(|p| p.ts);
+            h.extend(v);
+        }
+        // 仅当确有新价入库才唤醒主循环(空消息/重复不触发空转)。
+        if got { self.updated.notify_one(); }
     }
 }
 

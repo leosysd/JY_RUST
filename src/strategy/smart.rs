@@ -7,7 +7,7 @@ use crate::state::SmartStateStore;
 use crate::ws::MarketWs;
 use crate::zscore::ZScoreModel;
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
@@ -34,6 +34,9 @@ const LOTTERY_MAX_PRICE: f64 = 0.10;
 const MICRO_DIVISOR: f64 = 4.0;
 /// 最后多少秒不开新首单
 const ENTRY_MIN_SECONDS_LEFT: i64 = 60;
+/// 结算检查的最小间隔(秒)。结算结果有链上延迟、本就不需逐 tick 查;
+/// 节流到此间隔后,结算用的网络请求不再卡在每个决策 tick 前面拖慢入场。
+const SETTLEMENT_CHECK_INTERVAL: i64 = 10;
 
 pub struct SmartStrategy {
     pub config: Config,
@@ -55,6 +58,9 @@ pub struct SmartStrategy {
     pub last_book_log_ts: i64,
     /// 已采集训练样本的盘口(每盘只记一次特征快照,防重复)。LightGBM训练数据。
     pub sampled_slugs: std::collections::HashSet<String>,
+    /// 上次结算检查的 unix 秒。决策主循环据此节流结算网络请求(见 SETTLEMENT_CHECK_INTERVAL),
+    /// 让结算查询不再每 tick 阻塞、拖慢下一盘入场。
+    pub last_settlement_check: i64,
 }
 
 /// 由主状态文件路径派生影子账路径：quant_state.json → quant_state_ideal.json
@@ -87,22 +93,32 @@ impl SmartStrategy {
             .join("quant_book.jsonl");
         let now = chrono::Utc::now().timestamp();
         let first_allowed_start = ((now / 300) + 1) * 300;
+        // 启动时一次性建好 signal 目录,write_signal 热路径上不再每条 create_dir_all。
+        if let Some(p) = signal_file.parent() {
+            let _ = fs::create_dir_all(p).await;
+        }
         Ok(Self {
             config, state, client, cache, model,
             signal_file, first_allowed_start, ws,
             cached_market: None, executor, ideal_state,
             book_log_file, last_book_log_ts: 0,
             sampled_slugs: std::collections::HashSet::new(),
+            last_settlement_check: 0,
         })
     }
 
     pub async fn run_once(&mut self) -> Result<()> {
-        self.check_settlements().await?;
+        // 结算检查节流:绝大多数 tick 直接跳过,避免逐 tick 的结算网络请求拖慢决策/入场。
+        let now = chrono::Utc::now().timestamp();
+        if now - self.last_settlement_check >= SETTLEMENT_CHECK_INTERVAL {
+            self.last_settlement_check = now;
+            self.check_settlements().await?;
+        }
 
         let Some(market) = self.get_or_fetch_market().await else { return Ok(()); };
 
         if market.start_ts < self.first_allowed_start {
-            info!("[SMART] 等待新盘口，最早北京时间 {}", beijing_time(self.first_allowed_start));
+            debug!("[SMART] 等待新盘口，最早北京时间 {}", beijing_time(self.first_allowed_start));
             return Ok(());
         }
 
@@ -117,11 +133,11 @@ impl SmartStrategy {
         let (up_ask, dn_ask) = {
             let cache = self.cache.read().await;
             let Some(ua) = cache.get(&up_token).and_then(|b| b.best_ask()) else {
-                info!("[SMART] {} WS盘口未就绪...", market.title);
+                debug!("[SMART] {} WS盘口未就绪...", market.title);
                 return Ok(());
             };
             let Some(da) = cache.get(&dn_token).and_then(|b| b.best_ask()) else {
-                info!("[SMART] {} WS盘口未就绪...", market.title);
+                debug!("[SMART] {} WS盘口未就绪...", market.title);
                 return Ok(());
             };
             (f64::from(ua.try_into().unwrap_or(0.5f32)),
@@ -188,7 +204,7 @@ impl SmartStrategy {
         // 否则 price_to_beat 失真→z方向变形(原 .or_else(latest) 是隐患,已去掉)。
         let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
         if price_to_beat < 1000.0 {
-            info!("[SMART] {} 无真开盘价(chainlink过期/未就绪)，跳过", market.title);
+            debug!("[SMART] {} 无真开盘价(chainlink过期/未就绪)，跳过", market.title);
             return Ok(());
         }
 
@@ -213,17 +229,17 @@ impl SmartStrategy {
 
         // ── P4：趋势入场 ──────────────────────────────────────────────────
         let Some(sig) = self.model.compute(price_to_beat, seconds_left) else {
-            info!("[SMART] {} 价格数据不足，跳过入场", market.title);
+            debug!("[SMART] {} 价格数据不足，跳过入场", market.title);
             return Ok(());
         };
         let Some(dir) = sig.direction() else {
-            info!("[SMART] {} z={:.3} 信号不足，不入场", market.title, sig.z);
+            debug!("[SMART] {} z={:.3} 信号不足，不入场", market.title, sig.z);
             return Ok(());
         };
 
         let entry_ask = if dir == "Up" { up_ask } else { dn_ask };
         if entry_ask < TREND_ENTRY_MIN || entry_ask > TREND_ENTRY_MAX {
-            info!(
+            debug!(
                 "[SMART] {} {dir}@{entry_ask:.3} 不在追单区间[{TREND_ENTRY_MIN},{TREND_ENTRY_MAX}]，跳过",
                 market.title
             );
@@ -346,7 +362,7 @@ impl SmartStrategy {
                     self.do_buy(&market, main_dir, main_ask, shares, "trend_chase", pos.price_to_beat).await?;
                     return Ok(());
                 }
-                info!("[SMART] {} 趋势追单会使worst={p4_worst:+.2} < 下限{TREND_WORST_PNL_FLOOR}，跳过",
+                debug!("[SMART] {} 趋势追单会使worst={p4_worst:+.2} < 下限{TREND_WORST_PNL_FLOOR}，跳过",
                     market.title);
             }
         }
@@ -443,8 +459,8 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // 等待
-        info!(
+        // 等待(每 tick 状态,降到 debug 以免逐 tick 同步写日志拖慢主循环)
+        debug!(
             "[SMART] {} {main_dir}{main_shares:.0}份@{:.3} opp@{opp_ask:.3}  worst_pnl={cur_worst:+.2}  T-{seconds_left}s",
             market.title,
             if main_dir == "Up" { pos.up_avg_full() } else { pos.down_avg_full() }
@@ -477,13 +493,13 @@ impl SmartStrategy {
 
         let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
         let Some(dir) = sig.direction() else {
-            info!("[EV_SOLO] {} z={:.3} 信号不足,不入场", market.title, sig.z);
+            debug!("[EV_SOLO] {} z={:.3} 信号不足,不入场", market.title, sig.z);
             return Ok(());
         };
         let ask = if dir == "Up" { up_ask } else { dn_ask };
         // 价位过滤:只在 [min,max] 入场(避开贵价负EV区 + 过低赔率差区)
         if ask < self.config.ev_solo_min_ask || ask > self.config.ev_solo_max_ask {
-            info!("[EV_SOLO] {} {dir}@{ask:.3} 不在入场区[{:.2},{:.2}],跳过 z={:.3}",
+            debug!("[EV_SOLO] {} {dir}@{ask:.3} 不在入场区[{:.2},{:.2}],跳过 z={:.3}",
                 market.title, self.config.ev_solo_min_ask, self.config.ev_solo_max_ask, sig.z);
             return Ok(());
         }
@@ -535,6 +551,18 @@ impl SmartStrategy {
                     info!("[SMART ORDER] {} {dir} {phase_label} id={} status={} ok={} 成交{:.1}份@{:.3}",
                         market.title, fill.order_id, fill.status, fill.success,
                         fill.filled_shares, fill.filled_price);
+                    // 实盘发单但未成交=扑空(FAK taking=0)。记一条 phase:"miss" 到 signals,
+                    // 供 stats 算"下单未成交率"。纯增量记录,不改任何成交/决策逻辑;
+                    // train.py 只读 phase=settlement/kind=train_sample,不读 miss,训练不受影响。
+                    if !fill.success {
+                        let _ = self.write_signal(&serde_json::json!({
+                            "phase": "miss", "market": market.slug,
+                            "direction": dir, "price": price, "shares": shares,
+                            "label": phase_label,
+                            "dry_run": self.config.dry_run,
+                            "ts": chrono::Utc::now().timestamp(),
+                        })).await;
+                    }
                 }
                 Some(fill)
             }
@@ -684,7 +712,7 @@ impl SmartStrategy {
     }
 
     async fn write_signal(&self, v: &serde_json::Value) -> Result<()> {
-        if let Some(p) = self.signal_file.parent() { fs::create_dir_all(p).await?; }
+        // 目录已在 new() 建好,此处不再 create_dir_all。
         let mut f = OpenOptions::new().create(true).append(true).open(&self.signal_file).await?;
         f.write_all((serde_json::to_string(v)? + "\n").as_bytes()).await?;
         Ok(())

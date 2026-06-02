@@ -30,11 +30,22 @@ pub struct FlowSignal {
 #[derive(Clone)]
 pub struct BinanceFeed {
     pub history: Arc<Mutex<VecDeque<TradePoint>>>,
+    /// 新成交到达信号:每收到一笔 aggTrade 即 notify,供主循环事件驱动决策
+    /// (z 信号由 Binance/Chainlink 驱动,只盯 Polymarket 盘口会漏掉 alpha 源的变动)。
+    updated: Arc<tokio::sync::Notify>,
 }
 
 impl BinanceFeed {
     pub fn new() -> Self {
-        Self { history: Arc::new(Mutex::new(VecDeque::new())) }
+        Self {
+            history: Arc::new(Mutex::new(VecDeque::new())),
+            updated: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// 取得"新成交"通知句柄,主循环 await 它即可在 Binance 价更新时被唤醒。
+    pub fn updated_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.updated.clone()
     }
 
     pub fn latest(&self) -> Option<TradePoint> {
@@ -110,10 +121,15 @@ impl BinanceFeed {
         let now = chrono::Utc::now().timestamp();
         let cutoff = now - HISTORY_SEC;
 
-        let mut h = self.history.lock().unwrap();
-        h.push_back(TradePoint { ts, price, qty, sell });
-        while h.front().map(|p| p.ts < cutoff).unwrap_or(false) {
-            h.pop_front();
+        {
+            let mut h = self.history.lock().unwrap();
+            h.push_back(TradePoint { ts, price, qty, sell });
+            while h.front().map(|p| p.ts < cutoff).unwrap_or(false) {
+                h.pop_front();
+            }
         }
+        // 唤醒主循环:Binance 价是 z 信号主要驱动源,价一动就让决策有机会立刻重算。
+        // 高频 aggTrade 由主循环 min_gap(50ms) 节流兜底,Notify 只存一个 permit,多余通知自动合并。
+        self.updated.notify_one();
     }
 }

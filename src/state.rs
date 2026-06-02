@@ -11,6 +11,10 @@ pub struct SmartStateStore {
 
 impl SmartStateStore {
     pub async fn load(path: PathBuf) -> Result<Self> {
+        // 启动时一次性建好目录,之后 save() 不再每次 create_dir_all(那是热路径上的多余 syscall)。
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
         let positions = if path.exists() {
             let text = fs::read_to_string(&path).await?;
             serde_json::from_str::<HashMap<String, MarketPosition>>(&text)
@@ -66,10 +70,9 @@ impl SmartStateStore {
     }
 
     pub async fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let text = serde_json::to_string_pretty(&self.positions)?;
+        // 目录已在 load() 建好;此处不再 create_dir_all。紧凑序列化(非 pretty)减少
+        // 序列化与写入字节数——状态文件供程序读,无需人肉缩进。
+        let text = serde_json::to_string(&self.positions)?;
         fs::write(&self.path, text).await?;
         Ok(())
     }

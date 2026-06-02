@@ -1,4 +1,6 @@
 use crate::feeds::{BinanceFeed, ChainlinkFeed};
+use crate::feeds::binance::TradePoint;
+use crate::feeds::chainlink::PricePoint;
 
 /// z-score 方向信号
 #[derive(Debug, Clone)]
@@ -63,8 +65,13 @@ impl ZScoreModel {
     pub fn compute(&self, price_to_beat: f64, seconds_left: i64) -> Option<ZSignal> {
         let now = chrono::Utc::now().timestamp();
 
-        let cl_latest = self.chainlink.latest()?;
-        let bn_latest = self.binance.latest()?;
+        // 一次性取两路历史快照,后续所有派生量(latest/at_ts/basis60/sigma120)都复用这两个本地数组,
+        // 避免对同一历史在一次决策里反复加锁 + 整段 clone(原实现 clone 多达 3 次)。
+        let cl_snap = self.chainlink.snapshot();
+        let bn_snap = self.binance.snapshot();
+
+        let cl_latest = cl_snap.last()?;
+        let bn_latest = bn_snap.last()?;
 
         // 检查数据是否足够新鲜（最多5秒延迟）
         if (now - cl_latest.ts).abs() > 5 || (now - bn_latest.ts).abs() > 5 {
@@ -74,18 +81,25 @@ impl ZScoreModel {
         let ct = cl_latest.price;
         let xt = bn_latest.price;
 
-        // 2秒前和5秒前的 Binance 价格
-        let xt_2 = self.binance.at_ts(now - 2).unwrap_or(xt);
-        let xt_5 = self.binance.at_ts(now - 5).unwrap_or(xt);
+        // 2秒前和5秒前的 Binance 价格(Binance at_ts 无容差,取最近点;等价于原 feed.at_ts)
+        let bn_at = |target: i64| bn_snap.iter()
+            .min_by_key(|p| (p.ts - target).abs())
+            .map(|p| p.price);
+        let xt_2 = bn_at(now - 2).unwrap_or(xt);
+        let xt_5 = bn_at(now - 5).unwrap_or(xt);
 
-        // 2秒前 Chainlink
-        let ct_2 = self.chainlink.at_ts(now - 2).unwrap_or(ct);
+        // 2秒前 Chainlink(Chainlink at_ts 有 5s 容差:偏离超过 5s 视为取不到,回退 ct)
+        let ct_2 = cl_snap.iter()
+            .min_by_key(|p| (p.ts - (now - 2)).abs())
+            .filter(|p| (p.ts - (now - 2)).abs() <= 5)
+            .map(|p| p.price)
+            .unwrap_or(ct);
 
         // basis60：最近60秒 Binance - Chainlink 平均差
-        let basis60 = self.compute_basis60(now);
+        let basis60 = compute_basis60(now, &cl_snap, &bn_snap);
 
         // σ120：最近120秒每秒价格变化的标准差
-        let sigma120 = self.compute_sigma120(now);
+        let sigma120 = compute_sigma120(now, &bn_snap);
 
         // 预期偏移 E
         let e = (ct - price_to_beat)
@@ -112,43 +126,44 @@ impl ZScoreModel {
         })
     }
 
-    fn compute_basis60(&self, now: i64) -> f64 {
-        let cl = self.chainlink.snapshot();
-        let bn = self.binance.snapshot();
-        let cutoff = now - 60;
+}
 
-        let mut diffs = vec![];
-        for cp in cl.iter().filter(|p| p.ts >= cutoff) {
-            if let Some(bp) = bn.iter().min_by_key(|p| (p.ts - cp.ts).abs()) {
-                if (bp.ts - cp.ts).abs() <= 2 {
-                    diffs.push(bp.price - cp.price);
-                }
+/// 最近60秒 Binance−Chainlink 平均基差。基于已取好的快照切片,不再自行 snapshot。
+/// 语义与原实现等价:对每个60秒内的 Chainlink 点找最近的 Binance 点,|Δts|≤2 才计入。
+fn compute_basis60(now: i64, cl: &[PricePoint], bn: &[TradePoint]) -> f64 {
+    let cutoff = now - 60;
+    let mut sum = 0.0;
+    let mut n = 0usize;
+    for cp in cl.iter().filter(|p| p.ts >= cutoff) {
+        if let Some(bp) = bn.iter().min_by_key(|p| (p.ts - cp.ts).abs()) {
+            if (bp.ts - cp.ts).abs() <= 2 {
+                sum += bp.price - cp.price;
+                n += 1;
             }
         }
-        if diffs.is_empty() { return 0.0; }
-        diffs.iter().sum::<f64>() / diffs.len() as f64
     }
+    if n == 0 { 0.0 } else { sum / n as f64 }
+}
 
-    fn compute_sigma120(&self, now: i64) -> f64 {
-        let cutoff = now - 120;
-        let bn = self.binance.snapshot();
-        let prices: Vec<f64> = bn.iter()
-            .filter(|p| p.ts >= cutoff)
-            .map(|p| p.price)
-            .collect();
+/// 最近120秒每秒价格变化的标准差。基于已取好的 Binance 快照切片,不再自行 snapshot。
+fn compute_sigma120(now: i64, bn: &[TradePoint]) -> f64 {
+    let cutoff = now - 120;
+    let prices: Vec<f64> = bn.iter()
+        .filter(|p| p.ts >= cutoff)
+        .map(|p| p.price)
+        .collect();
 
-        if prices.len() < 3 { return 50.0; } // 默认50美元波动
+    if prices.len() < 3 { return 50.0; } // 默认50美元波动
 
-        let changes: Vec<f64> = prices.windows(2)
-            .map(|w| w[1] - w[0])
-            .collect();
+    let changes: Vec<f64> = prices.windows(2)
+        .map(|w| w[1] - w[0])
+        .collect();
 
-        let mean = changes.iter().sum::<f64>() / changes.len() as f64;
-        let variance = changes.iter()
-            .map(|x| (x - mean).powi(2))
-            .sum::<f64>() / changes.len() as f64;
-        variance.sqrt().max(1.0)
-    }
+    let mean = changes.iter().sum::<f64>() / changes.len() as f64;
+    let variance = changes.iter()
+        .map(|x| (x - mean).powi(2))
+        .sum::<f64>() / changes.len() as f64;
+    variance.sqrt().max(1.0)
 }
 
 /// 标准正态分布 CDF（Abramowitz & Stegun 近似）

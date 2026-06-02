@@ -115,10 +115,8 @@ impl OrderExecutor {
                     .with_context(|| format!("token_id 解析失败: {token_id}"))?;
                 // marketable 限价：在 ask 上加缓冲并对齐到 0.01 tick，封顶 0.99。
                 // 缓冲(滑点容忍)可经 env TAKER_BUFFER 调整，默认 MARKETABLE_BUFFER(0.02)。
-                let buffer = std::env::var("TAKER_BUFFER").ok()
-                    .and_then(|s| s.trim().parse::<f64>().ok())
-                    .filter(|b| *b >= 0.0 && *b <= 0.5)
-                    .unwrap_or(MARKETABLE_BUFFER);
+                // 只在首单读一次 env 并缓存,后续下单零 getenv(见 taker_buffer)。
+                let buffer = taker_buffer();
                 let limit = ((price + buffer).min(0.99) * 100.0).round() / 100.0;
                 // 份额取整：Polymarket 要求 BUY 金额(price×shares)≤2位小数。
                 // 价格已是2位小数，份额取整 → 乘积必然≤2位小数，金额合法。
@@ -325,6 +323,19 @@ pub struct OrderState {
 
 /// FOK 限价相对 ask 的上浮，使其可穿透盘口若干档成交。
 const MARKETABLE_BUFFER: f64 = 0.02;
+
+/// 下单滑点缓冲(TAKER_BUFFER)。只在首次调用时读一次环境变量并缓存,
+/// 避免每次下单都走 getenv+parse(下单是延迟敏感路径)。
+fn taker_buffer() -> f64 {
+    use std::sync::OnceLock;
+    static BUF: OnceLock<f64> = OnceLock::new();
+    *BUF.get_or_init(|| {
+        std::env::var("TAKER_BUFFER").ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|b| *b >= 0.0 && *b <= 0.5)
+            .unwrap_or(MARKETABLE_BUFFER)
+    })
+}
 
 /// 配置中的 signature_type(u8) → SDK 枚举。
 /// 0=EOA, 1=Proxy(email/magic), 2=GnosisSafe, 3=Poly1271(V2 智能合约钱包)

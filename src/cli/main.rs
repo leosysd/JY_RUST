@@ -476,6 +476,49 @@ fn state_file_path() -> PathBuf {
     }
 }
 
+/// signal 文件路径（扑空率/下单事件统计用）：默认 data/quant_signals.jsonl（相对 .env 目录）。
+fn signal_file_path() -> PathBuf {
+    let f = read_env_val("QUANT_SIGNAL_FILE").unwrap_or_else(|| "data/quant_signals.jsonl".into());
+    let p = PathBuf::from(&f);
+    if p.is_absolute() {
+        p
+    } else {
+        PathBuf::from(env_path())
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(f)
+    }
+}
+
+/// 统计实盘扑空率（下单未成交率）：扫 signals.jsonl，只看实盘记录（dry_run=false），
+/// phase=="miss" 计未成交，其余下单（非 settlement/entry_signal）计已成交。
+/// 返回 (未成交数, 已成交数, 扑空率%)。无实盘下单记录则返回 None。
+fn compute_miss_rate() -> Option<(usize, usize, f64)> {
+    let text = std::fs::read_to_string(signal_file_path()).ok()?;
+    let (mut miss, mut filled) = (0usize, 0usize);
+    for line in text.lines() {
+        let o: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // 只统计实盘记录（成交单与 miss 单都带 dry_run=false）；无此字段或 true 一律跳过。
+        if o.get("dry_run").and_then(|v| v.as_bool()) != Some(false) {
+            continue;
+        }
+        match o.get("phase").and_then(|v| v.as_str()).unwrap_or("") {
+            "miss" => miss += 1,
+            "settlement" | "entry_signal" => {}
+            _ => filled += 1,
+        }
+    }
+    let total = miss + filled;
+    if total == 0 {
+        None
+    } else {
+        Some((miss, filled, miss as f64 / total as f64 * 100.0))
+    }
+}
+
 /// 北京时间 HH:MM（按 UTC 时间戳 +8h）
 fn bj_hm(ts: i64) -> String {
     let bj = ts + 8 * 3600;
@@ -664,9 +707,14 @@ fn show_stats_file(path: &std::path::Path) {
     }
 
     render_grouped_table(&headers, &groups);
+    let win_rate = if win + lose > 0 {
+        win as f64 / (win + lose) as f64 * 100.0
+    } else {
+        0.0
+    };
     println!(
-        "\n  已结算 {} 盘  胜 {} / 负 {}   锁定中 {}  持仓中 {}",
-        total, win, lose, locked, holding
+        "\n  已结算 {} 盘  胜 {} / 负 {}  胜率 {:.1}%   锁定中 {}  持仓中 {}",
+        total, win, lose, win_rate, locked, holding
     );
     let pnl_styled = if net_pnl >= 0.0 {
         style(format!("${net_pnl:+.2}")).green().bold()
@@ -674,6 +722,15 @@ fn show_stats_file(path: &std::path::Path) {
         style(format!("${net_pnl:+.2}")).red().bold()
     };
     println!("  已实现净盈亏: {pnl_styled}");
+    // 实盘扑空率（下单未成交率）：仅当 signals 里有实盘下单记录时显示。
+    if let Some((miss, filled, rate)) = compute_miss_rate() {
+        let styled = if rate <= 20.0 {
+            style(format!("{rate:.1}%")).green()
+        } else {
+            style(format!("{rate:.1}%")).yellow()
+        };
+        println!("  实盘扑空率: {styled}  (未成交 {} / 已发单 {})", miss, miss + filled);
+    }
 }
 
 fn clear_sim_data() -> Result<()> {

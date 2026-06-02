@@ -61,6 +61,10 @@ async fn run_quant(
 
     let chainlink = ChainlinkFeed::new();
     let binance = BinanceFeed::new();
+    // alpha 源更新信号:z 由 Binance/Chainlink 驱动,主循环除了盯 Polymarket 盘口,
+    // 也要在这两路价更新时被唤醒,否则入场最坏要等兜底轮询(poll)才反应。
+    let cl_evt = chainlink.updated_handle();
+    let bn_evt = binance.updated_handle();
     let _cl = chainlink.clone().run();
     let _bn = binance.clone().run();
 
@@ -86,9 +90,12 @@ async fn run_quant(
         if let Err(e) = strategy.run_once().await {
             error!("[JY-BOT ERROR] {e}");
         }
-        // 等"盘口更新信号"或"兜底超时",谁先到
+        // 等"盘口更新""Chainlink/Binance 价更新"或"兜底超时",谁先到。
+        // 把 alpha 源(feed)也纳入唤醒,入场对 z 变化的反应不再被 poll 间隔拖住。
         tokio::select! {
             _ = ws_evt.wait_book_update() => {}
+            _ = cl_evt.notified() => {}
+            _ = bn_evt.notified() => {}
             _ = tokio::time::sleep(poll) => {}
         }
         // 节流:距上次决策不足 min_gap 则补足(防高频盘口空转)

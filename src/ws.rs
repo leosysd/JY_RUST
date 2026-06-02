@@ -117,9 +117,10 @@ impl MarketWs {
     async fn handle_message(&self, text: &str) {
         let Ok(data): Result<serde_json::Value, _> = serde_json::from_str(text) else { return };
 
-        let events = match &data {
-            serde_json::Value::Array(arr) => arr.clone(),
-            obj @ serde_json::Value::Object(_) => vec![obj.clone()],
+        // 按引用切片遍历,避免整批事件 clone(WS 热路径,每条消息都走这里)。
+        let events: &[serde_json::Value] = match &data {
+            serde_json::Value::Array(arr) => arr.as_slice(),
+            serde_json::Value::Object(_) => std::slice::from_ref(&data),
             _ => return,
         };
 
@@ -127,7 +128,7 @@ impl MarketWs {
         let mut touched: Vec<String> = Vec::new();
         {
             let mut cache = self.0.cache.write().await;
-            for event in &events {
+            for event in events {
                 let ev_type = event.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
                 if ev_type == "book" {
                     if let Some(asset_id) = event.get("asset_id").and_then(|v| v.as_str()) {
