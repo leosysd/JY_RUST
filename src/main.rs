@@ -32,8 +32,8 @@ async fn main() -> Result<()> {
     let config = config::load(env_path.as_deref())?;
 
     info!(
-        "[JY-BOT] mode={} dry_run={} shares={}",
-        config.bot_mode, config.dry_run, config.order_shares
+        "[JY-BOT] dry_run={} shares={}",
+        config.dry_run, config.order_shares
     );
     if config.dry_run {
         info!("[MODE] DRY_RUN=1，模拟，不真实下单。");
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     let poll = tokio::time::Duration::from_millis(config.poll_ms);
     info!("[JY-BOT] 开始轮询，间隔 {}ms", config.poll_ms);
 
-    // copy 跟单模式已删除(轮询慢、跟的钱包亏钱)。只剩 quant。
+    // 只有量化(quant)一种模式。
     run_quant(config, exec, poll).await
 }
 

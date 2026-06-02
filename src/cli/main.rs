@@ -102,11 +102,6 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
                 service_cmd("restart");
             }
         }
-        "set-bot-mode" => {
-            let val = args.get(1).map(|s| s.as_str()).unwrap_or("quant");
-            set_env_val("BOT_MODE", val);
-            println!("{} BOT_MODE={val}", style("✔").green());
-        }
         "set-entry-strategy" => {
             let val = args.get(1).map(|s| s.as_str()).unwrap_or("");
             let v = match val.to_lowercase().as_str() {
@@ -180,12 +175,10 @@ fn interactive_menu() -> Result<()> {
         // 显示当前状态
         let running = is_service_running();
         let dry_run = read_env_val("DRY_RUN").unwrap_or("1".into());
-        let mode = read_env_val("BOT_MODE").unwrap_or_else(|| "quant".into());
         let entry = read_env_val("ENTRY_STRATEGY").unwrap_or_else(|| "zscore".into());
         println!(
-            "  服务: {}  模式: {}  入场: {}  DRY_RUN: {}",
+            "  服务: {}  入场: {}  DRY_RUN: {}",
             if running { style("运行中").green().bold() } else { style("已停止").red().bold() },
-            style(&mode).yellow(),
             style(&entry).yellow(),
             if dry_run == "0" { style("实盘").red().bold() } else { style("模拟").green() },
         );
@@ -201,11 +194,10 @@ fn interactive_menu() -> Result<()> {
             "7.  重启服务",
             "8.  查看实时日志",
             "9.  切换 DRY_RUN 模式",
-            "10. 切换模式（quant / copy）",
-            "11. 切换入场策略（zscore / ev_solo）",
-            "12. 调策略参数（ev_solo / 滑点 等）",
-            "13. 清空模拟数据",
-            "14. 更新程序（从 GitHub 拉取最新版本）",
+            "10. 切换入场策略（zscore / ev_solo）",
+            "11. 调策略参数（ev_solo / 滑点 等）",
+            "12. 清空模拟数据",
+            "13. 更新程序（从 GitHub 拉取最新版本）",
             "0.  退出",
         ];
 
@@ -230,12 +222,11 @@ fn interactive_menu() -> Result<()> {
                 live_logs();
             }
             8 => toggle_dry_run()?,
-            9 => toggle_strategy()?,
-            10 => toggle_entry_strategy()?,
-            11 => tune_params()?,
-            12 => clear_sim_data()?,
-            13 => update_bot()?,
-            14 => break,
+            9 => toggle_entry_strategy()?,
+            10 => tune_params()?,
+            11 => clear_sim_data()?,
+            12 => update_bot()?,
+            13 => break,
             _ => {}
         }
     }
@@ -246,17 +237,6 @@ fn edit_config() -> Result<()> {
     println!("{}", style("── 初始化/修改配置 ──").bold());
 
     let curr = |key: &str| read_env_val(key).unwrap_or_default();
-
-    let bot_mode: String = Input::with_theme(&theme())
-        .with_prompt("BOT_MODE (quant/copy)")
-        .default({ let m = curr("BOT_MODE"); if m.is_empty() { "quant".into() } else { m } })
-        .interact_text()?;
-
-    let target_wallet: String = Input::with_theme(&theme())
-        .with_prompt("TARGET_WALLET (跟单目标地址)")
-        .default(curr("TARGET_WALLET").into())
-        .allow_empty(true)
-        .interact_text()?;
 
     let private_key: String = Password::with_theme(&theme())
         .with_prompt("PRIVATE_KEY (留空保持不变)")
@@ -280,19 +260,11 @@ fn edit_config() -> Result<()> {
         .default(curr("QUANT_ORDER_SHARES").if_empty("20").into())
         .interact_text()?;
 
-    let copy_ratio: String = Input::with_theme(&theme())
-        .with_prompt("COPY_RATIO（跟单比例，仅 copy 模式）")
-        .default(curr("COPY_RATIO").if_empty("1.0").into())
-        .interact_text()?;
-
     // 写入 .env
-    set_env_val("BOT_MODE", &bot_mode);
-    if !target_wallet.is_empty() { set_env_val("TARGET_WALLET", &target_wallet); }
     if !private_key.is_empty() { set_env_val("PRIVATE_KEY", &private_key); }
     if !deposit_wallet.is_empty() { set_env_val("DEPOSIT_WALLET_ADDRESS", &deposit_wallet); }
     set_env_val("DRY_RUN", if dry_run_choice == 0 { "1" } else { "0" });
     set_env_val("QUANT_ORDER_SHARES", &order_shares);
-    set_env_val("COPY_RATIO", &copy_ratio);
 
     println!("{} 配置已保存到 {}", style("✔").green(), env_path());
     Ok(())
@@ -301,8 +273,8 @@ fn edit_config() -> Result<()> {
 fn show_config() {
     println!("{}", style("── 当前配置 ──").bold());
     let keys = [
-        "BOT_MODE", "ENTRY_STRATEGY", "DRY_RUN", "TARGET_WALLET",
-        "DEPOSIT_WALLET_ADDRESS", "COPY_RATIO",
+        "ENTRY_STRATEGY", "DRY_RUN",
+        "DEPOSIT_WALLET_ADDRESS",
         "QUANT_ORDER_SHARES", "SIGNATURE_TYPE",
         "CLOB_API_URL", "CLOB_V2_API_URL",
     ];
@@ -348,25 +320,6 @@ fn toggle_dry_run() -> Result<()> {
     }
     set_env_val("DRY_RUN", new_val);
     println!("{} DRY_RUN={new_val}", style("✔").green());
-    if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
-        service_cmd("restart");
-    }
-    Ok(())
-}
-
-fn toggle_strategy() -> Result<()> {
-    let curr = read_env_val("BOT_MODE").unwrap_or_else(|| "quant".into());
-    let choice = Select::with_theme(&theme())
-        .with_prompt("选择模式")
-        .items(&[
-            "quant - 量化（BTC 5m 趋势追单 + 锁利，推荐）",
-            "copy  - 跟单（镜像目标地址成交）",
-        ])
-        .default(if curr == "copy" { 1 } else { 0 })
-        .interact()?;
-    let new_val = if choice == 1 { "copy" } else { "quant" };
-    set_env_val("BOT_MODE", new_val);
-    println!("{} BOT_MODE={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
         service_cmd("restart");
     }

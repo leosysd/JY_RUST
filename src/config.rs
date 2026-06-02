@@ -16,13 +16,6 @@ pub struct Config {
 
     // 运行模式
     pub dry_run: bool,
-    pub bot_mode: String,
-
-    // copy 模式
-    pub target_wallet: String,
-    pub copy_ratio: Decimal,
-    pub price_mode: String,
-    pub max_slippage: Decimal,
 
     // 市场
     pub market_slug_prefix: String,
@@ -160,11 +153,6 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         _ => None,
     };
     let dry_run = env_bool("DRY_RUN", true);
-    // 模式：copy=跟单，其余=量化(smart)
-    let bot_mode = match env("BOT_MODE", &env("QUANT_STRATEGY", "quant")).to_lowercase().as_str() {
-        "copy" => "copy".to_string(),
-        _ => "quant".to_string(),
-    };
     let signature_type: u8 = env("SIGNATURE_TYPE", "3").parse().unwrap_or(3);
 
     // 实盘前置校验：DRY_RUN=0 必须有 PRIVATE_KEY；用代理钱包(sig_type≠0)还必须有 DEPOSIT_WALLET_ADDRESS。
@@ -196,11 +184,6 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         private_key,
         deposit_wallet,
         dry_run,
-        bot_mode,
-        target_wallet: env("TARGET_WALLET", "0xe0229e10a858860218b6132f4234602c47bd6603"),
-        copy_ratio: env_decimal("COPY_RATIO", "1.0"),
-        price_mode: env("PRICE_MODE", "safe"),
-        max_slippage: env_decimal("MAX_SLIPPAGE", "0.02"),
         market_slug_prefix: env("QUANT_MARKET_SLUG_PREFIX", "btc-updown-5m"),
         market_ws_url: env(
             "MARKET_WS_URL",
