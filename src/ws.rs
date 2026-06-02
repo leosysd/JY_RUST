@@ -40,14 +40,14 @@ impl MarketWs {
         self.0.book_updated.notified().await;
     }
 
-    /// 订阅新 token，若有新增则触发重连（重连后服务端会推完整快照）。
+    /// 订阅当前盘 token。**替换**整个订阅集(不累加),旧盘 token 自动丢弃——
+    /// 防止 token 只增不减累积(曾累积到24个致WS过载、盘口卡住、停止下单)。
+    /// 订阅集变化则触发重连(重连后只订当前盘的2-4个token,服务端推完整快照)。
     pub async fn ensure_subscribed(&self, token_ids: &[String]) {
+        let new_set: HashSet<String> = token_ids.iter().cloned().collect();
         let mut sub = self.0.subscribed.lock().await;
-        let before = sub.len();
-        for id in token_ids {
-            sub.insert(id.clone());
-        }
-        if sub.len() > before {
+        if *sub != new_set {
+            *sub = new_set;
             drop(sub);
             self.0.reconnect.notify_one();
         }
