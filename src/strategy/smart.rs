@@ -253,6 +253,7 @@ impl SmartStrategy {
         );
         // 入场信号快照:丰富特征(为 LightGBM 铺路),结算后 join winner 作训练标签。
         let mut feat = self.build_features(&sig, dir, entry_ask, up_ask, dn_ask, seconds_left);
+        self.add_book_depth(&mut feat, market).await;
         feat["phase"] = serde_json::json!("entry_signal");
         feat["market"] = serde_json::json!(market.slug);
         feat["strategy"] = serde_json::json!("zscore");
@@ -513,6 +514,7 @@ impl SmartStrategy {
 
         // 记录入场信号(丰富特征,为 LightGBM 铺路;结算后 join winner 作训练标签)
         let mut feat = self.build_features(&sig, dir, ask, up_ask, dn_ask, seconds_left);
+        self.add_book_depth(&mut feat, market).await;
         feat["phase"] = serde_json::json!("entry_signal");
         feat["market"] = serde_json::json!(market.slug);
         feat["strategy"] = serde_json::json!("ev_solo");
@@ -729,6 +731,7 @@ impl SmartStrategy {
         let dir = if sig.z >= 0.0 { "Up" } else { "Down" };
         let entry_ask = if dir == "Up" { up_ask } else { dn_ask };
         let mut feat = self.build_features(&sig, dir, entry_ask, up_ask, dn_ask, seconds_left);
+        self.add_book_depth(&mut feat, market).await;
         feat["slug"] = serde_json::json!(market.slug);
         feat["end_ts"] = serde_json::json!(market.end_ts);
         feat["kind"] = serde_json::json!("train_sample");
@@ -771,11 +774,36 @@ impl SmartStrategy {
             // 多窗口量价不平衡
             "flow_imb_30": f30.imbalance, "flow_imb_60": f60.imbalance, "flow_imb_120": f120.imbalance,
             "flow_buy_60": f60.buy_vol, "flow_sell_60": f60.sell_vol, "flow_trades_60": f60.trades,
+            // 30/120 窗口绝对量(只记不启用,补齐量特征;之前只有60窗口有绝对量)
+            "flow_buy_30": f30.buy_vol, "flow_sell_30": f30.sell_vol, "flow_trades_30": f30.trades,
+            "flow_buy_120": f120.buy_vol, "flow_sell_120": f120.sell_vol, "flow_trades_120": f120.trades,
             // 多窗口动量
             "mom_10": m10, "mom_30": m30, "mom_60": m60, "mom_120": m120,
             // 时间
             "seconds_left": seconds_left, "bj_hour": bj_hour,
         })
+    }
+
+    /// 往特征 json 补 Polymarket 盘口深度:Up/Down 两个 token 各自的 bid/ask 挂单总量。
+    /// **只记不启用**(train.py FEATURES 未纳入),为将来"盘口深度"特征铺路;纯记录、零风险。
+    async fn add_book_depth(&self, feat: &mut serde_json::Value, market: &Market) {
+        let cache = self.cache.read().await;
+        let depth = |tok: Option<&str>, ask_side: bool| -> f64 {
+            tok.and_then(|t| cache.get(t))
+                .map(|b| {
+                    let lv = if ask_side { &b.asks } else { &b.bids };
+                    lv.iter()
+                        .map(|(_, s)| s.to_string().parse::<f64>().unwrap_or(0.0))
+                        .sum()
+                })
+                .unwrap_or(0.0)
+        };
+        let up = market.token_for("Up");
+        let dn = market.token_for("Down");
+        feat["up_bid_depth"] = serde_json::json!(depth(up, false));
+        feat["up_ask_depth"] = serde_json::json!(depth(up, true));
+        feat["dn_bid_depth"] = serde_json::json!(depth(dn, false));
+        feat["dn_ask_depth"] = serde_json::json!(depth(dn, true));
     }
 
     /// 写 token→slug/outcome/end_ts 映射到 book 目录的 token_map.jsonl(复盘join赢家用)。
