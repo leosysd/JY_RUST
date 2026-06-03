@@ -32,9 +32,16 @@ async fn main() -> Result<()> {
     let env_path = std::env::args().nth(1);
     let config = config::load(env_path.as_deref())?;
 
+    // 显示"真正生效"的下单份数:ev_solo 用 EV_SOLO_QTY,其余策略用 QUANT_ORDER_SHARES。
+    // 二者经 CLI 已同步,但仍按策略取实际值,避免日志显示一个、下单用另一个。
+    let eff_shares = if config.entry_strategy == "ev_solo" {
+        config.ev_solo_qty
+    } else {
+        config.order_shares.to_string().parse::<f64>().unwrap_or(20.0)
+    };
     info!(
-        "[JY-BOT] dry_run={} shares={}",
-        config.dry_run, config.order_shares
+        "[JY-BOT] dry_run={} strategy={} 下单份数={}",
+        config.dry_run, config.entry_strategy, eff_shares
     );
     if config.dry_run {
         info!("[MODE] DRY_RUN=1，模拟，不真实下单。");

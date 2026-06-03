@@ -149,10 +149,12 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
 const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
     ("TAKER_BUFFER",          "taker 吃单滑点缓冲(限价=ask+此值)",  "0.02"),
     ("EV_SOLO_MAX_ASK",       "ev_solo 入场价上限(≤才买)",         "0.52"),
-    ("EV_SOLO_MIN_ASK",       "ev_solo 入场价下限(≥才买)",         "0.35"),
-    ("EV_SOLO_QTY",           "ev_solo 单边份额",                  "20"),
+    ("EV_SOLO_MIN_ASK",       "ev_solo 入场价下限(≥才买)",         "0.44"),
+    ("EV_SOLO_QTY",           "每笔下单份数(与QUANT_ORDER_SHARES同步)", "20"),
+    ("EV_SOLO_MIN_SECONDS_LEFT","ev_solo 只打开盘段(剩余≥此秒才入)", "240"),
+    ("EV_SOLO_FLOW_GATE",     "ev_solo 资金流同向闸(1开/0关)",      "1"),
     ("FORCE_LOCK_SECONDS_LEFT","强制处理线(剩余 ≤ 此秒触发)",       "60"),
-    ("QUANT_ORDER_SHARES",    "zscore 每单份额",                   "20"),
+    ("QUANT_ORDER_SHARES",    "每笔下单份数(与EV_SOLO_QTY同步)",   "20"),
     ("TREND_CHASE_MAX_PRICE", "zscore 追单价格上限",               "0.60"),
     ("LOCK_MIN_PROFIT_FACTOR","zscore 锁利门槛系数(×份额)",        "0.2"),
 ];
@@ -258,15 +260,15 @@ fn edit_config() -> Result<()> {
         .interact()?;
 
     let order_shares: String = Input::with_theme(&theme())
-        .with_prompt("QUANT_ORDER_SHARES（每笔份数，测试实盘建议先填 1）")
-        .default(curr("QUANT_ORDER_SHARES").if_empty("20").into())
+        .with_prompt("每笔下单份数（实盘小额测试建议先填 1）")
+        .default(curr("EV_SOLO_QTY").if_empty("20").into())
         .interact_text()?;
 
     // 写入 .env
     if !private_key.is_empty() { set_env_val("PRIVATE_KEY", &private_key); }
     if !deposit_wallet.is_empty() { set_env_val("DEPOSIT_WALLET_ADDRESS", &deposit_wallet); }
     set_env_val("DRY_RUN", if dry_run_choice == 0 { "1" } else { "0" });
-    set_env_val("QUANT_ORDER_SHARES", &order_shares);
+    set_env_val("EV_SOLO_QTY", &order_shares); // 经 set_env_val 自动同步 QUANT_ORDER_SHARES
 
     println!("{} 配置已保存到 {}", style("✔").green(), env_path());
     Ok(())
@@ -277,7 +279,7 @@ fn show_config() {
     let keys = [
         "ENTRY_STRATEGY", "DRY_RUN",
         "DEPOSIT_WALLET_ADDRESS",
-        "QUANT_ORDER_SHARES", "SIGNATURE_TYPE",
+        "ENTRY_STRATEGY", "EV_SOLO_QTY", "QUANT_ORDER_SHARES", "SIGNATURE_TYPE",
         "CLOB_API_URL", "CLOB_V2_API_URL",
     ];
     for key in &keys {
@@ -732,7 +734,7 @@ fn read_env_val(key: &str) -> Option<String> {
     None
 }
 
-fn set_env_val(key: &str, val: &str) {
+fn set_env_raw(key: &str, val: &str) {
     let path = PathBuf::from(env_path());
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
@@ -749,6 +751,19 @@ fn set_env_val(key: &str, val: &str) {
         lines.push(entry);
     }
     let _ = std::fs::write(&path, lines.join("\n") + "\n");
+}
+
+/// 写入 .env。CLI 是配置的唯一权威:在此处把"份数"的两个 key
+/// (EV_SOLO_QTY / QUANT_ORDER_SHARES)始终同步为同值,保证不管当前用哪个策略,
+/// "CLI 设多少、系统实际就下多少",绝不再出现设一个 key、系统用另一个的脱节。
+/// 所有 CLI 写入路径(setup 向导 / set-param / 交互菜单)都经过本函数,一处覆盖全部。
+fn set_env_val(key: &str, val: &str) {
+    set_env_raw(key, val);
+    match key {
+        "EV_SOLO_QTY" => set_env_raw("QUANT_ORDER_SHARES", val),
+        "QUANT_ORDER_SHARES" => set_env_raw("EV_SOLO_QTY", val),
+        _ => {}
+    }
 }
 
 fn update_bot() -> Result<()> {
