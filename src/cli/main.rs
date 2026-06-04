@@ -109,8 +109,9 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
             let v = match val.to_lowercase().as_str() {
                 "zscore" | "z" => "zscore",
                 "ev_solo" | "ev" | "solo" => "ev_solo",
+                "sniper" | "snipe" | "s" => "sniper",
                 other => {
-                    eprintln!("未知入场策略: {other}（可选 zscore | ev_solo）");
+                    eprintln!("未知入场策略: {other}（可选 zscore | ev_solo | sniper）");
                     std::process::exit(1);
                 }
             };
@@ -153,6 +154,10 @@ const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
     ("EV_SOLO_QTY",           "每笔下单份数(与QUANT_ORDER_SHARES同步)", "20"),
     ("EV_SOLO_MIN_SECONDS_LEFT","ev_solo 只打开盘段(剩余≥此秒才入)", "240"),
     ("EV_SOLO_FLOW_GATE",     "ev_solo 资金流同向闸(1开/0关)",      "1"),
+    ("SNIPER_MOVE_USD",       "sniper BTC突破阈值(美元,相对开盘动够才入)", "20"),
+    ("SNIPER_MAX_ASK",        "sniper 限价闸(仅ask<此值才买,策略灵魂)", "0.62"),
+    ("SNIPER_WINDOW_SEC",     "sniper 速度窗口(0=相对开盘累计;5=5秒内变动)", "0"),
+    ("SNIPER_QTY",            "sniper 每笔下单份数(与其它份数键同步)", "20"),
     ("FORCE_LOCK_SECONDS_LEFT","强制处理线(剩余 ≤ 此秒触发)",       "60"),
     ("QUANT_ORDER_SHARES",    "每笔下单份数(与EV_SOLO_QTY同步)",   "20"),
     ("TREND_CHASE_MAX_PRICE", "zscore 追单价格上限",               "0.60"),
@@ -198,8 +203,8 @@ fn interactive_menu() -> Result<()> {
             "7.  重启服务",
             "8.  查看实时日志",
             "9.  切换 DRY_RUN 模式",
-            "10. 切换入场策略（zscore / ev_solo）",
-            "11. 调策略参数（ev_solo / 滑点 等）",
+            "10. 切换入场策略（zscore / ev_solo / sniper）",
+            "11. 调策略参数（sniper / ev_solo / 滑点 等）",
             "12. 清空模拟数据",
             "13. 更新程序（从 GitHub 拉取最新版本）",
             "0.  退出",
@@ -336,11 +341,12 @@ fn toggle_entry_strategy() -> Result<()> {
         .with_prompt("选择入场策略")
         .items(&[
             "zscore  - z-score 方向入场 + 锁利/追单/减险（baseline）",
-            "ev_solo - z-score 定方向 + 纯单边裸持（正期望主策略）",
+            "ev_solo - z-score 定方向 + 纯单边裸持（开盘预测,已被sniper取代）",
+            "sniper  - 延迟套利狙击:binance突破→抢盘口反应延迟（30天回测+5.7%,推荐）",
         ])
-        .default(if curr == "ev_solo" { 1 } else { 0 })
+        .default(match curr.as_str() { "sniper" => 2, "ev_solo" => 1, _ => 0 })
         .interact()?;
-    let new_val = if choice == 1 { "ev_solo" } else { "zscore" };
+    let new_val = match choice { 2 => "sniper", 1 => "ev_solo", _ => "zscore" };
     set_env_val("ENTRY_STRATEGY", new_val);
     println!("{} ENTRY_STRATEGY={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
@@ -759,9 +765,14 @@ fn set_env_raw(key: &str, val: &str) {
 /// 所有 CLI 写入路径(setup 向导 / set-param / 交互菜单)都经过本函数,一处覆盖全部。
 fn set_env_val(key: &str, val: &str) {
     set_env_raw(key, val);
+    // 份数三键(EV_SOLO_QTY / QUANT_ORDER_SHARES / SNIPER_QTY)始终同步为同值,
+    // 保证不管当前用哪个策略,CLI 设多少系统就下多少。
     match key {
-        "EV_SOLO_QTY" => set_env_raw("QUANT_ORDER_SHARES", val),
-        "QUANT_ORDER_SHARES" => set_env_raw("EV_SOLO_QTY", val),
+        "EV_SOLO_QTY" | "QUANT_ORDER_SHARES" | "SNIPER_QTY" => {
+            for k in ["EV_SOLO_QTY", "QUANT_ORDER_SHARES", "SNIPER_QTY"] {
+                if k != key { set_env_raw(k, val); }
+            }
+        }
         _ => {}
     }
 }

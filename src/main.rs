@@ -36,6 +36,8 @@ async fn main() -> Result<()> {
     // 二者经 CLI 已同步,但仍按策略取实际值,避免日志显示一个、下单用另一个。
     let eff_shares = if config.entry_strategy == "ev_solo" {
         config.ev_solo_qty
+    } else if config.entry_strategy == "sniper" {
+        config.sniper_qty
     } else {
         config.order_shares.to_string().parse::<f64>().unwrap_or(20.0)
     };
