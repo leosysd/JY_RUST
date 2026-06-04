@@ -127,7 +127,8 @@ impl OrderExecutor {
                 let s = SdkDecimal::from_str(&format!("{order_shares:.0}"))
                     .context("份额转换失败")?;
 
-                let resp = client
+                let t_send = std::time::Instant::now();
+                let resp_result = client
                     .limit_order()
                     .token_id(tid)
                     .side(Side::Buy)
@@ -135,8 +136,14 @@ impl OrderExecutor {
                     .size(s)
                     .order_type(OrderType::FAK)
                     .build_sign_and_post(signer)
-                    .await
-                    .context("提交订单失败")?;
+                    .await;
+                // 延迟埋点:无论成交/扑空都记下单往返(签名+POST+Polymarket撮合返回)。
+                // 狙击扑空根因排查:回测盘口1秒后edge归零,此值若~1s即必然扑空。
+                tracing::info!(
+                    "[EXEC延迟] 下单往返(签名+POST+撮合)={:.0}ms",
+                    t_send.elapsed().as_secs_f64() * 1000.0
+                );
+                let resp = resp_result.context("提交订单失败")?;
 
                 // 从真实成交额反推成交均价/份额：BUY → making=USDC支出, taking=买到份额
                 let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
