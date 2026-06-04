@@ -200,10 +200,24 @@ impl OrderExecutor {
                 );
                 let n = token_id.len();
                 tracing::info!(
-                    "[ORDER_PREWARM] token=..{} tick_size={}ms neg_risk={}ms fee={}ms total={}ms",
+                    "[CACHE_PREWARM] token=..{} tick_size={}ms neg_risk={}ms fee={}ms total={}ms",
                     &token_id[n.saturating_sub(8)..],
                     ts.as_millis(), nr.as_millis(), fee.as_millis(), t0.elapsed().as_millis()
                 );
+            }
+        }
+    }
+
+    /// 连接保活:用**同一个 client**打**同一个 clob host**的 ok()(GET,SDK 不缓存),
+    /// 让连接池保持一条热连接,使紧接着的 post_order 复用它、免 TCP+TLS 握手(~200ms)。
+    /// reqwest+Cloudflare 约 90-100s 掐空闲连接,故必须**抢单前 <90s**调(启动只预热一次没用)。
+    /// DryRun 下 no-op。
+    pub async fn prewarm(&self) {
+        if let Self::Live { client, .. } = self {
+            let t = std::time::Instant::now();
+            match client.ok().await {
+                Ok(_) => tracing::info!("[ORDER_PREWARM] warm in {}ms", t.elapsed().as_millis()),
+                Err(e) => tracing::warn!("[ORDER_PREWARM] failed: {e}"),
             }
         }
     }

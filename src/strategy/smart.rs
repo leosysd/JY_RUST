@@ -62,6 +62,8 @@ pub struct SmartStrategy {
     pub sniped_slugs: std::collections::HashSet<String>,
     /// 已预热缓存的盘(sniper 每盘开始预热 tick/neg-risk/fee,防重复预热)。
     pub primed_slugs: std::collections::HashSet<String>,
+    /// 上次连接保活(prewarm)的 unix 秒。sniper 每 <90s 打热一条连接,防空闲被 Cloudflare 掐。
+    pub last_prewarm: i64,
     /// 上次结算检查的 unix 秒。决策主循环据此节流结算网络请求(见 SETTLEMENT_CHECK_INTERVAL),
     /// 让结算查询不再每 tick 阻塞、拖慢下一盘入场。
     pub last_settlement_check: i64,
@@ -138,6 +140,7 @@ impl SmartStrategy {
             sampled_slugs: std::collections::HashSet::new(),
             sniped_slugs: std::collections::HashSet::new(),
             primed_slugs: std::collections::HashSet::new(),
+            last_prewarm: 0,
             last_settlement_check: 0,
             shadow, model_dir, shadow_mtime,
         })
@@ -172,6 +175,17 @@ impl SmartStrategy {
             self.executor.prime_token(&up_token).await;
             self.executor.prime_token(&dn_token).await;
             self.primed_slugs.insert(market.slug.clone());
+        }
+
+        // sniper 连接保活:每 <90s 用 ok() 打热一条连接(spawn 不阻塞决策),使突破下单时
+        // post_order 复用热连接、免 TCP+TLS 握手(~200ms)。空闲连接 ~90s 被掐,故须定期打。
+        if self.config.entry_strategy == "sniper" {
+            let nowts = chrono::Utc::now().timestamp();
+            if nowts - self.last_prewarm >= 50 {
+                self.last_prewarm = nowts;
+                let exec = self.executor.clone();
+                tokio::spawn(async move { exec.prewarm().await; });
+            }
         }
 
         let (up_ask, dn_ask) = {
