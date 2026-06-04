@@ -193,11 +193,11 @@ impl OrderExecutor {
             if let Ok(tid) = U256::from_str(token_id) {
                 // 并发取 3 个元数据填缓存,各自计时,忽略错误(预热失败只是下单回退到现取)。
                 let t0 = std::time::Instant::now();
-                let (ts, nr, fee) = tokio::join!(
-                    async { let s = std::time::Instant::now(); let _ = client.tick_size(tid).await; s.elapsed() },
-                    async { let s = std::time::Instant::now(); let _ = client.neg_risk(tid).await; s.elapsed() },
-                    async { let s = std::time::Instant::now(); let _ = client.fee_rate_bps(tid).await; s.elapsed() },
-                );
+                // 串行(非并发):只占一条连接。并发会建多条连接,多余的空闲 5 分钟被 CF 切,
+                // 下单随机命中冷条→暴雷(2161ms)。串行让连接池只剩一条,warm 与 post 必走同一条热连接。
+                let s = std::time::Instant::now(); let _ = client.tick_size(tid).await; let ts = s.elapsed();
+                let s = std::time::Instant::now(); let _ = client.neg_risk(tid).await; let nr = s.elapsed();
+                let s = std::time::Instant::now(); let _ = client.fee_rate_bps(tid).await; let fee = s.elapsed();
                 let n = token_id.len();
                 tracing::info!(
                     "[CACHE_PREWARM] token=..{} tick_size={}ms neg_risk={}ms fee={}ms total={}ms",
