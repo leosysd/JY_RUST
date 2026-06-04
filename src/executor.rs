@@ -127,21 +127,30 @@ impl OrderExecutor {
                 let s = SdkDecimal::from_str(&format!("{order_shares:.0}"))
                     .context("份额转换失败")?;
 
-                let t_send = std::time::Instant::now();
-                let resp_result = client
+                // 拆分埋点:build(取tick_size,预热后应命中缓存) / sign(本地EIP712) / post(POST /order)
+                // 各自计时,精确定位 ~400-1000ms 到底卡在哪一步。
+                let tb = std::time::Instant::now();
+                let order = client
                     .limit_order()
                     .token_id(tid)
                     .side(Side::Buy)
                     .price(p)
                     .size(s)
                     .order_type(OrderType::FAK)
-                    .build_sign_and_post(signer)
-                    .await;
-                // 延迟埋点:无论成交/扑空都记下单往返(签名+POST+Polymarket撮合返回)。
-                // 狙击扑空根因排查:回测盘口1秒后edge归零,此值若~1s即必然扑空。
+                    .build()
+                    .await
+                    .context("build 失败")?;
+                let t_build = tb.elapsed();
+                let tsg = std::time::Instant::now();
+                let signed = client.sign(signer, order).await.context("sign 失败")?;
+                let t_sign = tsg.elapsed();
+                let tp = std::time::Instant::now();
+                let resp_result = client.post_order(signed).await;
+                let t_post = tp.elapsed();
                 tracing::info!(
-                    "[ORDER_LAT] build_sign_and_post(签名+POST+撮合)={:.0}ms",
-                    t_send.elapsed().as_secs_f64() * 1000.0
+                    "[ORDER_LAT] build={}ms sign={}ms post={}ms 总={}ms",
+                    t_build.as_millis(), t_sign.as_millis(), t_post.as_millis(),
+                    (t_build + t_sign + t_post).as_millis()
                 );
                 let resp = resp_result.context("提交订单失败")?;
 
