@@ -99,6 +99,13 @@ impl OrderExecutor {
         };
 
         info!("[EXEC] DRY_RUN=0 实盘模式就绪，API creds 已派生确认");
+        // 预热全局 version 缓存(SDK 内 AtomicU32,重启后清零)。build 内部要 resolve_version,
+        // 不预热则重启后首单 build 走一次 GET /version(实测暴雷 1203ms)。一次永久(直到重启)。
+        let v0 = std::time::Instant::now();
+        match client.version().await {
+            Ok(v) => info!("[EXEC] version 预热 ok=v{v} in {}ms", v0.elapsed().as_millis()),
+            Err(e) => warn!("[EXEC] version 预热失败(首单 build 会慢): {e}"),
+        }
         Ok(Self::Live { client: Box::new(client), signer })
     }
 
@@ -108,7 +115,7 @@ impl OrderExecutor {
     /// 不接受部分成交——避免延迟到达时盘口已变、只吃到零头或买在坏价。
     /// 代价：浅流动性下整单失败(扑空)概率高于 FAK。
     /// 限价加 `MARKETABLE_BUFFER` 让单子能穿透盘口若干档。
-    pub async fn buy(&self, token_id: &str, price: f64, shares: f64) -> Result<Fill> {
+    pub async fn buy(&self, token_id: &str, price: f64, shares: f64, limit_price: Option<f64>) -> Result<Fill> {
         match self {
             Self::DryRun => Ok(Fill::simulated(price, shares)),
             Self::Live { client, signer } => {
@@ -117,8 +124,15 @@ impl OrderExecutor {
                 // marketable 限价：在 ask 上加缓冲并对齐到 0.01 tick，封顶 0.99。
                 // 缓冲(滑点容忍)可经 env TAKER_BUFFER 调整，默认 MARKETABLE_BUFFER(0.02)。
                 // 只在首单读一次 env 并缓存,后续下单零 getenv(见 taker_buffer)。
-                let buffer = taker_buffer();
-                let limit = ((price + buffer).min(0.99) * 100.0).round() / 100.0;
+                // limit_price=Some(x):直接用 x 作限价(狙击挂 0.99→撮合按"份额"封顶,精确成交,
+                // 不按金额买超);None:旧逻辑 ask+buffer 穿透盘口若干档。
+                let limit = match limit_price {
+                    Some(x) => (x.clamp(0.01, 0.99) * 100.0).round() / 100.0,
+                    None => {
+                        let buffer = taker_buffer();
+                        ((price + buffer).min(0.99) * 100.0).round() / 100.0
+                    }
+                };
                 // 份额取整：Polymarket 要求 BUY 金额(price×shares)≤2位小数。
                 // 价格已是2位小数，份额取整 → 乘积必然≤2位小数，金额合法。
                 // 成交返回的零头(如5.158729)若直接下单会算出4位小数金额被拒。

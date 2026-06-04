@@ -704,6 +704,7 @@ impl SmartStrategy {
         price: f64,
         shares: f64,
         phase_label: &str,
+        limit_price: Option<f64>,
     ) -> Option<crate::executor::Fill> {
         let token = match market.token_for(dir) {
             Some(t) => t,
@@ -712,7 +713,7 @@ impl SmartStrategy {
                 return None;
             }
         };
-        match self.executor.buy(token, price, shares).await {
+        match self.executor.buy(token, price, shares, limit_price).await {
             Ok(fill) => {
                 if !fill.simulated {
                     info!("[SMART ORDER] {} {dir} {phase_label} id={} status={} ok={} 成交{:.1}份@{:.3}",
@@ -749,7 +750,11 @@ impl SmartStrategy {
         phase_label: &str,
         price_to_beat: f64,
     ) -> Result<bool> {
-        let fill = self.place_order(market, dir, price, shares, phase_label).await;
+        // 教训:FOK 下限价挂高反而买超更多(金额驱动,maker_amount=size×limit→预算变大→份额多)。
+        // 实测 0.99 → 8.8 份。精确份额须改 GTC resting limit(按份额成交、余量取消),待实现。
+        // 当前所有策略一律 ask+buffer(limit_override=None)。
+        let limit_override: Option<f64> = None;
+        let fill = self.place_order(market, dir, price, shares, phase_label, limit_override).await;
 
         // A轨 影子账（仅实盘）：假设按 ask 全额成交，与真实账对比滑点/未成交代价。
         // 模拟模式下主账本身即理想账，无需重复。
@@ -789,7 +794,7 @@ impl SmartStrategy {
         let mode   = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         let secs   = (pos.end_ts - chrono::Utc::now().timestamp()).max(0);
 
-        let fill = self.place_order(market, dir, price, shares, phase_label).await;
+        let fill = self.place_order(market, dir, price, shares, phase_label, None).await;
 
         // A轨 影子账（仅实盘）：假设按 ask 全额成交并锁定
         if !self.config.dry_run {

@@ -81,6 +81,9 @@ pub struct Config {
     pub sniper_max_ask: f64,
     /// 单边份额。
     pub sniper_qty: f64,
+    /// 狙击挂单限价(默认 0.99):挂高限价让撮合按"份额"封顶→精确成交 sniper_qty 份,
+    /// 不再按金额买超(5→5.8)。实际成交价仍≤盘口 ask(由 sniper_max_ask 闸约束)。
+    pub sniper_buy_limit: f64,
 
     // 系统
     pub poll_ms: u64,
@@ -232,6 +235,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         sniper_window_sec: env_i64("SNIPER_WINDOW_SEC", 0),
         sniper_max_ask: env_f64("SNIPER_MAX_ASK", 0.62),
         sniper_qty: env_f64("SNIPER_QTY", 20.0),
+        sniper_buy_limit: env_f64("SNIPER_BUY_LIMIT", 0.99),
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
