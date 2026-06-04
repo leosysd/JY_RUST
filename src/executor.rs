@@ -175,6 +175,23 @@ impl OrderExecutor {
         }
     }
 
+    /// 预热 token 的 tick-size/neg-risk/fee 缓存(SDK 内部 DashMap)。
+    /// 狙击在盘一出现时调:突破下单时 build_sign_and_post 命中缓存,省掉
+    /// markets-by-token / clob-markets / tick-size 三个串行 API,
+    /// 下单往返从 ~400-900ms 降到 ~50-100ms(只剩 POST /order)。DryRun 下 no-op。
+    pub async fn prime_token(&self, token_id: &str) {
+        if let Self::Live { client, .. } = self {
+            if let Ok(tid) = U256::from_str(token_id) {
+                // 并发取 3 个元数据填缓存,忽略错误(预热失败只是下单回退到现取,不影响正确性)
+                let _ = tokio::join!(
+                    client.tick_size(tid),
+                    client.neg_risk(tid),
+                    client.fee_rate_bps(tid),
+                );
+            }
+        }
+    }
+
     // ── 路线二 maker 能力层（GTC + post_only，零 taker 费）──────────────────
     //
     // 设计见 reference_maker_state_machine。挂单后状态由 query_order 轮询，

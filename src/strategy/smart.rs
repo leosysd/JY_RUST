@@ -60,6 +60,8 @@ pub struct SmartStrategy {
     pub sampled_slugs: std::collections::HashSet<String>,
     /// 已狙击的盘(sniper 策略每盘只狙一次,防重复下单)。
     pub sniped_slugs: std::collections::HashSet<String>,
+    /// 已预热缓存的盘(sniper 每盘开始预热 tick/neg-risk/fee,防重复预热)。
+    pub primed_slugs: std::collections::HashSet<String>,
     /// 上次结算检查的 unix 秒。决策主循环据此节流结算网络请求(见 SETTLEMENT_CHECK_INTERVAL),
     /// 让结算查询不再每 tick 阻塞、拖慢下一盘入场。
     pub last_settlement_check: i64,
@@ -135,6 +137,7 @@ impl SmartStrategy {
             book_log_file, last_book_log_ts: 0,
             sampled_slugs: std::collections::HashSet::new(),
             sniped_slugs: std::collections::HashSet::new(),
+            primed_slugs: std::collections::HashSet::new(),
             last_settlement_check: 0,
             shadow, model_dir, shadow_mtime,
         })
@@ -162,6 +165,14 @@ impl SmartStrategy {
         let dn_idx = market.outcomes.iter().position(|o| o == "Down").unwrap_or(1);
         let up_token = market.token_ids[up_idx].clone();
         let dn_token = market.token_ids[dn_idx].clone();
+
+        // sniper 预热:盘一出现就把 Up/Down 的 tick/neg-risk/fee 缓存填好(突破前的空闲时间),
+        // 突破下单时 SDK build_sign_and_post 命中缓存,下单往返从 ~800ms 降到 ~100ms。每盘一次。
+        if self.config.entry_strategy == "sniper" && !self.primed_slugs.contains(&market.slug) {
+            self.executor.prime_token(&up_token).await;
+            self.executor.prime_token(&dn_token).await;
+            self.primed_slugs.insert(market.slug.clone());
+        }
 
         let (up_ask, dn_ask) = {
             let cache = self.cache.read().await;
