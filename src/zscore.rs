@@ -47,6 +47,16 @@ impl ZScoreModel {
         self.chainlink.latest().map(|p| p.price)
     }
 
+    /// 获取 Binance 在指定时间戳附近的价格(狙击用:取本盘开盘价)。
+    pub fn binance_at(&self, ts: i64) -> Option<f64> {
+        self.binance.at_ts(ts)
+    }
+
+    /// 获取 Binance 最新成交价(狙击用:当前价)。
+    pub fn binance_latest(&self) -> Option<f64> {
+        self.binance.latest().map(|p| p.price)
+    }
+
     /// 暴露 Binance 量价买卖压力信号(用于量价方向验证)。
     pub fn binance_flow(&self, now: i64, window_sec: i64) -> crate::feeds::FlowSignal {
         self.binance.flow(now, window_sec)

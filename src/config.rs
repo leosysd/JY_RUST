@@ -70,6 +70,18 @@ pub struct Config {
     /// 依据实测 flow_imb_30 一致59%/矛盾51%(目前最强方向单信号,AUC 0.528)。默认开。
     pub ev_solo_flow_gate: bool,
 
+    // ── 路线五:sniper 延迟套利狙击 ──────────────────────────────────────
+    // 盘内监控 binance,BTC 相对开盘价(或 N 秒窗口)动够阈值即定方向;仅当
+    // Polymarket 对应方向盘口还没反应(ask<max)时 FAK 买入、裸持。赚盘口反应延迟。
+    /// 突破阈值(美元):BTC 相对参照价动够此值才定方向(涨买 Up/跌买 Down)。
+    pub sniper_move_usd: f64,
+    /// 速度窗口(秒):0=相对开盘价累计;>0=最近 N 秒内变动(纯速度,更抓快突破)。
+    pub sniper_window_sec: i64,
+    /// 限价闸(灵魂):仅当对应方向 ask<此值才买。盘口已反应(ask 高)则放弃这盘。
+    pub sniper_max_ask: f64,
+    /// 单边份额。
+    pub sniper_qty: f64,
+
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -216,6 +228,10 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         ev_solo_qty: env_f64("EV_SOLO_QTY", 20.0),
         ev_solo_min_seconds_left: env_i64("EV_SOLO_MIN_SECONDS_LEFT", 240),
         ev_solo_flow_gate: env_bool("EV_SOLO_FLOW_GATE", true),
+        sniper_move_usd: env_f64("SNIPER_MOVE_USD", 20.0),
+        sniper_window_sec: env_i64("SNIPER_WINDOW_SEC", 0),
+        sniper_max_ask: env_f64("SNIPER_MAX_ASK", 0.62),
+        sniper_qty: env_f64("SNIPER_QTY", 20.0),
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),

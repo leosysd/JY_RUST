@@ -58,6 +58,8 @@ pub struct SmartStrategy {
     pub last_book_log_ts: i64,
     /// 已采集训练样本的盘口(每盘只记一次特征快照,防重复)。LightGBM训练数据。
     pub sampled_slugs: std::collections::HashSet<String>,
+    /// 已狙击的盘(sniper 策略每盘只狙一次,防重复下单)。
+    pub sniped_slugs: std::collections::HashSet<String>,
     /// 上次结算检查的 unix 秒。决策主循环据此节流结算网络请求(见 SETTLEMENT_CHECK_INTERVAL),
     /// 让结算查询不再每 tick 阻塞、拖慢下一盘入场。
     pub last_settlement_check: i64,
@@ -132,6 +134,7 @@ impl SmartStrategy {
             cached_market: None, executor, ideal_state,
             book_log_file, last_book_log_ts: 0,
             sampled_slugs: std::collections::HashSet::new(),
+            sniped_slugs: std::collections::HashSet::new(),
             last_settlement_check: 0,
             shadow, model_dir, shadow_mtime,
         })
@@ -187,6 +190,12 @@ impl SmartStrategy {
         // 路线四：ev_solo 纯单边裸持（数学上唯一正期望路径）。
         if self.config.entry_strategy == "ev_solo" {
             self.decide_ev_solo(&market, pos, up_ask, dn_ask, seconds_left).await?;
+            return Ok(());
+        }
+
+        // 路线五：sniper 延迟套利狙击(binance 突破 → 限价 → FAK → 裸持)。
+        if self.config.entry_strategy == "sniper" {
+            self.decide_sniper(&market, up_ask, dn_ask, seconds_left).await?;
             return Ok(());
         }
 
@@ -581,6 +590,73 @@ impl SmartStrategy {
 
         // 买单边,然后标 Locked 裸持到结算(不进任何后续决策)
         if self.do_buy(&market, dir, ask, qty, "ev_solo", price_to_beat).await? {
+            let p = self.state.get_or_create(&market.slug, market.end_ts);
+            p.phase = Phase::Locked;
+            self.state.save().await?;
+        }
+        Ok(())
+    }
+
+    /// 延迟套利狙击:盘内监控 binance,BTC 相对开盘价(window=0)或最近 N 秒(window>0)
+    /// 动够 ±move_usd 即定方向;仅当对应方向 ask < max_ask(盘口还没反应)时 FAK 买入,
+    /// 裸持到结算。每盘只狙一次。赚的是 Polymarket 盘口对 binance 变动的反应延迟。
+    async fn decide_sniper(
+        &mut self,
+        market: &Market,
+        up_ask: f64,
+        dn_ask: f64,
+        seconds_left: i64,
+    ) -> Result<()> {
+        // 每盘只狙一次
+        if self.sniped_slugs.contains(&market.slug) { return Ok(()); }
+        let now = chrono::Utc::now().timestamp();
+        if now < market.start_ts { return Ok(()); } // 还没开盘
+
+        // 开盘价 + 当前价(binance)
+        let Some(open_px) = self.model.binance_at(market.start_ts) else { return Ok(()); };
+        let Some(cur_px) = self.model.binance_latest() else { return Ok(()); };
+
+        // 参照价:window=0 用开盘价(相对开盘累计);>0 用最近 N 秒前价(纯速度)
+        let ref_px = if self.config.sniper_window_sec > 0 {
+            match self.model.binance_at(now - self.config.sniper_window_sec) {
+                Some(p) => p,
+                None => return Ok(()),
+            }
+        } else {
+            open_px
+        };
+        let move_usd = cur_px - ref_px;
+        if move_usd.abs() < self.config.sniper_move_usd { return Ok(()); } // 没动够,继续等
+
+        let dir = if move_usd > 0.0 { "Up" } else { "Down" };
+        let ask = if dir == "Up" { up_ask } else { dn_ask };
+
+        // 限价闸(灵魂):盘口还没反应(ask<max)才买;已反应(ask 高)则放弃这盘
+        if ask > self.config.sniper_max_ask {
+            self.sniped_slugs.insert(market.slug.clone());
+            debug!("[SNIPER] {} {dir} 突破${:+.0} 但 ask={ask:.3}>{:.2}(盘口已反应),放弃 T-{seconds_left}s",
+                market.title, move_usd, self.config.sniper_max_ask);
+            return Ok(());
+        }
+
+        let qty = self.config.sniper_qty;
+        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+        info!("[SNIPER {mode}] {} 突破${:+.0}(开盘{open_px:.0}→现{cur_px:.0}) 买{dir}@{ask:.3}×{qty:.0} T-{seconds_left}s",
+            market.title, move_usd);
+
+        // 下单前先标记已狙,避免本盘后续 tick 重复触发
+        self.sniped_slugs.insert(market.slug.clone());
+        let _ = self.write_signal(&serde_json::json!({
+            "phase": "sniper_entry", "market": market.slug,
+            "direction": dir, "ask": ask, "shares": qty,
+            "open_px": open_px, "cur_px": cur_px, "move_usd": move_usd,
+            "window_sec": self.config.sniper_window_sec,
+            "seconds_left": seconds_left, "dry_run": self.config.dry_run,
+            "ts": now,
+        })).await;
+
+        // 买入 + 裸持到结算
+        if self.do_buy(market, dir, ask, qty, "sniper", open_px).await? {
             let p = self.state.get_or_create(&market.slug, market.end_ts);
             p.phase = Phase::Locked;
             self.state.save().await?;

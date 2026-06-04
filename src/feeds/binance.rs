@@ -5,7 +5,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
 const BINANCE_WS: &str = "wss://data-stream.binance.vision/ws/btcusdt@aggTrade";
-const HISTORY_SEC: i64 = 180;
+const HISTORY_SEC: i64 = 350; // 狙击需取开盘价(盘最长300s):存够整盘+buffer
 
 #[derive(Clone, Debug)]
 pub struct TradePoint {
