@@ -104,8 +104,9 @@ impl OrderExecutor {
 
     /// 买入指定 token。
     ///
-    /// LIVE 用 **FAK（fill-and-kill）**：立即吃单，能成交多少成交多少，剩余取消。
-    /// 比 FOK 更适合 5 分钟盘口的浅流动性——部分成交也按真实成交份额记账。
+    /// LIVE 用 **FOK（fill-or-kill）**：要么按请求份额全部立即成交，要么整单取消，
+    /// 不接受部分成交——避免延迟到达时盘口已变、只吃到零头或买在坏价。
+    /// 代价：浅流动性下整单失败(扑空)概率高于 FAK。
     /// 限价加 `MARKETABLE_BUFFER` 让单子能穿透盘口若干档。
     pub async fn buy(&self, token_id: &str, price: f64, shares: f64) -> Result<Fill> {
         match self {
@@ -136,7 +137,7 @@ impl OrderExecutor {
                     .side(Side::Buy)
                     .price(p)
                     .size(s)
-                    .order_type(OrderType::FAK)
+                    .order_type(OrderType::FOK)
                     .build()
                     .await
                     .context("build 失败")?;
@@ -157,7 +158,7 @@ impl OrderExecutor {
                 // 从真实成交额反推成交均价/份额：BUY → making=USDC支出, taking=买到份额
                 let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
                 let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
-                // FAK 部分成交：以真实成交份额为准（taking>0 即视为成交）
+                // FOK：要么全额成交(taking≈order_shares)，要么整单 kill(taking=0)
                 let filled = taking > 0.0;
                 let (filled_price, filled_shares) = if filled {
                     (making / taking, taking)
