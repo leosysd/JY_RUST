@@ -638,6 +638,7 @@ impl SmartStrategy {
         };
         let move_usd = cur_px - ref_px;
         if move_usd.abs() < self.config.sniper_move_usd { return Ok(()); } // 没动够,继续等
+        let t_sig = std::time::Instant::now(); // 检测到突破信号的时刻
 
         let dir = if move_usd > 0.0 { "Up" } else { "Down" };
         let ask = if dir == "Up" { up_ask } else { dn_ask };
@@ -657,6 +658,12 @@ impl SmartStrategy {
 
         // 下单前先标记已狙,避免本盘后续 tick 重复触发
         self.sniped_slugs.insert(market.slug.clone());
+        // 信号→开始下单延迟:检测突破到调起下单。write_signal 挪到下单之后,
+        // 不让写文件 IO 阻塞下单(狙击争分夺秒)。
+        info!("[SIGNAL_LAT] 检测突破→开始下单={}ms", t_sig.elapsed().as_millis());
+
+        // 买入 + 裸持到结算
+        let bought = self.do_buy(market, dir, ask, qty, "sniper", open_px).await?;
         let _ = self.write_signal(&serde_json::json!({
             "phase": "sniper_entry", "market": market.slug,
             "direction": dir, "ask": ask, "shares": qty,
@@ -665,9 +672,7 @@ impl SmartStrategy {
             "seconds_left": seconds_left, "dry_run": self.config.dry_run,
             "ts": now,
         })).await;
-
-        // 买入 + 裸持到结算
-        if self.do_buy(market, dir, ask, qty, "sniper", open_px).await? {
+        if bought {
             let p = self.state.get_or_create(&market.slug, market.end_ts);
             p.phase = Phase::Locked;
             self.state.save().await?;
