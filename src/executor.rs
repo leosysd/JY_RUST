@@ -140,7 +140,7 @@ impl OrderExecutor {
                 // 延迟埋点:无论成交/扑空都记下单往返(签名+POST+Polymarket撮合返回)。
                 // 狙击扑空根因排查:回测盘口1秒后edge归零,此值若~1s即必然扑空。
                 tracing::info!(
-                    "[EXEC延迟] 下单往返(签名+POST+撮合)={:.0}ms",
+                    "[ORDER_LAT] build_sign_and_post(签名+POST+撮合)={:.0}ms",
                     t_send.elapsed().as_secs_f64() * 1000.0
                 );
                 let resp = resp_result.context("提交订单失败")?;
@@ -182,11 +182,18 @@ impl OrderExecutor {
     pub async fn prime_token(&self, token_id: &str) {
         if let Self::Live { client, .. } = self {
             if let Ok(tid) = U256::from_str(token_id) {
-                // 并发取 3 个元数据填缓存,忽略错误(预热失败只是下单回退到现取,不影响正确性)
-                let _ = tokio::join!(
-                    client.tick_size(tid),
-                    client.neg_risk(tid),
-                    client.fee_rate_bps(tid),
+                // 并发取 3 个元数据填缓存,各自计时,忽略错误(预热失败只是下单回退到现取)。
+                let t0 = std::time::Instant::now();
+                let (ts, nr, fee) = tokio::join!(
+                    async { let s = std::time::Instant::now(); let _ = client.tick_size(tid).await; s.elapsed() },
+                    async { let s = std::time::Instant::now(); let _ = client.neg_risk(tid).await; s.elapsed() },
+                    async { let s = std::time::Instant::now(); let _ = client.fee_rate_bps(tid).await; s.elapsed() },
+                );
+                let n = token_id.len();
+                tracing::info!(
+                    "[ORDER_PREWARM] token=..{} tick_size={}ms neg_risk={}ms fee={}ms total={}ms",
+                    &token_id[n.saturating_sub(8)..],
+                    ts.as_millis(), nr.as_millis(), fee.as_millis(), t0.elapsed().as_millis()
                 );
             }
         }
