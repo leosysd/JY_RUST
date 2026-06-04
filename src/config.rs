@@ -85,6 +85,21 @@ pub struct Config {
     /// 不再按金额买超(5→5.8)。实际成交价仍≤盘口 ask(由 sniper_max_ask 闸约束)。
     pub sniper_buy_limit: f64,
 
+    // ── 路线六:accum 双边非对称累积建仓 ────────────────────────────────
+    // 第一笔 z 定方向(之后不看 z)。以"BTC 每走 STEP_USD"为节拍器:每个朝主方向的
+    // 新台阶 → 主腿顺势加 QTY 份;同台阶若对侧 ask≤HEDGE_MAX → 对冲腿也买 QTY 份。
+    // 两腿 FAK、裸持到结算。主腿吃趋势、对冲腿逢低封下行(目标 赢多亏少)。不封顶预算。
+    /// 每笔份额(主腿/对冲腿同值)。
+    pub accum_qty: f64,
+    /// 台阶步长(美元):BTC 每朝主方向走此值 → 一个新台阶 → 加一笔主腿。
+    pub accum_step_usd: f64,
+    /// 对冲腿买入上限:仅当对侧 ask≤此值才在该台阶补对冲腿。
+    pub accum_hedge_max_ask: f64,
+    /// 第一笔定方向阈值:|z|≥此值才开第一笔主腿(锁定方向)。
+    pub accum_entry_z: f64,
+    /// 临近结算停建:剩余秒≤此值不再加仓(已建仓裸持)。
+    pub accum_force_seconds: i64,
+
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -236,6 +251,12 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         sniper_max_ask: env_f64("SNIPER_MAX_ASK", 0.62),
         sniper_qty: env_f64("SNIPER_QTY", 20.0),
         sniper_buy_limit: env_f64("SNIPER_BUY_LIMIT", 0.99),
+
+        accum_qty: env_f64("ACCUM_QTY", 20.0),
+        accum_step_usd: env_f64("ACCUM_STEP_USD", 10.0),
+        accum_hedge_max_ask: env_f64("ACCUM_HEDGE_MAX_ASK", 0.35),
+        accum_entry_z: env_f64("ACCUM_ENTRY_Z", 0.15),
+        accum_force_seconds: env_i64("ACCUM_FORCE_SECONDS", 15),
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),

@@ -62,8 +62,6 @@ pub struct SmartStrategy {
     pub sniped_slugs: std::collections::HashSet<String>,
     /// 已预热缓存的盘(sniper 每盘开始预热 tick/neg-risk/fee,防重复预热)。
     pub primed_slugs: std::collections::HashSet<String>,
-    /// 上次连接保活(prewarm)的 unix 秒。sniper 每 <90s 打热一条连接,防空闲被 Cloudflare 掐。
-    pub last_prewarm: i64,
     /// 上次结算检查的 unix 秒。决策主循环据此节流结算网络请求(见 SETTLEMENT_CHECK_INTERVAL),
     /// 让结算查询不再每 tick 阻塞、拖慢下一盘入场。
     pub last_settlement_check: i64,
@@ -74,6 +72,19 @@ pub struct SmartStrategy {
     /// 训练 timer 训出新模型后,bot 在下个新盘自动加载,无需重启(见 maybe_reload_shadow)。
     pub model_dir: PathBuf,
     pub shadow_mtime: i64,
+    /// accum 路线每盘累积状态(slug→方向锁定+台阶进度)。
+    pub accum: std::collections::HashMap<String, AccumLeg>,
+}
+
+/// accum 路线每盘的累积状态。第一笔 z 定方向后锁定,后续靠 BTC 台阶加仓,不再看 z。
+#[derive(Clone)]
+pub struct AccumLeg {
+    /// 主腿方向("Up"/"Down"),第一笔成交后锁定。
+    pub dir: String,
+    /// 基准 BTC 价(第一笔时的价)。台阶 = (cur-base)*方向符号 / step。
+    pub base_px: f64,
+    /// 主腿已建到的最高台阶序号(只增不减,只在创新高台阶加仓)。
+    pub main_step: i64,
 }
 
 /// 读 model.txt 的修改时间(unix 秒);不存在则 0。用于热重载判新。
@@ -140,9 +151,9 @@ impl SmartStrategy {
             sampled_slugs: std::collections::HashSet::new(),
             sniped_slugs: std::collections::HashSet::new(),
             primed_slugs: std::collections::HashSet::new(),
-            last_prewarm: 0,
             last_settlement_check: 0,
             shadow, model_dir, shadow_mtime,
+            accum: std::collections::HashMap::new(),
         })
     }
 
@@ -169,23 +180,16 @@ impl SmartStrategy {
         let up_token = market.token_ids[up_idx].clone();
         let dn_token = market.token_ids[dn_idx].clone();
 
-        // sniper 预热:盘一出现就把 Up/Down 的 tick/neg-risk/fee 缓存填好(突破前的空闲时间),
-        // 突破下单时 SDK build_sign_and_post 命中缓存,下单往返从 ~800ms 降到 ~100ms。每盘一次。
-        if self.config.entry_strategy == "sniper" && !self.primed_slugs.contains(&market.slug) {
+        // sniper 开盘预热(每盘一次):填好 Up/Down 的 tick/neg-risk/fee 缓存 + 打热一条连接。
+        // 实盘统计:96% 下单在开盘后≤30s、全部≤48s,远早于 CF 切空闲连接(~100s),
+        // 故开盘 prewarm 一次即覆盖全部下单窗口,无需整盘每 50s ping(84% 时间根本不下单)。
+        // (连接握手实测仅 ~45ms;prewarm 省的是这 45ms,暴雷在平台撮合、与连接无关。)
+        if matches!(self.config.entry_strategy.as_str(), "sniper" | "accum") && !self.primed_slugs.contains(&market.slug) {
             self.executor.prime_token(&up_token).await;
             self.executor.prime_token(&dn_token).await;
+            let exec = self.executor.clone();
+            tokio::spawn(async move { exec.prewarm().await; }); // 开盘打热连接,不阻塞决策
             self.primed_slugs.insert(market.slug.clone());
-        }
-
-        // sniper 连接保活:每 <90s 用 ok() 打热一条连接(spawn 不阻塞决策),使突破下单时
-        // post_order 复用热连接、免 TCP+TLS 握手(~200ms)。空闲连接 ~90s 被掐,故须定期打。
-        if self.config.entry_strategy == "sniper" {
-            let nowts = chrono::Utc::now().timestamp();
-            if nowts - self.last_prewarm >= 50 {
-                self.last_prewarm = nowts;
-                let exec = self.executor.clone();
-                tokio::spawn(async move { exec.prewarm().await; });
-            }
         }
 
         let (up_ask, dn_ask) = {
@@ -221,6 +225,12 @@ impl SmartStrategy {
         // 路线五：sniper 延迟套利狙击(binance 突破 → 限价 → FAK → 裸持)。
         if self.config.entry_strategy == "sniper" {
             self.decide_sniper(&market, up_ask, dn_ask, seconds_left).await?;
+            return Ok(());
+        }
+
+        // 路线六：accum 双边非对称累积建仓(z 定首笔方向 → BTC 台阶顺势加主腿 + 逢低补对冲腿 → 裸持)。
+        if self.config.entry_strategy == "accum" {
+            self.decide_accum(&market, up_ask, dn_ask, seconds_left).await?;
             return Ok(());
         }
 
@@ -691,6 +701,117 @@ impl SmartStrategy {
             p.phase = Phase::Locked;
             self.state.save().await?;
         }
+        Ok(())
+    }
+
+    // ── 路线六：accum 双边非对称累积建仓 ─────────────────────────────────
+    //
+    // 首笔 z 定方向(之后不再看 z)。以"BTC 每走 STEP_USD"为节拍器,每个朝主方向的
+    // 新台阶:主腿顺势加 QTY 份;同台阶若对侧 ask≤HEDGE_MAX → 对冲腿也买 QTY 份。
+    // 两腿 FAK、裸持到结算。主腿吃趋势,对冲腿逢低封下行(目标 赢多亏少)。不封顶预算。
+    async fn decide_accum(
+        &mut self,
+        market: &Market,
+        up_ask: f64,
+        dn_ask: f64,
+        seconds_left: i64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        if now < market.start_ts { return Ok(()); }                          // 还没开盘
+        if seconds_left <= self.config.accum_force_seconds { return Ok(()); } // 临近结算停建
+
+        let Some(cur_px) = self.model.binance_latest() else { return Ok(()); };
+        let qty = self.config.accum_qty;
+        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+
+        // ── 首笔:z 定方向并锁定(整盘只此一次用 z) ────────────────────────
+        if !self.accum.contains_key(&market.slug) {
+            let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
+            if price_to_beat < 1000.0 { return Ok(()); }       // 开盘 Chainlink 价未就绪
+            let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
+            let z_thr = self.config.accum_entry_z;
+            let dir = if sig.z >= z_thr { "Up" }
+                      else if sig.z <= -z_thr { "Down" }
+                      else { return Ok(()); };                 // |z| 不足,等下个 tick
+            let ask = if dir == "Up" { up_ask } else { dn_ask };
+            info!("[ACCUM {mode}] {} 首笔 z={:.3}→{dir} 主腿@{ask:.3}×{qty:.0} base={cur_px:.0} T-{seconds_left}s",
+                market.title, sig.z);
+            self.accum_buy(market, dir, ask, "accum_main", price_to_beat, None).await?;
+            self.accum.insert(market.slug.clone(), AccumLeg {
+                dir: dir.to_string(), base_px: cur_px, main_step: 0,
+            });
+            return Ok(());
+        }
+
+        // ── 后续台阶:方向已锁,BTC 每朝主方向走 STEP_USD → 新台阶 ────────────
+        let leg = self.accum.get(&market.slug).unwrap().clone();
+        let sign = if leg.dir == "Up" { 1.0 } else { -1.0 };
+        let progress = (cur_px - leg.base_px) * sign;          // 朝主方向累计美元(负=回撤)
+        let step = self.config.accum_step_usd.max(1.0);
+        // 单 tick 最多补 50 台阶:防异常数据(cur_px 跳变)触发 runaway 刷单。正常不触发。
+        let step_now = ((progress / step).floor() as i64).min(leg.main_step + 50);
+        if step_now <= leg.main_step { return Ok(()); }        // 没创新台阶(含回撤),不加仓
+
+        let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(leg.base_px);
+        let main_ask  = if leg.dir == "Up" { up_ask } else { dn_ask };
+        let hedge_dir = if leg.dir == "Up" { "Down" } else { "Up" };
+        let hedge_ask = if leg.dir == "Up" { dn_ask } else { up_ask };
+        let hedge_cap = self.config.accum_hedge_max_ask;
+
+        // 补齐每个新台阶:主腿各一笔;同台阶对侧便宜(≤cap)则对冲腿一笔。
+        for s in (leg.main_step + 1)..=step_now {
+            info!("[ACCUM {mode}] {} 台阶#{s}(BTC{progress:+.0}) 主腿{}@{main_ask:.3}×{qty:.0} T-{seconds_left}s",
+                market.title, leg.dir);
+            self.accum_buy(market, &leg.dir, main_ask, "accum_main", price_to_beat, None).await?;
+            if hedge_ask <= hedge_cap {
+                info!("[ACCUM {mode}] {} 台阶#{s} 对冲腿{hedge_dir}@{hedge_ask:.3}×{qty:.0}(对侧≤{hedge_cap:.2})",
+                    market.title);
+                self.accum_buy(market, hedge_dir, hedge_ask, "accum_hedge", price_to_beat, Some(hedge_cap)).await?;
+            }
+        }
+        if let Some(l) = self.accum.get_mut(&market.slug) { l.main_step = step_now; }
+        Ok(())
+    }
+
+    /// accum 专用下单+双轨记账(FAK)。limit_override:对冲腿传 Some(cap) 封价,主腿 None(ask+buffer 保成交)。
+    async fn accum_buy(
+        &mut self,
+        market: &Market,
+        dir: &str,
+        price: f64,
+        label: &str,
+        price_to_beat: f64,
+        limit_override: Option<f64>,
+    ) -> Result<()> {
+        let qty = self.config.accum_qty;
+        let Some(token) = market.token_for(dir) else {
+            warn!("[ACCUM] {} 找不到 {dir} 的 token_id,跳过", market.title);
+            return Ok(());
+        };
+        let fill = match self.executor.buy_fak(token, price, qty, limit_override).await {
+            Ok(f) => f,
+            Err(e) => { warn!("[ACCUM ORDER ERR] {} {dir} {label}: {e:#}", market.title); return Ok(()); }
+        };
+        if !fill.simulated {
+            info!("[ACCUM ORDER] {} {dir} {label} id={} status={} ok={} 成交{:.1}份@{:.3}",
+                market.title, fill.order_id, fill.status, fill.success, fill.filled_shares, fill.filled_price);
+        }
+        // A轨 影子账(仅实盘):假设按 ask 全额成交,与真实账对比滑点/扑空代价。
+        if !self.config.dry_run {
+            record_trade(&mut self.ideal_state, market, dir, price, qty, label, price_to_beat, false);
+            self.ideal_state.save().await?;
+        }
+        // B轨 真实账:FAK 可能部分成交/扑空,只记真正成交的份额。
+        if !fill.success || fill.filled_shares <= 0.0 { return Ok(()); }
+        let (rp, rs) = (fill.filled_price, fill.filled_shares);
+        self.write_signal(&serde_json::json!({
+            "phase": label, "market": market.slug,
+            "direction": dir, "price": rp, "shares": rs,
+            "full_cost": full_cost_per_share(rp),
+            "dry_run": self.config.dry_run, "ts": chrono::Utc::now().timestamp(),
+        })).await?;
+        record_trade(&mut self.state, market, dir, rp, rs, label, price_to_beat, false);
+        self.state.save().await?;
         Ok(())
     }
 

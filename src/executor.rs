@@ -115,7 +115,18 @@ impl OrderExecutor {
     /// 不接受部分成交——避免延迟到达时盘口已变、只吃到零头或买在坏价。
     /// 代价：浅流动性下整单失败(扑空)概率高于 FAK。
     /// 限价加 `MARKETABLE_BUFFER` 让单子能穿透盘口若干档。
+    /// FOK 下单(整单成交或扑空):狙击/锁仓用,杜绝部分成交零头。
     pub async fn buy(&self, token_id: &str, price: f64, shares: f64, limit_price: Option<f64>) -> Result<Fill> {
+        self.buy_with(token_id, price, shares, limit_price, OrderType::FOK).await
+    }
+
+    /// FAK 下单(吃掉簿上≤limit的量、最多 shares 份,剩余撤):accum 累积建仓用,
+    /// 部分成交是好事(能买多少买多少,不浪费低价机会)。
+    pub async fn buy_fak(&self, token_id: &str, price: f64, shares: f64, limit_price: Option<f64>) -> Result<Fill> {
+        self.buy_with(token_id, price, shares, limit_price, OrderType::FAK).await
+    }
+
+    async fn buy_with(&self, token_id: &str, price: f64, shares: f64, limit_price: Option<f64>, order_type: OrderType) -> Result<Fill> {
         match self {
             Self::DryRun => Ok(Fill::simulated(price, shares)),
             Self::Live { client, signer } => {
@@ -151,7 +162,7 @@ impl OrderExecutor {
                     .side(Side::Buy)
                     .price(p)
                     .size(s)
-                    .order_type(OrderType::FOK)
+                    .order_type(order_type.clone())
                     .build()
                     .await
                     .context("build 失败")?;
@@ -172,7 +183,8 @@ impl OrderExecutor {
                 // 从真实成交额反推成交均价/份额：BUY → making=USDC支出, taking=买到份额
                 let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
                 let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
-                // FOK：要么全额成交(taking≈order_shares)，要么整单 kill(taking=0)
+                // FOK：要么全额成交(taking≈order_shares)，要么整单 kill(taking=0)。
+                // FAK：吃≤limit的量、最多order_shares份,部分成交(taking∈(0,shares))属正常。
                 let filled = taking > 0.0;
                 let (filled_price, filled_shares) = if filled {
                     (making / taking, taking)
@@ -183,7 +195,7 @@ impl OrderExecutor {
                 if !filled {
                     warn!("[EXEC] 订单未成交(不记账): id={} status={} ok={} err={:?}",
                         resp.order_id, resp.status, resp.success, resp.error_msg);
-                } else if (taking - shares).abs() > 0.01 {
+                } else if matches!(order_type, OrderType::FOK) && (taking - shares).abs() > 0.01 {
                     warn!("[EXEC] 部分成交: 请求{shares:.0}份 实际{taking:.1}份 @ {:.3}",
                         making / taking);
                 }
