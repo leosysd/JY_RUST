@@ -76,17 +76,19 @@ pub struct SmartStrategy {
     pub accum: std::collections::HashMap<String, AccumLeg>,
 }
 
-/// accum 路线每盘的累积状态。第一笔 z 定方向后锁定,后续靠 BTC 台阶加仓,不再看 z。
+/// accum 路线每盘的累积状态。第一笔 z 定方向后锁定,后续按 Polymarket 价格阶梯加仓,不再看 z。
 #[derive(Clone)]
 pub struct AccumLeg {
-    /// 主腿方向("Up"/"Down"),第一笔成交后锁定。
+    /// 主腿方向("Up"/"Down"),第一笔成交后锁定,整盘不再换向。
     pub dir: String,
-    /// 基准 BTC 价(第一笔时的价)。台阶 = (cur-base)*方向符号 / step。
+    /// 基准 BTC 价(第一笔时的 binance 价)。仅记录,不作加仓台阶依据。
     pub base_px: f64,
-    /// 主腿已建到的最高台阶序号(只增不减,只在创新高台阶加仓)。
-    pub main_step: i64,
-    /// 对冲腿上次补单时的对侧 ask(None=尚未补过)。每再跌 HEDGE_STEP 才补下一笔。
-    pub hedge_last: Option<f64>,
+    /// 第一笔 Polymarket 主腿成交价(ask)。
+    pub entry_ask: f64,
+    /// 主方向已买过的阶梯下标(对应 config.accum_main_levels,每阶梯只买一次)。
+    pub main_filled_levels: Vec<usize>,
+    /// 反方向已买过的阶梯下标(对应 config.accum_hedge_levels,每阶梯只买一次)。
+    pub hedge_filled_levels: Vec<usize>,
 }
 
 /// 读 model.txt 的修改时间(unix 秒);不存在则 0。用于热重载判新。
@@ -706,13 +708,18 @@ impl SmartStrategy {
         Ok(())
     }
 
-    // ── 路线六：accum 双边封顶累积(抄底版,目标稳健现金流)─────────────────
+    // ── 路线六：accum 价格阶梯双边建仓(按 Polymarket outcome 价加仓)──────────
     //
-    // 首笔 z 定方向(之后不再看 z)。主腿:BTC 每走 STEP_USD 顺势加 QTY 份,主腿"赢的毛
-    // PnL(份额−成本)"跨过 TARGET_WIN 即封顶停(锁定赢约 12,截断方向错时的失控亏损)。
-    // 对冲(买输侧/抄底):对侧 ask<HEDGE_MAX 即逢低补、每再跌 HEDGE_STEP 一笔,补到对冲
-    // 份额≥主腿份额(平衡)。平衡后涨跌同利,对侧崩盘越狠同利越高(方向错的盘救成套利)。
-    // 两腿 FAK、裸持到结算。
+    // 首笔 z 定方向(之后不再看 z,整盘不换向),只买 BUY 不卖。之后:
+    //  主方向 按 ASK 降序阶梯(accum_main_levels,如 [0.45,0.42,0.40,0.38])**逢低抄底**:主腿
+    //    ask≤某阶梯且该阶梯未买过 → 买 QTY 份(回调买点,赔率好;一个月回测胜率 71%、ROI 16%)。
+    //    注:这是"逢低"不是"追涨"——追涨买高价赔率差,实测明显劣于逢低,故弃。
+    //  反方向 按 ASK 降序阶梯(accum_hedge_levels,如 [0.45,0.42,0.40,0.38,0.36])补仓对冲:
+    //    对侧 ask≤某阶梯且该阶梯未买过 → 买 QTY 份(削减方向错时的亏损)。
+    //  每阶梯只买一次(filled_levels 去重)。每笔前重算两个结算结果(worst_pnl):
+    //    Up 赢 = up_shares - up_cost_total - down_cost_total;Down 赢同理。
+    //  闸门:新订单须让 worst_pnl 变好,或加仓后 worst_pnl≥accum_max_loss,否则不下。
+    //  不再用 BTC progress=cur-base 决定加仓;base_px 仅记录首笔 BTC 价。两腿 FAK、裸持到结算。
     async fn decide_accum(
         &mut self,
         market: &Market,
@@ -724,11 +731,13 @@ impl SmartStrategy {
         if now < market.start_ts { return Ok(()); }                          // 还没开盘
         if seconds_left <= self.config.accum_force_seconds { return Ok(()); } // 临近结算停建
 
-        let Some(cur_px) = self.model.binance_latest() else { return Ok(()); };
         let qty = self.config.accum_qty;
+        let max_loss = self.config.accum_max_loss;
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
 
-        // ── 首笔:z 定方向并锁定(整盘只此一次用 z) ────────────────────────
+        // ── 首笔:无过滤宽入场。仅 z 定方向(accum_entry_z 阈值),不设价位窗/flow闸/时间窗,
+        //    整盘任意时刻 |z| 一够即开首笔。只买 BUY 不卖,首笔定方向后锁定不换向。
+        //    实测(20h自洽回放):宽入场方向命中 58%、均收益最高,故不加 ev_solo 那套过滤。
         if !self.accum.contains_key(&market.slug) {
             let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
             if price_to_beat < 1000.0 { return Ok(()); }       // 开盘 Chainlink 价未就绪
@@ -738,72 +747,71 @@ impl SmartStrategy {
                       else if sig.z <= -z_thr { "Down" }
                       else { return Ok(()); };                 // |z| 不足,等下个 tick
             let ask = if dir == "Up" { up_ask } else { dn_ask };
-            info!("[ACCUM {mode}] {} 首笔 z={:.3}→{dir} 主腿@{ask:.3}×{qty:.0} base={cur_px:.0} T-{seconds_left}s",
+            let base_px = self.model.binance_latest().unwrap_or(0.0); // 仅记录首笔 BTC 价
+            info!("[ACCUM {mode}] {} 首笔 z={:.3}→{dir} 主腿@{ask:.3}×{qty:.0} base={base_px:.0} T-{seconds_left}s",
                 market.title, sig.z);
-            self.accum_buy(market, dir, ask, "accum_main", price_to_beat, None).await?;
+            let filled = self.accum_buy(market, dir, ask, "accum_main", price_to_beat, None).await?;
+            // 用真实成交价记 entry_ask,扑空则退回意向 ask。
+            let entry_ask = filled.unwrap_or(ask);
             self.accum.insert(market.slug.clone(), AccumLeg {
-                dir: dir.to_string(), base_px: cur_px, main_step: 0, hedge_last: None,
+                dir: dir.to_string(), base_px, entry_ask,
+                main_filled_levels: Vec::new(), hedge_filled_levels: Vec::new(),
             });
             return Ok(());
         }
 
-        // ── 后续 tick:方向已锁。读当前仓位算封顶/平衡判据 ──────────────────
+        // ── 后续 tick:方向已锁,按价格阶梯双边加仓 ─────────────────────────
         let leg = self.accum.get(&market.slug).unwrap().clone();
         let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(leg.base_px);
-        let hedge_cap = self.config.accum_hedge_max_ask;
-        let target = self.config.accum_target_win;
-        // 当前仓位:主腿份额/成本(含费)、对冲份额。WIN_main = 主腿赢的毛 PnL(份额−成本)。
-        let (main_sh, main_cost, hedge_sh) = {
-            let pos = self.state.get_or_create(&market.slug, market.end_ts);
-            if leg.dir == "Up" { (pos.up_shares, pos.up_cost_total, pos.down_shares) }
-            else               { (pos.down_shares, pos.down_cost_total, pos.up_shares) }
-        };
-        let win_main = main_sh - main_cost;
+        let main_dir = leg.dir.clone();
+        let hedge_dir = if main_dir == "Up" { "Down" } else { "Up" };
+        let main_ask = if main_dir == "Up" { up_ask } else { dn_ask };
+        let hedge_ask = if main_dir == "Up" { dn_ask } else { up_ask };
+        // 阶梯列表拷到本地:循环体内要 &mut self(下单),不能同时借用 self.config。
+        let main_levels = self.config.accum_main_levels.clone();
+        let hedge_levels = self.config.accum_hedge_levels.clone();
 
-        // ① 对冲腿(买输侧/抄底):对侧 ask<HEDGE_MAX 即补、每再跌 HEDGE_STEP 一笔;
-        //    补到对冲份额≥主腿份额(双边平衡)为止。平衡后涨跌同利,对侧越便宜同利越高。
-        //    放主腿之前:主腿封顶/停滞后,对侧崩盘仍能继续抄底补成套利。
-        let hedge_dir = if leg.dir == "Up" { "Down" } else { "Up" };
-        let hedge_ask = if leg.dir == "Up" { dn_ask } else { up_ask };
-        if hedge_ask < hedge_cap && hedge_sh < main_sh {
-            let step_ok = match leg.hedge_last {
-                None => true,                                  // 首次跌破 HEDGE_MAX
-                Some(hl) => hedge_ask <= hl - self.config.accum_hedge_step, // 每再跌一档
-            };
-            if step_ok {
-                info!("[ACCUM {mode}] {} 对冲(买输侧){hedge_dir}@{hedge_ask:.3}×{qty:.0}(对侧<{hedge_cap:.2},补平衡{hedge_sh:.0}/{main_sh:.0}) T-{seconds_left}s",
+        // ① 主方向逢低抄底:ask≤阶梯价 且 该阶梯未买过 → 加一笔(回调买点,赔率好)。
+        for (i, &lvl) in main_levels.iter().enumerate() {
+            if leg.main_filled_levels.contains(&i) { continue; }
+            if main_ask > lvl { continue; }
+            // 下单前重算结算:worst_pnl 须变好,或加仓后仍≥max_loss,否则跳过(留待以后)。
+            let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
+            let cur_worst = pos.worst_pnl();
+            let new_worst = pos.worst_pnl_if_add(&main_dir, main_ask, qty);
+            if new_worst < cur_worst && new_worst < max_loss {
+                debug!("[ACCUM {mode}] {} 主腿阶梯#{i}@{lvl:.2} 跳过:worst {cur_worst:+.1}→{new_worst:+.1}<{max_loss:.0}",
                     market.title);
-                self.accum_buy(market, hedge_dir, hedge_ask, "accum_hedge", price_to_beat, Some(hedge_cap)).await?;
-                if let Some(l) = self.accum.get_mut(&market.slug) { l.hedge_last = Some(hedge_ask); }
+                continue;
             }
+            info!("[ACCUM {mode}] {} 主腿逢低#{i}(ask{main_ask:.3}≤{lvl:.2}) {main_dir}×{qty:.0} worst {cur_worst:+.1}→{new_worst:+.1} T-{seconds_left}s",
+                market.title);
+            self.accum_buy(market, &main_dir, main_ask, "accum_main", price_to_beat, None).await?;
+            if let Some(l) = self.accum.get_mut(&market.slug) { l.main_filled_levels.push(i); }
         }
 
-        // ② 主腿:WIN_main<TARGET_WIN 时,BTC 每朝主方向走 STEP_USD 加一笔;跨过目标即封顶停。
-        if win_main < target {
-            let sign = if leg.dir == "Up" { 1.0 } else { -1.0 };
-            let progress = (cur_px - leg.base_px) * sign;      // 朝主方向累计美元(负=回撤)
-            let step = self.config.accum_step_usd.max(1.0);
-            // 单 tick 最多补 50 台阶:防异常数据(cur_px 跳变)触发 runaway。
-            let step_now = ((progress / step).floor() as i64).min(leg.main_step + 50);
-            if step_now > leg.main_step {
-                let main_ask = if leg.dir == "Up" { up_ask } else { dn_ask };
-                info!("[ACCUM {mode}] {} 台阶#{step_now}(BTC{progress:+.0}) 主腿{}@{main_ask:.3}×{qty:.0} WIN={win_main:.1}<{target:.0} T-{seconds_left}s",
-                    market.title, leg.dir);
-                // 每笔前再判 WIN 封顶(跨多台阶时,跨过目标即停,允许小幅跳动)。
-                let (mut est_sh, mut est_cost) = (main_sh, main_cost);
-                for _s in (leg.main_step + 1)..=step_now {
-                    if est_sh - est_cost >= target { break; }
-                    self.accum_buy(market, &leg.dir, main_ask, "accum_main", price_to_beat, None).await?;
-                    est_sh += qty;
-                    est_cost += full_cost_per_share(main_ask) * qty;
-                }
-                if let Some(l) = self.accum.get_mut(&market.slug) { l.main_step = step_now; }
+        // ② 反方向:ask≤阶梯价 且 该阶梯未买过 → 补一笔(逢低)。限价封在阶梯价,不追高。
+        for (i, &lvl) in hedge_levels.iter().enumerate() {
+            if leg.hedge_filled_levels.contains(&i) { continue; }
+            if hedge_ask > lvl { continue; }
+            let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
+            let cur_worst = pos.worst_pnl();
+            let new_worst = pos.worst_pnl_if_add(hedge_dir, hedge_ask, qty);
+            if new_worst < cur_worst && new_worst < max_loss {
+                debug!("[ACCUM {mode}] {} 对冲阶梯#{i}@{lvl:.2} 跳过:worst {cur_worst:+.1}→{new_worst:+.1}<{max_loss:.0}",
+                    market.title);
+                continue;
             }
+            info!("[ACCUM {mode}] {} 对冲阶梯#{i}(ask{hedge_ask:.3}≤{lvl:.2}) {hedge_dir}×{qty:.0} worst {cur_worst:+.1}→{new_worst:+.1} T-{seconds_left}s",
+                market.title);
+            self.accum_buy(market, hedge_dir, hedge_ask, "accum_hedge", price_to_beat, Some(lvl)).await?;
+            if let Some(l) = self.accum.get_mut(&market.slug) { l.hedge_filled_levels.push(i); }
         }
         Ok(())
     }
 
     /// accum 专用下单+双轨记账(FAK)。limit_override:对冲腿传 Some(cap) 封价,主腿 None(ask+buffer 保成交)。
+    /// 返回真实成交价(Some);扑空/找不到 token/下单错误返回 None。供首笔记 entry_ask 用。
     async fn accum_buy(
         &mut self,
         market: &Market,
@@ -812,15 +820,15 @@ impl SmartStrategy {
         label: &str,
         price_to_beat: f64,
         limit_override: Option<f64>,
-    ) -> Result<()> {
+    ) -> Result<Option<f64>> {
         let qty = self.config.accum_qty;
         let Some(token) = market.token_for(dir) else {
             warn!("[ACCUM] {} 找不到 {dir} 的 token_id,跳过", market.title);
-            return Ok(());
+            return Ok(None);
         };
         let fill = match self.executor.buy_fak(token, price, qty, limit_override).await {
             Ok(f) => f,
-            Err(e) => { warn!("[ACCUM ORDER ERR] {} {dir} {label}: {e:#}", market.title); return Ok(()); }
+            Err(e) => { warn!("[ACCUM ORDER ERR] {} {dir} {label}: {e:#}", market.title); return Ok(None); }
         };
         if !fill.simulated {
             info!("[ACCUM ORDER] {} {dir} {label} id={} status={} ok={} 成交{:.1}份@{:.3}",
@@ -832,7 +840,7 @@ impl SmartStrategy {
             self.ideal_state.save().await?;
         }
         // B轨 真实账:FAK 可能部分成交/扑空,只记真正成交的份额。
-        if !fill.success || fill.filled_shares <= 0.0 { return Ok(()); }
+        if !fill.success || fill.filled_shares <= 0.0 { return Ok(None); }
         let (rp, rs) = (fill.filled_price, fill.filled_shares);
         self.write_signal(&serde_json::json!({
             "phase": label, "market": market.slug,
@@ -842,7 +850,7 @@ impl SmartStrategy {
         })).await?;
         record_trade(&mut self.state, market, dir, rp, rs, label, price_to_beat, false);
         self.state.save().await?;
-        Ok(())
+        Ok(Some(rp))
     }
 
     // ── 通用：买入（不切换 Locked）────────────────────────────────────────

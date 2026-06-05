@@ -103,6 +103,12 @@ pub struct Config {
     pub accum_entry_z: f64,
     /// 临近结算停建:剩余秒≤此值不再加仓(已建仓裸持)。
     pub accum_force_seconds: i64,
+    /// 主方向逢低抄底阶梯(Polymarket ask,降序):主腿 ask≤某阶梯且该阶梯未买过 → 加一笔(回调买点)。
+    pub accum_main_levels: Vec<f64>,
+    /// 反方向对冲阶梯(Polymarket ask,降序):对侧 ask≤某阶梯且该阶梯未买过 → 补一笔(削减错向亏损)。
+    pub accum_hedge_levels: Vec<f64>,
+    /// 最大可接受亏损下限:新订单若不改善 worst_pnl 且会使 worst_pnl 跌破此值则不下单。
+    pub accum_max_loss: f64,
 
     // 系统
     pub poll_ms: u64,
@@ -174,6 +180,14 @@ fn env_f64(key: &str, default: f64) -> f64 {
     env(key, &default.to_string())
         .parse()
         .unwrap_or(default)
+}
+
+/// 解析逗号分隔的浮点列表(如价格阶梯)。空项/解析失败的项被忽略。
+fn env_f64_vec(key: &str, default: &str) -> Vec<f64> {
+    env(key, default)
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .collect()
 }
 
 pub fn load(env_path: Option<&str>) -> Result<Config> {
@@ -263,6 +277,9 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
         accum_entry_z: env_f64("ACCUM_ENTRY_Z", 0.15),
         accum_force_seconds: env_i64("ACCUM_FORCE_SECONDS", 15),
+        accum_main_levels: env_f64_vec("ACCUM_MAIN_LEVELS", "0.45,0.42,0.40,0.38"),
+        accum_hedge_levels: env_f64_vec("ACCUM_HEDGE_LEVELS", "0.45,0.42,0.40,0.38,0.36"),
+        accum_max_loss: env_f64("ACCUM_MAX_LOSS", -30.0),
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
