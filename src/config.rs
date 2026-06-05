@@ -265,7 +265,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_entry_z: env_f64("ACCUM_ENTRY_Z", 0.15),
         accum_force_seconds: env_i64("ACCUM_FORCE_SECONDS", 15),
         accum_chase_levels: env_f64_vec("ACCUM_CHASE_LEVELS", "0.62,0.65,0.68,0.70"),
-        accum_dip_levels: env_f64_vec("ACCUM_DIP_LEVELS", "0.28,0.25,0.20"),
+        accum_dip_levels: env_f64_vec("ACCUM_DIP_LEVELS", "0.25,0.20"),
         accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
         accum_max_loss: env_f64("ACCUM_MAX_LOSS", 7.0),
 
