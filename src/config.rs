@@ -85,31 +85,6 @@ pub struct Config {
     /// 不再按金额买超(5→5.8)。实际成交价仍≤盘口 ask(由 sniper_max_ask 闸约束)。
     pub sniper_buy_limit: f64,
 
-    // ── 路线六:accum 双边非对称累积建仓 ────────────────────────────────
-    // 第一笔 z 定方向(之后不看 z)。以"BTC 每走 STEP_USD"为节拍器:每个朝主方向的
-    // 新台阶 → 主腿顺势加 QTY 份;同台阶若对侧 ask≤HEDGE_MAX → 对冲腿也买 QTY 份。
-    // 两腿 FAK、裸持到结算。主腿吃趋势、对冲腿逢低封下行(目标 赢多亏少)。不封顶预算。
-    /// 每笔份额(主腿/对冲腿同值)。
-    pub accum_qty: f64,
-    /// 台阶步长(美元):BTC 每朝主方向走此值 → 一个新台阶 → 加一笔主腿。
-    pub accum_step_usd: f64,
-    /// 对冲腿买入上限(严格 <):对侧 ask 跌破此值即补对冲腿(独立于主腿台阶)。
-    pub accum_hedge_max_ask: f64,
-    /// 对冲腿加仓步长:对侧 ask 每再跌此值补下一笔(越低买越多)。
-    pub accum_hedge_step: f64,
-    /// 主腿盈利封顶:主腿"赢的毛 PnL(份额−成本)"跨过此值即停止加主腿(锁定赢约此值)。
-    pub accum_target_win: f64,
-    /// 第一笔定方向阈值:|z|≥此值才开第一笔主腿(锁定方向)。
-    pub accum_entry_z: f64,
-    /// 临近结算停建:剩余秒≤此值不再加仓(已建仓裸持)。
-    pub accum_force_seconds: i64,
-    /// 主方向逢低抄底阶梯(Polymarket ask,降序):主腿 ask≤某阶梯且该阶梯未买过 → 加一笔(回调买点)。
-    pub accum_main_levels: Vec<f64>,
-    /// 反方向对冲阶梯(Polymarket ask,降序):对侧 ask≤某阶梯且该阶梯未买过 → 补一笔(削减错向亏损)。
-    pub accum_hedge_levels: Vec<f64>,
-    /// 最大可接受亏损下限:新订单若不改善 worst_pnl 且会使 worst_pnl 跌破此值则不下单。
-    pub accum_max_loss: f64,
-
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -180,14 +155,6 @@ fn env_f64(key: &str, default: f64) -> f64 {
     env(key, &default.to_string())
         .parse()
         .unwrap_or(default)
-}
-
-/// 解析逗号分隔的浮点列表(如价格阶梯)。空项/解析失败的项被忽略。
-fn env_f64_vec(key: &str, default: &str) -> Vec<f64> {
-    env(key, default)
-        .split(',')
-        .filter_map(|s| s.trim().parse::<f64>().ok())
-        .collect()
 }
 
 pub fn load(env_path: Option<&str>) -> Result<Config> {
@@ -270,16 +237,6 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         sniper_qty: env_f64("SNIPER_QTY", 20.0),
         sniper_buy_limit: env_f64("SNIPER_BUY_LIMIT", 0.99),
 
-        accum_qty: env_f64("ACCUM_QTY", 20.0),
-        accum_step_usd: env_f64("ACCUM_STEP_USD", 10.0),
-        accum_hedge_max_ask: env_f64("ACCUM_HEDGE_MAX_ASK", 0.35),
-        accum_hedge_step: env_f64("ACCUM_HEDGE_STEP", 0.05),
-        accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
-        accum_entry_z: env_f64("ACCUM_ENTRY_Z", 0.15),
-        accum_force_seconds: env_i64("ACCUM_FORCE_SECONDS", 15),
-        accum_main_levels: env_f64_vec("ACCUM_MAIN_LEVELS", "0.45,0.42,0.40,0.38"),
-        accum_hedge_levels: env_f64_vec("ACCUM_HEDGE_LEVELS", "0.45,0.42,0.40,0.38,0.36"),
-        accum_max_loss: env_f64("ACCUM_MAX_LOSS", -30.0),
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),

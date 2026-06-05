@@ -120,8 +120,8 @@ impl OrderExecutor {
         self.buy_with(token_id, price, shares, limit_price, OrderType::FOK).await
     }
 
-    /// FAK 下单(吃掉簿上≤limit的量、最多 shares 份,剩余撤):accum 累积建仓用,
-    /// 部分成交是好事(能买多少买多少,不浪费低价机会)。
+    /// FAK 下单(吃掉簿上≤limit的量、最多 shares 份,剩余撤):需要"能成多少成多少"
+    /// 的累积建仓场景用,部分成交是好事(不浪费低价机会)。当前未被任何策略调用,保留备用。
     pub async fn buy_fak(&self, token_id: &str, price: f64, shares: f64, limit_price: Option<f64>) -> Result<Fill> {
         self.buy_with(token_id, price, shares, limit_price, OrderType::FAK).await
     }
