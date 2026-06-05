@@ -85,6 +85,22 @@ pub struct Config {
     /// 不再按金额买超(5→5.8)。实际成交价仍≤盘口 ask(由 sniper_max_ask 闸约束)。
     pub sniper_buy_limit: f64,
 
+    // ── 路线六:accum 双边追涨补仓 + 计算模块(主腿赢≥target/输≥−maxloss,锁住即停)──
+    /// 首笔/追买份额(每档固定)。
+    pub accum_qty: f64,
+    /// 首笔定方向阈值:|z|≥此值才开首笔主腿。
+    pub accum_entry_z: f64,
+    /// 临近结算停建:剩余秒≤此值不再下单。
+    pub accum_force_seconds: i64,
+    /// 追涨档(谁涨追谁,升序):任一边 ask≥某档且未追过 → 追买那边 accum_qty 份。
+    pub accum_chase_levels: Vec<f64>,
+    /// 补仓档(谁跌补谁,降序):任一边 ask≤某档且未补过 → 计算模块补那边(份额算出)。
+    pub accum_dip_levels: Vec<f64>,
+    /// 计算模块:主腿方向赢的结算 PnL 目标(补到 ≥此值)。
+    pub accum_target_win: f64,
+    /// 计算模块:主腿方向输的最大亏损(补到结算 PnL ≥ −此值)。
+    pub accum_max_loss: f64,
+
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -155,6 +171,14 @@ fn env_f64(key: &str, default: f64) -> f64 {
     env(key, &default.to_string())
         .parse()
         .unwrap_or(default)
+}
+
+/// 解析逗号分隔的浮点列表(价格阶梯)。空项/解析失败的项忽略。
+fn env_f64_vec(key: &str, default: &str) -> Vec<f64> {
+    env(key, default)
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .collect()
 }
 
 pub fn load(env_path: Option<&str>) -> Result<Config> {
@@ -236,6 +260,14 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         sniper_max_ask: env_f64("SNIPER_MAX_ASK", 0.62),
         sniper_qty: env_f64("SNIPER_QTY", 20.0),
         sniper_buy_limit: env_f64("SNIPER_BUY_LIMIT", 0.99),
+
+        accum_qty: env_f64("ACCUM_QTY", 20.0),
+        accum_entry_z: env_f64("ACCUM_ENTRY_Z", 0.15),
+        accum_force_seconds: env_i64("ACCUM_FORCE_SECONDS", 15),
+        accum_chase_levels: env_f64_vec("ACCUM_CHASE_LEVELS", "0.62,0.65,0.68,0.70"),
+        accum_dip_levels: env_f64_vec("ACCUM_DIP_LEVELS", "0.28,0.25,0.20"),
+        accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
+        accum_max_loss: env_f64("ACCUM_MAX_LOSS", 7.0),
 
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),

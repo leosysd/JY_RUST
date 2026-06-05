@@ -72,6 +72,24 @@ pub struct SmartStrategy {
     /// 训练 timer 训出新模型后,bot 在下个新盘自动加载,无需重启(见 maybe_reload_shadow)。
     pub model_dir: PathBuf,
     pub shadow_mtime: i64,
+    /// accum 路线每盘状态(slug→方向锚点+追涨/补仓进度+锁定)。
+    pub accum: std::collections::HashMap<String, AccumLeg>,
+}
+
+/// accum 路线每盘状态。首笔 z 定主腿方向(盈亏锚点),之后谁涨追谁/谁跌补谁,
+/// 计算模块把结算锁到「主腿赢≥target、主腿输≥−maxloss」,达标即停止下单裸持。
+#[derive(Clone)]
+pub struct AccumLeg {
+    /// z 主腿方向("Up"/"Down"),盈亏锚点,整盘不换。
+    pub main_dir: String,
+    /// Up / Down 两边各自已追涨的档位下标(谁涨追谁,两边都可能追)。
+    pub up_chase: Vec<usize>,
+    pub dn_chase: Vec<usize>,
+    /// Up / Down 两边各自已补仓的档位下标(谁跌补谁)。
+    pub up_dip: Vec<usize>,
+    pub dn_dip: Vec<usize>,
+    /// 盈亏已锁住(两个结算情景都达标)→ 停止一切下单。
+    pub locked: bool,
 }
 
 /// 读 model.txt 的修改时间(unix 秒);不存在则 0。用于热重载判新。
@@ -140,6 +158,7 @@ impl SmartStrategy {
             primed_slugs: std::collections::HashSet::new(),
             last_settlement_check: 0,
             shadow, model_dir, shadow_mtime,
+            accum: std::collections::HashMap::new(),
         })
     }
 
@@ -170,7 +189,7 @@ impl SmartStrategy {
         // 实盘统计:96% 下单在开盘后≤30s、全部≤48s,远早于 CF 切空闲连接(~100s),
         // 故开盘 prewarm 一次即覆盖全部下单窗口,无需整盘每 50s ping(84% 时间根本不下单)。
         // (连接握手实测仅 ~45ms;prewarm 省的是这 45ms,暴雷在平台撮合、与连接无关。)
-        if self.config.entry_strategy == "sniper" && !self.primed_slugs.contains(&market.slug) {
+        if matches!(self.config.entry_strategy.as_str(), "sniper" | "accum") && !self.primed_slugs.contains(&market.slug) {
             self.executor.prime_token(&up_token).await;
             self.executor.prime_token(&dn_token).await;
             let exec = self.executor.clone();
@@ -211,6 +230,12 @@ impl SmartStrategy {
         // 路线五：sniper 延迟套利狙击(binance 突破 → 限价 → FAK → 裸持)。
         if self.config.entry_strategy == "sniper" {
             self.decide_sniper(&market, up_ask, dn_ask, seconds_left).await?;
+            return Ok(());
+        }
+
+        // 路线六：accum 双边追涨补仓 + 计算模块(谁涨追谁/谁跌补谁,赢≥12/亏≤7,锁住即停)。
+        if self.config.entry_strategy == "accum" {
+            self.decide_accum(&market, up_ask, dn_ask, seconds_left).await?;
             return Ok(());
         }
 
@@ -681,6 +706,176 @@ impl SmartStrategy {
             p.phase = Phase::Locked;
             self.state.save().await?;
         }
+        Ok(())
+    }
+
+    // ── 路线六：accum 双边追涨补仓 + 计算模块 ─────────────────────────────
+    //
+    // 首笔 z 定主腿方向(盈亏锚点,整盘不换)。之后每 tick 对 Up/Down 两边:
+    //  ① 谁涨追谁:某边 ask≥追涨档[0.62,0.65,0.68,0.70]且未追过 → 追买那边 QTY 份。
+    //  ② 谁跌补谁(计算模块):某边 ask≤补档[0.28,0.25,0.20]且未补过 → 算份额补那边——
+    //     补主腿边→把"主腿赢"补到 target(12);补对侧→把"主腿输"补到 −maxloss(−7)。
+    //  ③ 锁住即停:一旦"主腿赢≥target 且 主腿输≥−maxloss"(两结算情景都达标),停止下单裸持。
+    // 计算模块公式:补 side 边 q 份后该边结算指标 =(side份额−总成本)+q·(1−fc(价))。
+    //   令其=目标 → q=(目标−当前指标)/(1−fc(价))。补不齐(对侧没跌够/主腿没涨够)则尽力而为。
+    async fn decide_accum(
+        &mut self,
+        market: &Market,
+        up_ask: f64,
+        dn_ask: f64,
+        seconds_left: i64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        if now < market.start_ts { return Ok(()); }                          // 还没开盘
+        if seconds_left <= self.config.accum_force_seconds { return Ok(()); } // 临近结算停建
+        let qty = self.config.accum_qty;
+        let target = self.config.accum_target_win;
+        let maxloss = self.config.accum_max_loss;
+        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+
+        // ── 首笔:z 定主腿方向,只 BUY ──
+        if !self.accum.contains_key(&market.slug) {
+            let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
+            if price_to_beat < 1000.0 { return Ok(()); }       // 开盘 Chainlink 价未就绪
+            let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
+            let z = self.config.accum_entry_z;
+            let dir = if sig.z >= z { "Up" } else if sig.z <= -z { "Down" } else { return Ok(()); };
+            let ask = if dir == "Up" { up_ask } else { dn_ask };
+            info!("[ACCUM {mode}] {} 首笔 z={:.3}→{dir} 主腿@{ask:.3}×{qty:.0} T-{seconds_left}s",
+                market.title, sig.z);
+            self.accum_buy(market, dir, ask, qty, "accum_first", price_to_beat).await?;
+            self.accum.insert(market.slug.clone(), AccumLeg {
+                main_dir: dir.to_string(),
+                up_chase: Vec::new(), dn_chase: Vec::new(),
+                up_dip: Vec::new(), dn_dip: Vec::new(), locked: false,
+            });
+            return Ok(());
+        }
+
+        let leg = self.accum.get(&market.slug).unwrap().clone();
+        if leg.locked { return Ok(()); }                       // 已锁住,不再下单
+        let main_dir = leg.main_dir.clone();
+        let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
+        let chase = self.config.accum_chase_levels.clone();
+        let dip = self.config.accum_dip_levels.clone();
+        let (up_chase, dn_chase) = (leg.up_chase.clone(), leg.dn_chase.clone());
+        let (up_dip, dn_dip) = (leg.up_dip.clone(), leg.dn_dip.clone());
+
+        // 进 tick 先判锁住(可能上 tick 刚好达标)
+        let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
+        if wm >= target && wo >= -maxloss {
+            if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
+            info!("[ACCUM {mode}] {} 盈亏锁住(主腿赢{wm:+.1}≥{target:.0} 主腿输{wo:+.1}≥{:.0}),停止下单裸持 T-{seconds_left}s",
+                market.title, -maxloss);
+            return Ok(());
+        }
+
+        // ① 谁涨追谁:Up/Down 两边,ask≥追涨档且未追过 → 追买 qty 份
+        for side in ["Up", "Down"] {
+            let side_ask = if side == "Up" { up_ask } else { dn_ask };
+            let chased = if side == "Up" { &up_chase } else { &dn_chase };
+            for (k, &lv) in chase.iter().enumerate() {
+                if chased.contains(&k) || side_ask < lv { continue; }
+                info!("[ACCUM {mode}] {} 追涨{side}#{k}(ask{side_ask:.3}≥{lv:.2})×{qty:.0} T-{seconds_left}s",
+                    market.title);
+                self.accum_buy(market, side, side_ask, qty, "accum_chase", price_to_beat).await?;
+                if let Some(l) = self.accum.get_mut(&market.slug) {
+                    if side == "Up" { l.up_chase.push(k); } else { l.dn_chase.push(k); }
+                }
+                let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
+                if wm >= target && wo >= -maxloss {
+                    if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
+                    info!("[ACCUM {mode}] {} 盈亏锁住,停止下单裸持 T-{seconds_left}s", market.title);
+                    return Ok(());
+                }
+            }
+        }
+
+        // ② 谁跌补谁(计算模块):Up/Down 两边,ask≤补档且未补过 → 算份额补
+        for side in ["Up", "Down"] {
+            let side_ask = if side == "Up" { up_ask } else { dn_ask };
+            let dipped = if side == "Up" { &up_dip } else { &dn_dip };
+            for (j, &lv) in dip.iter().enumerate() {
+                if dipped.contains(&j) || side_ask > lv { continue; }
+                // 计算模块:补 side 到目标(主腿边→主腿赢=target;对侧→主腿输=−maxloss)
+                let q = self.accum_calc_qty(&market.slug, market.end_ts, &main_dir, side, side_ask, target, maxloss);
+                if let Some(l) = self.accum.get_mut(&market.slug) {
+                    if side == "Up" { l.up_dip.push(j); } else { l.dn_dip.push(j); }
+                }
+                if q < 1.0 { continue; }                       // 已达标/无需补
+                info!("[ACCUM {mode}] {} 补{side}#{j}(ask{side_ask:.3}≤{lv:.2}) 计算×{q:.0}份 T-{seconds_left}s",
+                    market.title);
+                self.accum_buy(market, side, side_ask, q, "accum_dip", price_to_beat).await?;
+                let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
+                if wm >= target && wo >= -maxloss {
+                    if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
+                    info!("[ACCUM {mode}] {} 盈亏锁住,停止下单裸持 T-{seconds_left}s", market.title);
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 当前两个结算情景的 PnL:返回 (主腿方向赢, 主腿方向输)。
+    /// 主腿赢 = 主腿份额 − 总成本;主腿输 = 对侧份额 − 总成本(含费)。
+    fn accum_pnl(&mut self, slug: &str, end_ts: i64, main_dir: &str) -> (f64, f64) {
+        let pos = self.state.get_or_create(slug, end_ts);
+        let (m, o) = if main_dir == "Up" {
+            (pos.up_shares, pos.down_shares)
+        } else {
+            (pos.down_shares, pos.up_shares)
+        };
+        let t = pos.up_cost_total + pos.down_cost_total;
+        (m - t, o - t)
+    }
+
+    /// 计算模块:补 `side` 边到对应目标所需的份额(向上取整,≤0 返回 0)。
+    /// 补 side 边后该边结算指标 = (side份额−总成本) + q·(1−fc(价));令其=目标解 q。
+    /// side==主腿 → 目标=target(主腿赢);side==对侧 → 目标=−maxloss(主腿输)。
+    fn accum_calc_qty(&mut self, slug: &str, end_ts: i64, main_dir: &str, side: &str,
+                      price: f64, target: f64, maxloss: f64) -> f64 {
+        let pos = self.state.get_or_create(slug, end_ts);
+        let t = pos.up_cost_total + pos.down_cost_total;
+        let side_sh = if side == "Up" { pos.up_shares } else { pos.down_shares };
+        let denom = 1.0 - full_cost_per_share(price);
+        if denom <= 0.001 { return 0.0; }                      // 价格过高,补也无效
+        let goal = if side == main_dir { target } else { -maxloss };
+        let cur = side_sh - t;                                 // 该边当前结算指标
+        ((goal - cur) / denom).max(0.0).round()
+    }
+
+    /// accum 专用下单 + 双轨记账(FAK,能成多少成多少;补仓份额可变,不按金额买超)。
+    async fn accum_buy(&mut self, market: &Market, dir: &str, price: f64, shares: f64,
+                       label: &str, price_to_beat: f64) -> Result<()> {
+        let Some(token) = market.token_for(dir) else {
+            warn!("[ACCUM] {} 找不到 {dir} 的 token_id,跳过", market.title);
+            return Ok(());
+        };
+        let fill = match self.executor.buy_fak(token, price, shares, None).await {
+            Ok(f) => f,
+            Err(e) => { warn!("[ACCUM ORDER ERR] {} {dir} {label}: {e:#}", market.title); return Ok(()); }
+        };
+        if !fill.simulated {
+            info!("[ACCUM ORDER] {} {dir} {label} id={} status={} ok={} 成交{:.1}份@{:.3}",
+                market.title, fill.order_id, fill.status, fill.success, fill.filled_shares, fill.filled_price);
+        }
+        // A轨 影子账(仅实盘)
+        if !self.config.dry_run {
+            record_trade(&mut self.ideal_state, market, dir, price, shares, label, price_to_beat, false);
+            self.ideal_state.save().await?;
+        }
+        // B轨 真实账:只记真正成交的份额
+        if !fill.success || fill.filled_shares <= 0.0 { return Ok(()); }
+        let (rp, rs) = (fill.filled_price, fill.filled_shares);
+        self.write_signal(&serde_json::json!({
+            "phase": label, "market": market.slug,
+            "direction": dir, "price": rp, "shares": rs,
+            "full_cost": full_cost_per_share(rp),
+            "dry_run": self.config.dry_run, "ts": chrono::Utc::now().timestamp(),
+        })).await?;
+        record_trade(&mut self.state, market, dir, rp, rs, label, price_to_beat, false);
+        self.state.save().await?;
         Ok(())
     }
 
