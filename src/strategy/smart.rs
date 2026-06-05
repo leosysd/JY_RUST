@@ -790,11 +790,20 @@ impl SmartStrategy {
             if let Some(l) = self.accum.get_mut(&market.slug) { l.main_filled_levels.push(i); }
         }
 
-        // ② 反方向:ask≤阶梯价 且 该阶梯未买过 → 补一笔(逢低)。限价封在阶梯价,不追高。
+        // ② 反方向对冲:ask≤阶梯价 且 该阶梯未买过 → 补一笔。限价封在阶梯价,不追高。
         for (i, &lvl) in hedge_levels.iter().enumerate() {
             if leg.hedge_filled_levels.contains(&i) { continue; }
             if hedge_ask > lvl { continue; }
             let pos = self.state.get_or_create(&market.slug, market.end_ts).clone();
+            // 平衡上限:对冲份额补到与主腿相等即止,绝不反向超买。否则对侧便宜时会一路
+            // 抄到对冲份额远超主腿,仓位从"押主腿方向"翻转成"反押对侧"(押反 z 方向),
+            // worst 一路砸到 max_loss。补到 50/50 平衡即锁套利,这才是对冲(保险)的本分。
+            let (main_sh, hedge_sh) = if main_dir == "Up" {
+                (pos.up_shares, pos.down_shares)
+            } else {
+                (pos.down_shares, pos.up_shares)
+            };
+            if hedge_sh >= main_sh { break; }
             let cur_worst = pos.worst_pnl();
             let new_worst = pos.worst_pnl_if_add(hedge_dir, hedge_ask, qty);
             if new_worst < cur_worst && new_worst < max_loss {
