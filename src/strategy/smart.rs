@@ -791,26 +791,34 @@ impl SmartStrategy {
             }
         }
 
-        // ② 谁跌补谁(计算模块):Up/Down 两边,ask≤补档且未补过 → 算份额补
+        // ② 谁跌补谁(计算模块):Up/Down 两边,ask≤补档且未补过 → 分笔补。
+        //    每笔最多 qty(20)份、最后一笔补不足 20 的零头,笔间隔 500ms。
+        //    每笔后重算需求(动态收敛):实盘 FAK 单笔小好成交,部分成交下一笔自动补足。
         for side in ["Up", "Down"] {
             let side_ask = if side == "Up" { up_ask } else { dn_ask };
             let dipped = if side == "Up" { &up_dip } else { &dn_dip };
             for (j, &lv) in dip.iter().enumerate() {
                 if dipped.contains(&j) || side_ask > lv { continue; }
-                // 计算模块:补 side 到目标(主腿边→主腿赢=target;对侧→主腿输=−maxloss)
-                let q = self.accum_calc_qty(&market.slug, market.end_ts, &main_dir, side, side_ask, target, maxloss);
                 if let Some(l) = self.accum.get_mut(&market.slug) {
                     if side == "Up" { l.up_dip.push(j); } else { l.dn_dip.push(j); }
                 }
-                if q < 1.0 { continue; }                       // 已达标/无需补
-                info!("[ACCUM {mode}] {} 补{side}#{j}(ask{side_ask:.3}≤{lv:.2}) 计算×{q:.0}份 T-{seconds_left}s",
-                    market.title);
-                self.accum_buy(market, side, side_ask, q, "accum_dip", price_to_beat).await?;
-                let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
-                if wm >= target && wo >= -maxloss {
-                    if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
-                    info!("[ACCUM {mode}] {} 盈亏锁住,停止下单裸持 T-{seconds_left}s", market.title);
-                    return Ok(());
+                // 分笔补:循环算"还差多少到达标",每笔补 min(剩余, 20),笔间隔 500ms。
+                for _step in 0..50 {                           // 上限50笔(1000份),防异常死循环
+                    let need = self.accum_calc_qty(&market.slug, market.end_ts, &main_dir, side, side_ask, target, maxloss);
+                    if need < 1.0 { break; }                   // 已达标/无需再补
+                    let this = need.min(qty);                  // 每笔最多20,最后一笔=零头
+                    info!("[ACCUM {mode}] {} 补{side}#{j}(ask{side_ask:.3}≤{lv:.2}) ×{this:.0}份(剩需{need:.0}) T-{seconds_left}s",
+                        market.title);
+                    self.accum_buy(market, side, side_ask, this, "accum_dip", price_to_beat).await?;
+                    let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
+                    if wm >= target && wo >= -maxloss {
+                        if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
+                        info!("[ACCUM {mode}] {} 盈亏锁住,停止下单裸持 T-{seconds_left}s", market.title);
+                        return Ok(());
+                    }
+                    if need > qty {                            // 还要补,等 500ms 让盘口恢复
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
                 }
             }
         }
