@@ -818,31 +818,28 @@ impl SmartStrategy {
     }
 
     /// 当前两个结算情景的 PnL:返回 (主腿方向赢, 主腿方向输)。
-    /// 主腿赢 = 主腿份额 − 总成本;主腿输 = 对侧份额 − 总成本(含费)。
+    /// 用户口径(输方归零只损本金):直接复用 position 的 pnl_if_*_wins。
     fn accum_pnl(&mut self, slug: &str, end_ts: i64, main_dir: &str) -> (f64, f64) {
         let pos = self.state.get_or_create(slug, end_ts);
-        let (m, o) = if main_dir == "Up" {
-            (pos.up_shares, pos.down_shares)
+        if main_dir == "Up" {
+            (pos.pnl_if_up_wins(), pos.pnl_if_down_wins())
         } else {
-            (pos.down_shares, pos.up_shares)
-        };
-        let t = pos.up_cost_total + pos.down_cost_total;
-        (m - t, o - t)
+            (pos.pnl_if_down_wins(), pos.pnl_if_up_wins())
+        }
     }
 
-    /// 计算模块:补 `side` 边到对应目标所需的份额(向上取整,≤0 返回 0)。
-    /// 补 side 边后该边结算指标 = (side份额−总成本) + q·(1−fc(价));令其=目标解 q。
+    /// 计算模块:补 `side` 边到对应目标所需的份额(向上取整补够,≤0 返回 0)。
+    /// 补 side 边后"该边赢"的结算指标 += q·(1−fc(价));令其=目标解 q。
+    /// 指标 = pnl_if_<side>_wins(用户口径:该边含费、对侧只本金)。
     /// side==主腿 → 目标=target(主腿赢);side==对侧 → 目标=−maxloss(主腿输)。
     fn accum_calc_qty(&mut self, slug: &str, end_ts: i64, main_dir: &str, side: &str,
                       price: f64, target: f64, maxloss: f64) -> f64 {
         let pos = self.state.get_or_create(slug, end_ts);
-        let t = pos.up_cost_total + pos.down_cost_total;
-        let side_sh = if side == "Up" { pos.up_shares } else { pos.down_shares };
+        let cur = if side == "Up" { pos.pnl_if_up_wins() } else { pos.pnl_if_down_wins() };
         let denom = 1.0 - full_cost_per_share(price);
         if denom <= 0.001 { return 0.0; }                      // 价格过高,补也无效
         let goal = if side == main_dir { target } else { -maxloss };
-        let cur = side_sh - t;                                 // 该边当前结算指标
-        ((goal - cur) / denom).max(0.0).round()
+        ((goal - cur) / denom).max(0.0).ceil()                 // ceil 补够,不让 round 少补
     }
 
     /// accum 专用下单 + 双轨记账(FAK,能成多少成多少;补仓份额可变,不按金额买超)。

@@ -58,10 +58,16 @@ pub struct MarketPosition {
     // Up 仓位
     pub up_shares: f64,
     pub up_cost_total: f64,   // 含手续费总成本
+    /// Up 本金(price×shares,不含费)。用户口径:输方归零只损本金、不扣手续费,
+    /// 故"对侧赢"时用本金、不用含费成本。serde default 兼容旧 state。
+    #[serde(default)]
+    pub up_principal: f64,
 
     // Down 仓位
     pub down_shares: f64,
     pub down_cost_total: f64,
+    #[serde(default)]
+    pub down_principal: f64,
 
     pub trades: Vec<TradeRecord>,
     pub phase: Phase,
@@ -99,26 +105,28 @@ impl MarketPosition {
 
     /// 添加一笔交易
     pub fn add_trade(&mut self, trade: TradeRecord) {
+        let principal = trade.price * trade.shares;   // 本金(不含费)
         if trade.side == "Up" {
             self.up_shares += trade.shares;
             self.up_cost_total += trade.total_cost;
+            self.up_principal += principal;
         } else {
             self.down_shares += trade.shares;
             self.down_cost_total += trade.total_cost;
+            self.down_principal += principal;
         }
         self.trades.push(trade);
     }
 
-    /// 如果 Up 赢，当前已有仓位的 PnL
+    /// 如果 Up 赢：Up 兑付得含费收益(up_shares − up_cost_total) − Down 输了的本金。
+    /// 用户口径:Down 归零只损本金(down_principal),不扣 Down 的手续费。
     pub fn pnl_if_up_wins(&self) -> f64 {
-        self.up_shares * (1.0 - self.up_avg_full())
-            - self.down_cost_total
+        (self.up_shares - self.up_cost_total) - self.down_principal
     }
 
-    /// 如果 Down 赢，当前已有仓位的 PnL
+    /// 如果 Down 赢：对称——Down 含费收益 − Up 本金。
     pub fn pnl_if_down_wins(&self) -> f64 {
-        self.down_shares * (1.0 - self.down_avg_full())
-            - self.up_cost_total
+        (self.down_shares - self.down_cost_total) - self.up_principal
     }
 
     /// 当前最坏情形 PnL（无论谁赢都取较差那个）
@@ -126,21 +134,20 @@ impl MarketPosition {
         self.pnl_if_up_wins().min(self.pnl_if_down_wins())
     }
 
-    /// 假设再买 `shares` 份 `side` 方向（价格 `price`），最坏情形 PnL 会变成多少
+    /// 假设再买 `shares` 份 `side` 方向（价格 `price`），最坏情形 PnL 会变成多少。
+    /// 用户口径:赢方含费、输方只本金。
     pub fn worst_pnl_if_add(&self, side: &str, price: f64, shares: f64) -> f64 {
-        let full_c = full_cost_per_share(price);
-        let cost   = full_c * shares;
-        let (us, uc, ds, dc) = if side == "Up" {
-            (self.up_shares + shares, self.up_cost_total + cost,
-             self.down_shares,        self.down_cost_total)
+        let cost      = full_cost_per_share(price) * shares;  // 含费
+        let principal = price * shares;                       // 本金
+        let (us, uc, upr, ds, dc, dpr) = if side == "Up" {
+            (self.up_shares + shares, self.up_cost_total + cost, self.up_principal + principal,
+             self.down_shares, self.down_cost_total, self.down_principal)
         } else {
-            (self.up_shares,   self.up_cost_total,
-             self.down_shares + shares, self.down_cost_total + cost)
+            (self.up_shares, self.up_cost_total, self.up_principal,
+             self.down_shares + shares, self.down_cost_total + cost, self.down_principal + principal)
         };
-        let ua = if us > 0.0 { uc / us } else { 0.0 };
-        let da = if ds > 0.0 { dc / ds } else { 0.0 };
-        let pnl_up  = us * (1.0 - ua) - dc;
-        let pnl_dn  = ds * (1.0 - da) - uc;
+        let pnl_up = (us - uc) - dpr;   // Up赢:Up含费收益 − Down本金
+        let pnl_dn = (ds - dc) - upr;   // Down赢:Down含费收益 − Up本金
         pnl_up.min(pnl_dn)
     }
 }
