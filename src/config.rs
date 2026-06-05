@@ -93,8 +93,12 @@ pub struct Config {
     pub accum_qty: f64,
     /// 台阶步长(美元):BTC 每朝主方向走此值 → 一个新台阶 → 加一笔主腿。
     pub accum_step_usd: f64,
-    /// 对冲腿买入上限:仅当对侧 ask≤此值才在该台阶补对冲腿。
+    /// 对冲腿买入上限(严格 <):对侧 ask 跌破此值即补对冲腿(独立于主腿台阶)。
     pub accum_hedge_max_ask: f64,
+    /// 对冲腿加仓步长:对侧 ask 每再跌此值补下一笔(越低买越多)。
+    pub accum_hedge_step: f64,
+    /// 主腿盈利封顶:主腿"赢的毛 PnL(份额−成本)"跨过此值即停止加主腿(锁定赢约此值)。
+    pub accum_target_win: f64,
     /// 第一笔定方向阈值:|z|≥此值才开第一笔主腿(锁定方向)。
     pub accum_entry_z: f64,
     /// 临近结算停建:剩余秒≤此值不再加仓(已建仓裸持)。
@@ -255,6 +259,8 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_qty: env_f64("ACCUM_QTY", 20.0),
         accum_step_usd: env_f64("ACCUM_STEP_USD", 10.0),
         accum_hedge_max_ask: env_f64("ACCUM_HEDGE_MAX_ASK", 0.35),
+        accum_hedge_step: env_f64("ACCUM_HEDGE_STEP", 0.05),
+        accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
         accum_entry_z: env_f64("ACCUM_ENTRY_Z", 0.15),
         accum_force_seconds: env_i64("ACCUM_FORCE_SECONDS", 15),
         poll_ms: env_u64("POLL_MS", 200),
