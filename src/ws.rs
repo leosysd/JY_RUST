@@ -60,12 +60,12 @@ impl MarketWs {
                 match ws.connect_once().await {
                     Ok(true)  => info!("[WS] 新token触发重连"),
                     Ok(false) => {
-                        info!("[WS] 连接关闭，3s后重连");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        info!("[WS] 连接关闭，0.5s后重连");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     }
                     Err(e) => {
-                        warn!("[WS] 错误: {e}，3s后重连");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        warn!("[WS] 错误: {e}，0.5s后重连");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     }
                 }
             }
