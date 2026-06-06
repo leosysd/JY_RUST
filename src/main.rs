@@ -38,6 +38,8 @@ async fn main() -> Result<()> {
         config.ev_solo_qty
     } else if config.entry_strategy == "sniper" {
         config.sniper_qty
+    } else if config.entry_strategy == "accum" {
+        config.accum_qty
     } else {
         config.order_shares.to_string().parse::<f64>().unwrap_or(20.0)
     };

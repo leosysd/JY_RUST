@@ -163,6 +163,12 @@ const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
     ("QUANT_ORDER_SHARES",    "每笔下单份数(与EV_SOLO_QTY同步)",   "20"),
     ("TREND_CHASE_MAX_PRICE", "zscore 追单价格上限",               "0.60"),
     ("LOCK_MIN_PROFIT_FACTOR","zscore 锁利门槛系数(×份额)",        "0.2"),
+    ("ACCUM_ENTRY_Z",         "accum 首笔定方向阈值(|z|≥才开主腿)", "0.15"),
+    ("ACCUM_CHASE_LEVELS",    "accum 追涨档(逗号分隔,谁涨追谁)",    "0.62,0.65,0.68,0.70"),
+    ("ACCUM_DIP_LEVELS",      "accum 补仓档(逗号分隔,谁跌补谁)",    "0.25,0.20"),
+    ("ACCUM_TARGET_WIN",      "accum 主腿赢目标PnL(补到≥此值)",    "12"),
+    ("ACCUM_MAX_LOSS",        "accum 主腿输最大亏损(补到≥−此值)",  "7"),
+    ("ACCUM_FORCE_SECONDS",   "accum 临结算停建线(剩余≤此秒不下单)", "15"),
 ];
 
 /// 打印所有可调参数的当前值（未设置则显示默认）。
@@ -767,11 +773,11 @@ fn set_env_raw(key: &str, val: &str) {
 /// 所有 CLI 写入路径(setup 向导 / set-param / 交互菜单)都经过本函数,一处覆盖全部。
 fn set_env_val(key: &str, val: &str) {
     set_env_raw(key, val);
-    // 份数三键(EV_SOLO_QTY / QUANT_ORDER_SHARES / SNIPER_QTY)始终同步为同值,
+    // 份数四键(EV_SOLO_QTY / QUANT_ORDER_SHARES / SNIPER_QTY / ACCUM_QTY)始终同步为同值,
     // 保证不管当前用哪个策略,CLI 设多少系统就下多少。
     match key {
-        "EV_SOLO_QTY" | "QUANT_ORDER_SHARES" | "SNIPER_QTY" => {
-            for k in ["EV_SOLO_QTY", "QUANT_ORDER_SHARES", "SNIPER_QTY"] {
+        "EV_SOLO_QTY" | "QUANT_ORDER_SHARES" | "SNIPER_QTY" | "ACCUM_QTY" => {
+            for k in ["EV_SOLO_QTY", "QUANT_ORDER_SHARES", "SNIPER_QTY", "ACCUM_QTY"] {
                 if k != key { set_env_raw(k, val); }
             }
         }
