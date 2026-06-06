@@ -90,6 +90,8 @@ pub struct AccumLeg {
     pub dn_dip: Vec<usize>,
     /// 盈亏已锁住(两个结算情景都达标)→ 停止一切下单。
     pub locked: bool,
+    /// 晚场顺势补救已触发过(每盘只补救一次)。
+    pub rescued: bool,
 }
 
 /// 读 model.txt 的修改时间(unix 秒);不存在则 0。用于热重载判新。
@@ -747,7 +749,7 @@ impl SmartStrategy {
             self.accum.insert(market.slug.clone(), AccumLeg {
                 main_dir: dir.to_string(),
                 up_chase: Vec::new(), dn_chase: Vec::new(),
-                up_dip: Vec::new(), dn_dip: Vec::new(), locked: false,
+                up_dip: Vec::new(), dn_dip: Vec::new(), locked: false, rescued: false,
             });
             return Ok(());
         }
@@ -818,6 +820,38 @@ impl SmartStrategy {
                     }
                     if need > qty {                            // 还要补,等 500ms 让盘口恢复
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
+
+        // ③ 晚场顺势补救:临结算(剩余<rescue_secs)、尚未锁住、某边 ask 进收敛带(0.78-0.83)。
+        //    机理(6/6 实盘 DRY_RUN 回测):未锁盘到此无一不收敛,该边即结算赢家概率≈88%。
+        //    顺势补强势边到"该边赢结算 PnL >rescue_goal",一次性补到位(cap 不限),每盘只补一次。
+        //    注意这是放大下注(正 EV×杠杆):命中赚、翻盘亏更大,靠 88% 命中率支撑——多天验证为先。
+        if !leg.rescued && seconds_left < self.config.accum_rescue_secs {
+            let (lo, hi) = (self.config.accum_rescue_lo, self.config.accum_rescue_hi);
+            let fired = if up_ask > lo && up_ask < hi { Some(("Up", up_ask)) }
+                        else if dn_ask > lo && dn_ask < hi { Some(("Down", dn_ask)) }
+                        else { None };
+            if let Some((side, p)) = fired {
+                if let Some(l) = self.accum.get_mut(&market.slug) { l.rescued = true; }   // 每盘只补救一次
+                let denom = 1.0 - full_cost_per_share(p);
+                if denom > 0.001 {
+                    let cur = {
+                        let pos = self.state.get_or_create(&market.slug, market.end_ts);
+                        if side == "Up" { pos.pnl_if_up_wins() } else { pos.pnl_if_down_wins() }
+                    };
+                    let need = ((self.config.accum_rescue_goal - cur) / denom).max(0.0).ceil();
+                    if need >= 1.0 {
+                        info!("[ACCUM {mode}] {} 晚场补救:市场收敛,顺势补{side}@{p:.3}×{need:.0}份(该边赢→>{:.0}) T-{seconds_left}s",
+                            market.title, self.config.accum_rescue_goal);
+                        self.accum_buy(market, side, p, need, "accum_rescue", price_to_beat).await?;
+                        let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
+                        if wm >= target && wo >= -maxloss {
+                            if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
+                            info!("[ACCUM {mode}] {} 补救后盈亏锁住,停止下单裸持 T-{seconds_left}s", market.title);
+                        }
                     }
                 }
             }

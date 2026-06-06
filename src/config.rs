@@ -100,6 +100,13 @@ pub struct Config {
     pub accum_target_win: f64,
     /// 计算模块:主腿方向输的最大亏损(补到结算 PnL ≥ −此值)。
     pub accum_max_loss: f64,
+    /// 晚场顺势补救:剩余秒<此值才触发(临结算市场已收敛区)。
+    pub accum_rescue_secs: i64,
+    /// 晚场补救收敛带下/上限:某边 ask∈(lo,hi) 视为"市场已选定该边"。
+    pub accum_rescue_lo: f64,
+    pub accum_rescue_hi: f64,
+    /// 晚场补救:顺势补强势边到"该边赢结算 PnL >此值"(cap 不限)。
+    pub accum_rescue_goal: f64,
 
     // 系统
     pub poll_ms: u64,
@@ -268,6 +275,10 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_dip_levels: env_f64_vec("ACCUM_DIP_LEVELS", "0.25,0.20"),
         accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
         accum_max_loss: env_f64("ACCUM_MAX_LOSS", 7.0),
+        accum_rescue_secs: env_i64("ACCUM_RESCUE_SECS", 100),
+        accum_rescue_lo: env_f64("ACCUM_RESCUE_LO", 0.78),
+        accum_rescue_hi: env_f64("ACCUM_RESCUE_HI", 0.83),
+        accum_rescue_goal: env_f64("ACCUM_RESCUE_GOAL", 10.0),
 
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
