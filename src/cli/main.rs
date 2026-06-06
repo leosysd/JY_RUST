@@ -110,8 +110,9 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
                 "zscore" | "z" => "zscore",
                 "ev_solo" | "ev" | "solo" => "ev_solo",
                 "sniper" | "snipe" | "s" => "sniper",
+                "accum" | "ac" | "a" => "accum",
                 other => {
-                    eprintln!("未知入场策略: {other}（可选 zscore | ev_solo | sniper）");
+                    eprintln!("未知入场策略: {other}（可选 zscore | ev_solo | sniper | accum）");
                     std::process::exit(1);
                 }
             };
@@ -203,7 +204,7 @@ fn interactive_menu() -> Result<()> {
             "7.  重启服务",
             "8.  查看实时日志",
             "9.  切换 DRY_RUN 模式",
-            "10. 切换入场策略（zscore / ev_solo / sniper）",
+            "10. 切换入场策略（zscore / ev_solo / sniper / accum）",
             "11. 调策略参数（sniper / ev_solo / 滑点 等）",
             "12. 清空模拟数据",
             "13. 更新程序（从 GitHub 拉取最新版本）",
@@ -343,10 +344,11 @@ fn toggle_entry_strategy() -> Result<()> {
             "zscore  - z-score 方向入场 + 锁利/追单/减险（baseline）",
             "ev_solo - z-score 定方向 + 纯单边裸持（开盘预测,已被sniper取代）",
             "sniper  - 延迟套利狙击:binance突破→抢盘口反应延迟（30天回测+5.7%,推荐）",
+            "accum   - z定主腿→谁涨追谁/谁跌补谁(计算模块)→赢≥12/亏≤7锁住即停",
         ])
-        .default(match curr.as_str() { "sniper" => 2, "ev_solo" => 1, _ => 0 })
+        .default(match curr.as_str() { "accum" => 3, "sniper" => 2, "ev_solo" => 1, _ => 0 })
         .interact()?;
-    let new_val = match choice { 2 => "sniper", 1 => "ev_solo", _ => "zscore" };
+    let new_val = match choice { 3 => "accum", 2 => "sniper", 1 => "ev_solo", _ => "zscore" };
     set_env_val("ENTRY_STRATEGY", new_val);
     println!("{} ENTRY_STRATEGY={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
