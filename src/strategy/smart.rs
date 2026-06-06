@@ -68,6 +68,8 @@ pub struct SmartStrategy {
     /// 上次结算检查的 unix 秒。决策主循环据此节流结算网络请求(见 SETTLEMENT_CHECK_INTERVAL),
     /// 让结算查询不再每 tick 阻塞、拖慢下一盘入场。
     pub last_settlement_check: i64,
+    /// 盘内 z 采集上次写入的 unix 秒(每秒最多记一条 z 快照,节流)。
+    pub z_last_ts: i64,
     /// LightGBM 影子模型(model/ 目录就绪时加载)。每盘记一条"模型预测 vs z vs 结果",
     /// 不参与下单;待影子胜率稳超 z 再接管。None=模型未训出,影子静默跳过。
     pub shadow: Option<crate::model::LgbModel>,
@@ -162,6 +164,7 @@ impl SmartStrategy {
             sniped_slugs: std::collections::HashSet::new(),
             primed_slugs: std::collections::HashSet::new(),
             last_settlement_check: 0,
+            z_last_ts: 0,
             shadow, model_dir, shadow_mtime,
             accum: std::collections::HashMap::new(),
         })
@@ -224,6 +227,25 @@ impl SmartStrategy {
         if seconds_left >= 240 && seconds_left <= 290 && !self.sampled_slugs.contains(&market.slug) {
             self.record_train_sample(&market, up_ask, dn_ask, seconds_left).await;
             self.sampled_slugs.insert(market.slug.clone());
+        }
+
+        // ── 盘内 z 采集(常驻,独立于策略;accum/sniper 在跑也照采)──────────────
+        // 每秒记一条真 z 快照(z/p_up/e/v/σ120 + 两边 ask),为"盘内便宜边+真z"回测攒数据。
+        // 现状只有开盘单点(entry_signal),盘内逐秒缺;这条补上,几天后才能验"盘内赢多亏少"。
+        if self.config.z_record_enabled && now > self.z_last_ts {
+            let pb = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
+            if pb >= 1000.0 && now >= market.start_ts {
+                if let Some(sig) = self.model.compute(pb, seconds_left) {
+                    self.z_last_ts = now;
+                    let rec = serde_json::json!({
+                        "phase":"z_tick","market":market.slug,"ts":now,
+                        "seconds_left":seconds_left,
+                        "z":sig.z,"p_up":sig.p_up,"e":sig.e,"v":sig.v,"sigma120":sig.sigma120,
+                        "up_ask":up_ask,"dn_ask":dn_ask,
+                    });
+                    self.write_signal(&rec).await?;
+                }
+            }
         }
 
         // 路线四：ev_solo 纯单边裸持（数学上唯一正期望路径）。

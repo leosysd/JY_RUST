@@ -117,6 +117,9 @@ pub struct Config {
     // ── 全盘口数据采集（与交易无关，常驻 WS 录制；按天分 JSONL）──────────────
     /// 是否开启 tick 级盘口录制（默认开）。安装后一启动即采集，不受 DRY_RUN 影响。
     pub book_record_enabled: bool,
+    /// 是否开启盘内 z 采集（默认开）。每秒记一条真 z 快照到 signals(phase=z_tick),
+    /// 为"盘内便宜边+真z"回测攒数据。独立于策略,不受 DRY_RUN/ENTRY_STRATEGY 影响。
+    pub z_record_enabled: bool,
     /// 录制输出目录：每天一个 quant_book-YYYYMMDD.jsonl
     pub book_record_dir: PathBuf,
     /// 旧版单文件逐秒盘口日志（quant_book.jsonl，仅当前盘）。默认关：已被 tick 采集器取代。
@@ -285,6 +288,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         signal_file: base.join(env("QUANT_SIGNAL_FILE", "data/quant_signals.jsonl")),
         log_file: base.join(env("LOG_FILE", "logs/jy-bot.log")),
         book_record_enabled: env_bool("BOOK_RECORD_ENABLED", true),
+        z_record_enabled: env_bool("Z_RECORD_ENABLED", true),
         book_record_dir: base.join(env("BOOK_RECORD_DIR", "data/books")),
         book_legacy_log_enabled: env_bool("BOOK_LEGACY_LOG_ENABLED", false),
     })
