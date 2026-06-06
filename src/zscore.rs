@@ -156,24 +156,32 @@ fn compute_basis60(now: i64, cl: &[PricePoint], bn: &[TradePoint]) -> f64 {
 }
 
 /// 最近120秒每秒价格变化的标准差。基于已取好的 Binance 快照切片,不再自行 snapshot。
+/// 开盘初期窗口太短(价格还没动开)会算出 σ≈0 被兜底成极小值,致 z=e/(σ√T) 虚高、
+/// 开盘 p_up 夸大(实测喊70%只赢57%)。故历史**时间跨度**不足60s时不信这点数据,用默认50。
+// 真实盘内 σ120 中位数≈4.4、均值5.1、90分位8.3(币安6/2-6/3实测16万点)。
+// 默认取 5(真实中位),不是旧注释拍的50(高估10倍)。开盘初期历史不足时用它,
+// 避免价格没动开→σ≈0被压成1.0→z虚高、p_up夸大(实测喊70%只赢57%)。
+const SIGMA120_DEFAULT: f64 = 5.0;
 fn compute_sigma120(now: i64, bn: &[TradePoint]) -> f64 {
     let cutoff = now - 120;
-    let prices: Vec<f64> = bn.iter()
-        .filter(|p| p.ts >= cutoff)
-        .map(|p| p.price)
+    let recent: Vec<&TradePoint> = bn.iter().filter(|p| p.ts >= cutoff).collect();
+
+    // 跨度不足(开盘初期)→σ估计失真,直接用默认,不靠假数据
+    let span = match (recent.first(), recent.last()) {
+        (Some(a), Some(b)) => b.ts - a.ts,
+        _ => 0,
+    };
+    if recent.len() < 3 || span < 60 { return SIGMA120_DEFAULT; }
+
+    let changes: Vec<f64> = recent.windows(2)
+        .map(|w| w[1].price - w[0].price)
         .collect();
-
-    if prices.len() < 3 { return 50.0; } // 默认50美元波动
-
-    let changes: Vec<f64> = prices.windows(2)
-        .map(|w| w[1] - w[0])
-        .collect();
-
     let mean = changes.iter().sum::<f64>() / changes.len() as f64;
     let variance = changes.iter()
         .map(|x| (x - mean).powi(2))
         .sum::<f64>() / changes.len() as f64;
-    variance.sqrt().max(1.0)
+    // 下限 2(真实10分位≈2.6),防极端平静盘把 σ 压到失真小值
+    variance.sqrt().max(2.0)
 }
 
 /// 标准正态分布 CDF（Abramowitz & Stegun 近似）
