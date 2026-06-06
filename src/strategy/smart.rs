@@ -793,7 +793,46 @@ impl SmartStrategy {
             }
         }
 
-        // ② 谁跌补谁(计算模块):Up/Down 两边,ask≤补档且未补过 → 分笔补。
+        // ② 晚场顺势补救(临结算收敛,优先于 dip):剩余<rescue_secs、未补救过、某边 ask 进收敛带
+        //    (0.78-0.83)→ 市场已选定该边(6/6回测:未锁盘到此无一不收敛,该边赢≈88%)。
+        //    分笔顺势补强势边到"该边赢结算>rescue_goal"(每笔20+零头,间隔500ms,动态重算),
+        //    补完即 locked 停手裸持——押定这边、不再 dip 补反向主腿(否则两边对冲互抵,见21:50盘bug)。
+        //    放大下注(正EV×杠杆):命中赚/翻盘亏更大,靠88%命中撑——多天验证为先。
+        if !leg.rescued && seconds_left < self.config.accum_rescue_secs {
+            let (lo, hi) = (self.config.accum_rescue_lo, self.config.accum_rescue_hi);
+            let fired = if up_ask > lo && up_ask < hi { Some(("Up", up_ask)) }
+                        else if dn_ask > lo && dn_ask < hi { Some(("Down", dn_ask)) }
+                        else { None };
+            if let Some((side, p)) = fired {
+                if let Some(l) = self.accum.get_mut(&market.slug) { l.rescued = true; }   // 每盘只补救一次
+                let denom = 1.0 - full_cost_per_share(p);
+                if denom > 0.001 {
+                    let goal = self.config.accum_rescue_goal;
+                    // 分笔补:每笔最多 qty,最后一笔零头,间隔 500ms,每笔后重算(部分成交自动补足)
+                    for _step in 0..50 {
+                        let cur = {
+                            let pos = self.state.get_or_create(&market.slug, market.end_ts);
+                            if side == "Up" { pos.pnl_if_up_wins() } else { pos.pnl_if_down_wins() }
+                        };
+                        let need = ((goal - cur) / denom).max(0.0).ceil();
+                        if need < 1.0 { break; }
+                        let this = need.min(qty);
+                        info!("[ACCUM {mode}] {} 晚场补救:顺势补{side}@{p:.3}×{this:.0}份(剩需{need:.0},该边赢→>{goal:.0}) T-{seconds_left}s",
+                            market.title);
+                        self.accum_buy(market, side, p, this, "accum_rescue", price_to_beat).await?;
+                        if need > qty {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+                // 押定强势边,停止一切后续下单裸持到结算(不再 dip 补反向主腿)
+                if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
+                info!("[ACCUM {mode}] {} 补救完成,押定{side}停止下单裸持 T-{seconds_left}s", market.title);
+                return Ok(());
+            }
+        }
+
+        // ③ 谁跌补谁(计算模块):Up/Down 两边,ask≤补档且未补过 → 分笔补。
         //    每笔最多 qty(20)份、最后一笔补不足 20 的零头,笔间隔 500ms。
         //    每笔后重算需求(动态收敛):实盘 FAK 单笔小好成交,部分成交下一笔自动补足。
         for side in ["Up", "Down"] {
@@ -825,37 +864,6 @@ impl SmartStrategy {
             }
         }
 
-        // ③ 晚场顺势补救:临结算(剩余<rescue_secs)、尚未锁住、某边 ask 进收敛带(0.78-0.83)。
-        //    机理(6/6 实盘 DRY_RUN 回测):未锁盘到此无一不收敛,该边即结算赢家概率≈88%。
-        //    顺势补强势边到"该边赢结算 PnL >rescue_goal",一次性补到位(cap 不限),每盘只补一次。
-        //    注意这是放大下注(正 EV×杠杆):命中赚、翻盘亏更大,靠 88% 命中率支撑——多天验证为先。
-        if !leg.rescued && seconds_left < self.config.accum_rescue_secs {
-            let (lo, hi) = (self.config.accum_rescue_lo, self.config.accum_rescue_hi);
-            let fired = if up_ask > lo && up_ask < hi { Some(("Up", up_ask)) }
-                        else if dn_ask > lo && dn_ask < hi { Some(("Down", dn_ask)) }
-                        else { None };
-            if let Some((side, p)) = fired {
-                if let Some(l) = self.accum.get_mut(&market.slug) { l.rescued = true; }   // 每盘只补救一次
-                let denom = 1.0 - full_cost_per_share(p);
-                if denom > 0.001 {
-                    let cur = {
-                        let pos = self.state.get_or_create(&market.slug, market.end_ts);
-                        if side == "Up" { pos.pnl_if_up_wins() } else { pos.pnl_if_down_wins() }
-                    };
-                    let need = ((self.config.accum_rescue_goal - cur) / denom).max(0.0).ceil();
-                    if need >= 1.0 {
-                        info!("[ACCUM {mode}] {} 晚场补救:市场收敛,顺势补{side}@{p:.3}×{need:.0}份(该边赢→>{:.0}) T-{seconds_left}s",
-                            market.title, self.config.accum_rescue_goal);
-                        self.accum_buy(market, side, p, need, "accum_rescue", price_to_beat).await?;
-                        let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
-                        if wm >= target && wo >= -maxloss {
-                            if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
-                            info!("[ACCUM {mode}] {} 补救后盈亏锁住,停止下单裸持 T-{seconds_left}s", market.title);
-                        }
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
