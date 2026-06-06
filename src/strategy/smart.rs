@@ -24,10 +24,13 @@ const TREND_ENTRY_MAX: f64 = 0.65;
 const TREND_STEP: f64 = 0.05;
 /// P4 最多追多少笔
 const MAX_TREND_TRADES: usize = 5;
-/// P4 追单允许 worst_pnl 最多恶化多少（超过就不追）
-const TREND_WORST_PNL_FLOOR: f64 = -30.0;
-/// P3 减险触发：单次买入须把 worst_pnl 改善至少这么多（避免每秒刷单）
-const REBALANCE_MIN_IMPROVE: f64 = 1.0;
+/// P4 追单允许 worst_pnl 最多恶化的下限 = −(order_shares × 此系数)。
+/// 必须随份额缩放:原设计份额5对应−30(系数6);若写死−30,份额改20后入场就−10、追1笔即撞墙,
+/// 追单瘫痪→利润跑不起来(份额20回测胜率从98%崩到43%、1s延迟转负)。
+const TREND_WORST_PNL_FLOOR_FACTOR: f64 = 6.0;
+/// P3 减险触发:单次买入须把 worst_pnl 改善 ≥ order_shares × 此系数(避免每秒刷单)。
+/// 同样随份额缩放:原设计份额5对应1.0(系数0.2)。
+const REBALANCE_MIN_IMPROVE_FACTOR: f64 = 0.2;
 /// 冷门彩票：临近结束时便宜边 ask ≤ 此价才买（下行受限于极低价）
 const LOTTERY_MAX_PRICE: f64 = 0.10;
 /// P3 微批份额 = order_shares / 4
@@ -371,6 +374,8 @@ impl SmartStrategy {
     ) -> Result<()> {
         let shares  = self.order_shares();
         let micro   = (shares / MICRO_DIVISOR).max(1.0);
+        let trend_floor   = -(shares * TREND_WORST_PNL_FLOOR_FACTOR);   // 追单天花板,随份额缩放
+        let rebalance_min = shares * REBALANCE_MIN_IMPROVE_FACTOR;      // 减险最小改善,随份额缩放
         let cur_worst = pos.worst_pnl();
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
 
@@ -452,7 +457,7 @@ impl SmartStrategy {
                 && main_ask <= self.config.trend_chase_max_price
             {
                 let p4_worst = pos.worst_pnl_if_add(main_dir, main_ask, shares);
-                if p4_worst >= TREND_WORST_PNL_FLOOR {
+                if p4_worst >= trend_floor {
                     info!(
                         "[SMART TREND {mode}] {} 追{main_dir}@{main_ask:.3} ×{shares:.0}份（第{}/{}笔）worst={p4_worst:+.2}  T-{seconds_left}s",
                         market.title, trade_count + 1, MAX_TREND_TRADES
@@ -460,7 +465,7 @@ impl SmartStrategy {
                     self.do_buy(&market, main_dir, main_ask, shares, "trend_chase", pos.price_to_beat).await?;
                     return Ok(());
                 }
-                debug!("[SMART] {} 趋势追单会使worst={p4_worst:+.2} < 下限{TREND_WORST_PNL_FLOOR}，跳过",
+                debug!("[SMART] {} 趋势追单会使worst={p4_worst:+.2} < 下限{trend_floor:.1}，跳过",
                     market.title);
             }
         }
@@ -469,7 +474,7 @@ impl SmartStrategy {
         // 合并了原"便宜保险"：对边便宜本就让 worst 改善更多，统一走这里。
         if seconds_left > ENTRY_MIN_SECONDS_LEFT && trend_dir != Some(main_dir) {
             let p3_worst = pos.worst_pnl_if_add(opp_dir, opp_ask, micro);
-            if p3_worst - cur_worst >= REBALANCE_MIN_IMPROVE {
+            if p3_worst - cur_worst >= rebalance_min {
                 info!(
                     "[SMART HEDGE {mode}] {} 趋势转向，减险买{opp_dir}@{opp_ask:.3} ×{micro:.0}份  worst {cur_worst:+.2}→{p3_worst:+.2}  T-{seconds_left}s",
                     market.title
