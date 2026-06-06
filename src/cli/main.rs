@@ -864,12 +864,19 @@ fn update_bot() -> Result<()> {
 
     println!("{} 安装并重启服务...", style("[4/4]").cyan());
     let bin_dir = format!("{INSTALL_DIR}/target/release");
-    let _ = std::process::Command::new("sudo")
-        .args(["cp", &format!("{bin_dir}/jy-bot"), "/usr/local/bin/jy-bot"])
-        .status();
-    let _ = std::process::Command::new("sudo")
-        .args(["cp", &format!("{bin_dir}/jy"), "/usr/local/bin/jy"])
-        .status();
+    // 原子替换:cp 到 .new 临时文件 → mv -f 覆盖。
+    // 关键:update 是用正在运行的 jy 跑的,直接 cp 覆盖 /usr/local/bin/jy 会
+    // "Text file busy"。mv(rename)不截断目标,能替换正在运行的二进制,彻底避坑。
+    let ok_bot = install_bin(&format!("{bin_dir}/jy-bot"), "/usr/local/bin/jy-bot");
+    let ok_cli = install_bin(&format!("{bin_dir}/jy"), "/usr/local/bin/jy");
+    if !ok_bot || !ok_cli {
+        println!("  {} 二进制安装失败,服务仍用旧版本重启,请人工检查", style("✖").red());
+        let _ = std::process::Command::new("sudo")
+            .args(["systemctl", "start", SERVICE])
+            .status();
+        return Ok(());
+    }
+    println!("  {} 二进制已原子替换", style("✔").green());
 
     let _ = std::process::Command::new("sudo")
         .args(["systemctl", "start", SERVICE])
@@ -887,6 +894,27 @@ fn update_bot() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 原子安装一个二进制:sudo cp src→dst.new,再 sudo mv -f dst.new→dst。
+/// 用 mv(rename)而非直接 cp,以替换"正在运行"的二进制(避免 Text file busy)。
+/// 任一步失败返回 false(不再静默吞错)。
+fn install_bin(src: &str, dst: &str) -> bool {
+    let tmp = format!("{dst}.new");
+    let copied = std::process::Command::new("sudo")
+        .args(["cp", src, &tmp]).status();
+    if !matches!(copied, Ok(s) if s.success()) {
+        println!("  {} 复制失败: {src} → {tmp}", style("✖").red());
+        return false;
+    }
+    let moved = std::process::Command::new("sudo")
+        .args(["mv", "-f", &tmp, dst]).status();
+    if !matches!(moved, Ok(s) if s.success()) {
+        println!("  {} 替换失败: {tmp} → {dst}", style("✖").red());
+        let _ = std::process::Command::new("sudo").args(["rm", "-f", &tmp]).status();
+        return false;
+    }
+    true
 }
 
 trait StrExt {
