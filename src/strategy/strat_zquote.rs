@@ -31,7 +31,7 @@ impl SmartStrategy {
         let dir: String = if let Some(d) = self.zquote_dir.get(&market.slug) {
             d.clone()
         } else {
-            let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
+            let Some(sig) = self.model.compute(price_to_beat, seconds_left, crate::zscore::DirSource::Chainlink) else { return Ok(()); };
             let Some(d) = sig.direction() else {
                 debug!("[ZQUOTE] {} z={:.3} 信号不足,不挂", market.title, sig.z);
                 return Ok(());

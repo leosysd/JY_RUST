@@ -75,6 +75,17 @@ pub struct Config {
     /// 依据实测 flow_imb_30 一致59%/矛盾51%(目前最强方向单信号,AUC 0.528)。默认开。
     pub ev_solo_flow_gate: bool,
 
+    // ── zscore 隔离参数(与 ev_solo 完全独立,改这里不影响 ev_solo/accum/zquote)──────
+    /// zscore 方向公式开关:true=币安驱动(新,现价基差校正相对开盘价 + 币安动量);
+    /// false=Chainlink 混合(原公式,与 ev_solo/accum/zquote 一致)。默认 true。
+    pub zscore_use_binance_dir: bool,
+    /// zscore 入场价带/时间门槛/flow闸。默认值同 ev_solo,但单独可调,互不串。
+    /// 注意:zscore 份额仍用全局 order_shares(QUANT_ORDER_SHARES),不单设。
+    pub zscore_min_ask: f64,
+    pub zscore_max_ask: f64,
+    pub zscore_min_seconds_left: i64,
+    pub zscore_flow_gate: bool,
+
     // ── 路线五:sniper 延迟套利狙击 ──────────────────────────────────────
     // 盘内监控 binance,BTC 相对开盘价(或 N 秒窗口)动够阈值即定方向;仅当
     // Polymarket 对应方向盘口还没反应(ask<max)时 FOK 买入、裸持。赚盘口反应延迟。
@@ -281,6 +292,12 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         ev_solo_qty: env_f64("EV_SOLO_QTY", 20.0),
         ev_solo_min_seconds_left: env_i64("EV_SOLO_MIN_SECONDS_LEFT", 240),
         ev_solo_flow_gate: env_bool("EV_SOLO_FLOW_GATE", true),
+        // zscore 隔离参数:默认与 ev_solo 一致,但独立可调(份额仍走全局 order_shares)。
+        zscore_use_binance_dir: env_bool("ZSCORE_USE_BINANCE_DIR", true),
+        zscore_min_ask: env_f64("ZSCORE_MIN_ASK", 0.44),
+        zscore_max_ask: env_f64("ZSCORE_MAX_ASK", 0.52),
+        zscore_min_seconds_left: env_i64("ZSCORE_MIN_SECONDS_LEFT", 240),
+        zscore_flow_gate: env_bool("ZSCORE_FLOW_GATE", true),
         sniper_move_usd: env_f64("SNIPER_MOVE_USD", 20.0),
         sniper_window_sec: env_i64("SNIPER_WINDOW_SEC", 0),
         sniper_max_ask: env_f64("SNIPER_MAX_ASK", 0.62),

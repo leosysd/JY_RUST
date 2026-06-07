@@ -261,7 +261,8 @@ impl SmartStrategy {
         if self.config.z_record_enabled && now > self.z_last_ts {
             let pb = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
             if pb >= 1000.0 && now >= market.start_ts {
-                if let Some(sig) = self.model.compute(pb, seconds_left) {
+                // 盘内 z 快照沿用原 Chainlink 公式(与历史 z_tick 口径一致)。
+                if let Some(sig) = self.model.compute(pb, seconds_left, crate::zscore::DirSource::Chainlink) {
                     self.z_last_ts = now;
                     let rec = serde_json::json!({
                         "phase":"z_tick","market":market.slug,"ts":now,

@@ -10,6 +10,16 @@ const MOM_WIN_LONG: i64 = 5;
 const MOM_W_SHORT: f64 = 0.60;
 const MOM_W_LONG: f64 = 0.30;
 
+/// 方向公式来源：决定 compute() 用哪套预期偏移 E。隔离用——zscore 可独立选 Binance，
+/// 而 ev_solo/accum/zquote 仍走 Chainlink 原公式，互不影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirSource {
+    /// 币安驱动（新）：现价基差校正后相对开盘价 + 币安动量。
+    Binance,
+    /// Chainlink 混合（原公式）：Chainlink 水平(ct−B) + 币安动量 + Chainlink动量 + 基差回归。
+    Chainlink,
+}
+
 /// z-score 方向信号
 #[derive(Debug, Clone)]
 pub struct ZSignal {
@@ -82,7 +92,8 @@ impl ZScoreModel {
     /// 计算当前 z-score 信号
     /// price_to_beat: 本轮开盘时的 Chainlink 价格 (B)
     /// seconds_left: 距结算剩余秒数
-    pub fn compute(&self, price_to_beat: f64, seconds_left: i64) -> Option<ZSignal> {
+    /// dir_src: 方向公式来源（zscore 可用 Binance；其他策略传 Chainlink 保持原公式）
+    pub fn compute(&self, price_to_beat: f64, seconds_left: i64, dir_src: DirSource) -> Option<ZSignal> {
         let now = chrono::Utc::now().timestamp();
 
         // 一次性取两路历史快照,后续所有派生量(latest/at_ts/basis60/sigma120)都复用这两个本地数组,
@@ -112,16 +123,32 @@ impl ZScoreModel {
         let mom_short = momentum::momentum_on(&bn_snap, now, MOM_WIN_SHORT).unwrap_or(0.0);
         let mom_long  = momentum::momentum_on(&bn_snap, now, MOM_WIN_LONG).unwrap_or(0.0);
 
-        // 预期偏移 E —— 方向信号全部改由「币安」驱动(tick级、实时,比 Chainlink 灵敏)。
-        // 开盘基准价 B(price_to_beat)仍用 Chainlink,保证与市场结算口径对齐。
-        // xt_adj = 币安现价经基差校正到 Chainlink 口径(basis60≈xt−ct),
-        // 这样"相对开盘价的漂移"用币安现价算,又不会和 Chainlink 开盘价串了口径。
-        // 原 Chainlink 动量项(ct−ct_2)与单独的基差回归项已并入此处,不再单列;
-        // 动量已抽到 momentum 模块,各策略可经 binance_momentum() 复用同一定义。
-        let xt_adj = xt - basis60;
-        let e = (xt_adj - price_to_beat)        // 币安现价(基差校正) − Chainlink 开盘价
-            + MOM_W_SHORT * mom_short           // 币安短窗动量(默认 2s)
-            + MOM_W_LONG  * mom_long;           // 币安长窗动量(默认 5s)
+        // 预期偏移 E —— 按 dir_src 选公式,两套各自独立(隔离):
+        //   Binance(zscore新): 币安现价(基差校正)相对 Chainlink 开盘价 + 币安动量。
+        //                      开盘价 B 仍用 Chainlink,与结算对齐;xt_adj=xt−basis60 换算口径。
+        //   Chainlink(原公式): Chainlink 水平(ct−B)+币安动量+Chainlink动量(ct−ct_2)+基差回归。
+        // 两路都复用上面的 mom_short/mom_long(币安动量,经 momentum 模块);Chainlink 路另算 ct_2。
+        let e = match dir_src {
+            DirSource::Binance => {
+                let xt_adj = xt - basis60;
+                (xt_adj - price_to_beat)
+                    + MOM_W_SHORT * mom_short
+                    + MOM_W_LONG * mom_long
+            }
+            DirSource::Chainlink => {
+                // 2秒前 Chainlink(at_ts 5s 容差,超差回退 ct)。仅原公式需要。
+                let ct_2 = cl_snap.iter()
+                    .min_by_key(|p| (p.ts - (now - 2)).abs())
+                    .filter(|p| (p.ts - (now - 2)).abs() <= 5)
+                    .map(|p| p.price)
+                    .unwrap_or(ct);
+                (ct - price_to_beat)
+                    + MOM_W_SHORT * mom_short
+                    + MOM_W_LONG * mom_long
+                    + 0.20 * (ct - ct_2)
+                    + 0.20 * ((xt - ct) - basis60)
+            }
+        };
 
         // 噪声尺度 V = σ120 × √T
         let t = seconds_left.max(1) as f64;

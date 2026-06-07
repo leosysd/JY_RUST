@@ -10,7 +10,8 @@ impl SmartStrategy {
         // 训练样本也要真开盘价(否则特征里的 ct-b/z 失真,污染训练集)。
         let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
         if price_to_beat < 1000.0 { return; }
-        let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return; };
+        // 训练样本记录沿用原 Chainlink 公式(与历史 z 数据口径一致)。
+        let Some(sig) = self.model.compute(price_to_beat, seconds_left, crate::zscore::DirSource::Chainlink) else { return; };
         // 方向取 z 倾向(>0看Up),仅作记录;入场价取该方向 ask
         let dir = if sig.z >= 0.0 { "Up" } else { "Down" };
         let entry_ask = if dir == "Up" { up_ask } else { dn_ask };

@@ -5,6 +5,7 @@ use super::smart::{
 };
 use crate::clob::Market;
 use crate::position::{full_cost_per_share, MarketPosition, Phase};
+use crate::zscore::DirSource;
 use anyhow::Result;
 use tracing::{debug, info};
 
@@ -56,13 +57,15 @@ impl SmartStrategy {
         // ── P4：趋势入场（入场过滤已对齐 ev_solo：时间门槛 / 价带 / flow闸）──
         // 注意:只把"入场条件"改成和 ev_solo 一样;入场后仍留在 Holding,
         // 交给 decide_holding 全套管理(锁利/追单/减险),与 ev_solo 的裸持不同。
-        // 时间门槛:与 ev_solo 一致,只在开盘前段入(剩余秒数 ≥ ev_solo_min_seconds_left)。
-        if seconds_left < self.config.ev_solo_min_seconds_left {
-            debug!("[SMART] {} 距结算{seconds_left}s < ev_solo 入场最早时点，跳过入场", market.title);
+        // 时间门槛:zscore 独立参数(默认同 ev_solo,可单独调)。
+        if seconds_left < self.config.zscore_min_seconds_left {
+            debug!("[SMART] {} 距结算{seconds_left}s < zscore 入场最早时点，跳过入场", market.title);
             return Ok(());
         }
 
-        let Some(sig) = self.model.compute(price_to_beat, seconds_left) else {
+        // 方向公式来源:zscore 独立开关(默认币安),与 ev_solo/accum/zquote 互不影响。
+        let dsrc = if self.config.zscore_use_binance_dir { DirSource::Binance } else { DirSource::Chainlink };
+        let Some(sig) = self.model.compute(price_to_beat, seconds_left, dsrc) else {
             debug!("[SMART] {} 价格数据不足，跳过入场", market.title);
             return Ok(());
         };
@@ -72,17 +75,17 @@ impl SmartStrategy {
         };
 
         let entry_ask = if dir == "Up" { up_ask } else { dn_ask };
-        // 价带:与 ev_solo 一致,用 ev_solo_min_ask / ev_solo_max_ask。
-        if entry_ask < self.config.ev_solo_min_ask || entry_ask > self.config.ev_solo_max_ask {
+        // 价带:zscore 独立参数 zscore_min_ask / zscore_max_ask。
+        if entry_ask < self.config.zscore_min_ask || entry_ask > self.config.zscore_max_ask {
             debug!(
                 "[SMART] {} {dir}@{entry_ask:.3} 不在入场区[{:.2},{:.2}]，跳过",
-                market.title, self.config.ev_solo_min_ask, self.config.ev_solo_max_ask
+                market.title, self.config.zscore_min_ask, self.config.zscore_max_ask
             );
             return Ok(());
         }
 
-        // flow_imb_30 同向闸:与 ev_solo 一致,开盘前30s资金流与 z 方向明确相悖则跳过。
-        if self.config.ev_solo_flow_gate {
+        // flow_imb_30 同向闸:zscore 独立开关 zscore_flow_gate。
+        if self.config.zscore_flow_gate {
             let now = chrono::Utc::now().timestamp();
             let imb = self.model.binance_flow(now, 30).imbalance;
             let signed = if dir == "Up" { imb } else { -imb };
@@ -185,8 +188,9 @@ impl SmartStrategy {
             }
         }
 
-        // 当前趋势信号（用于决定"追单"还是"减险"）
-        let trend_dir = self.model.compute(pos.price_to_beat, seconds_left)
+        // 当前趋势信号（用于决定"追单"还是"减险"）——与 zscore 入场用同一方向源。
+        let dsrc = if self.config.zscore_use_binance_dir { DirSource::Binance } else { DirSource::Chainlink };
+        let trend_dir = self.model.compute(pos.price_to_beat, seconds_left, dsrc)
             .and_then(|s| s.direction());
 
         // ── P4：趋势追单（趋势仍支持主边时，优先顺势加仓）────────────────
