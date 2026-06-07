@@ -1115,7 +1115,9 @@ impl SmartStrategy {
         let mut ideal_changed = false;
         for (slug, pos) in pending {
             let Some(winner) = self.client.fetch_winning_outcome(&slug).await else { continue };
-            let pnl = if winner == "Up" { pos.pnl_if_up_wins() } else { pos.pnl_if_down_wins() };
+            // 结算账面用 settle_pnl(含费实付口径)→ realized_pnl 与链上一致;
+            // 决策用的 pnl_if_*_wins(乐观本金口径)不动。
+            let pnl = pos.settle_pnl(&winner);
             let emoji = if pnl >= 0.0 { "✅" } else { "❌" };
             info!(
                 "[SMART SETTLE] {} | 赢={} | Up={:.0}@{:.3} Down={:.0}@{:.3} | PNL={:+.2} {}",
@@ -1134,7 +1136,7 @@ impl SmartStrategy {
             // 同步结算影子账（实盘双轨；模拟时影子账为空，跳过）
             if let Some(ipos) = self.ideal_state.get(&slug).cloned() {
                 if !matches!(ipos.phase, Phase::Settled) && !ipos.trades.is_empty() {
-                    let ipnl = if winner == "Up" { ipos.pnl_if_up_wins() } else { ipos.pnl_if_down_wins() };
+                    let ipnl = ipos.settle_pnl(&winner);
                     let ip = self.ideal_state.get_or_create(&slug, ipos.end_ts);
                     ip.phase = Phase::Settled;
                     ip.winner = Some(winner.clone());
