@@ -185,6 +185,10 @@ const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
     ("ACCUM_TARGET_WIN",      "accum 主腿赢目标PnL(补到≥此值)",    "12"),
     ("ACCUM_MAX_LOSS",        "accum 主腿输最大亏损(补到≥−此值)",  "7"),
     ("ACCUM_FORCE_SECONDS",   "accum 临结算停建线(剩余≤此秒不下单)", "15"),
+    ("ZQUOTE_UP_PX",          "zquote z方向挂单价(看好侧,稍高争成交)", "0.52"),
+    ("ZQUOTE_DN_PX",          "zquote 反向挂单价(稍低捡便宜)",      "0.488"),
+    ("MAKER_QUOTE_TTL_SECS",  "maker 挂单存活秒数(超时撤,配合重挂)", "5"),
+    ("MAKER_REPLACE_TICKS",   "maker 盘口移动几个tick就撤重挂",      "1"),
 ];
 
 /// 打印所有可调参数的当前值（未设置则显示默认）。
