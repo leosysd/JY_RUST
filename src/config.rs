@@ -275,7 +275,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         stop_loss_max_opp: env_f64("STOP_LOSS_MAX_OPP", 0.75),
         stop_loss_max_seconds_left: env_i64("STOP_LOSS_MAX_SECONDS_LEFT", 120),
         entry_strategy: env("ENTRY_STRATEGY", "ev_solo").to_lowercase(),
-        order_mode: env("ORDER_MODE", "market").to_lowercase(),
+        order_mode: env("ORDER_MODE", "maker").to_lowercase(),
         ev_solo_max_ask: env_f64("EV_SOLO_MAX_ASK", 0.52),
         ev_solo_min_ask: env_f64("EV_SOLO_MIN_ASK", 0.44),
         ev_solo_qty: env_f64("EV_SOLO_QTY", 20.0),
