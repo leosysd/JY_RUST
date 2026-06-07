@@ -41,6 +41,13 @@ const ENTRY_MIN_SECONDS_LEFT: i64 = 60;
 /// 节流到此间隔后,结算用的网络请求不再卡在每个决策 tick 前面拖慢入场。
 const SETTLEMENT_CHECK_INTERVAL: i64 = 10;
 
+fn strategy_order_shares(shares: f64) -> Option<f64> {
+    if !shares.is_finite() || shares <= 0.0 {
+        return None;
+    }
+    Some(shares.round().max(1.0))
+}
+
 pub struct SmartStrategy {
     pub config: Config,
     pub state: SmartStateStore,
@@ -254,7 +261,7 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // 路线五：sniper 延迟套利狙击(binance 突破 → 限价 → FAK → 裸持)。
+        // 路线五：sniper 延迟套利狙击(binance 突破 → FOK 限价 → 裸持)。
         if self.config.entry_strategy == "sniper" {
             self.decide_sniper(&market, up_ask, dn_ask, seconds_left).await?;
             return Ok(());
@@ -642,7 +649,7 @@ impl SmartStrategy {
             }
         }
 
-        let qty = self.config.ev_solo_qty;
+        let qty = strategy_order_shares(self.config.ev_solo_qty).unwrap_or(20.0);
         let fc = full_cost_per_share(ask);
         let ev_per = 0.578 * (1.0 - fc) - 0.422 * fc; // 用实测胜率估每份EV(仅日志参考)
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
@@ -667,7 +674,7 @@ impl SmartStrategy {
     }
 
     /// 延迟套利狙击:盘内监控 binance,BTC 相对开盘价(window=0)或最近 N 秒(window>0)
-    /// 动够 ±move_usd 即定方向;仅当对应方向 ask < max_ask(盘口还没反应)时 FAK 买入,
+    /// 动够 ±move_usd 即定方向;仅当对应方向 ask < max_ask(盘口还没反应)时 FOK 买入,
     /// 裸持到结算。每盘只狙一次。赚的是 Polymarket 盘口对 binance 变动的反应延迟。
     async fn decide_sniper(
         &mut self,
@@ -709,7 +716,7 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        let qty = self.config.sniper_qty;
+        let qty = strategy_order_shares(self.config.sniper_qty).unwrap_or(20.0);
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         info!("[SNIPER {mode}] {} 突破${:+.0}(开盘{open_px:.0}→现{cur_px:.0}) 买{dir}@{ask:.3}×{qty:.0} T-{seconds_left}s",
             market.title, move_usd);
@@ -757,7 +764,7 @@ impl SmartStrategy {
         let now = chrono::Utc::now().timestamp();
         if now < market.start_ts { return Ok(()); }                          // 还没开盘
         if seconds_left <= self.config.accum_force_seconds { return Ok(()); } // 临近结算停建
-        let qty = self.config.accum_qty;
+        let qty = strategy_order_shares(self.config.accum_qty).unwrap_or(20.0);
         let target = self.config.accum_target_win;
         let maxloss = self.config.accum_max_loss;
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
@@ -835,7 +842,7 @@ impl SmartStrategy {
                 let denom = 1.0 - full_cost_per_share(p);
                 if denom > 0.001 {
                     let goal = self.config.accum_rescue_goal;
-                    // 分笔补:每笔最多 qty,最后一笔零头,间隔 500ms,每笔后重算(部分成交自动补足)
+                    // 分笔补:每笔最多 qty,不足 1 份停止;FOK 不接受部分成交零头。
                     for _step in 0..50 {
                         let cur = {
                             let pos = self.state.get_or_create(&market.slug, market.end_ts);
@@ -861,7 +868,7 @@ impl SmartStrategy {
 
         // ③ 谁跌补谁(计算模块):Up/Down 两边,ask≤补档且未补过 → 分笔补。
         //    每笔最多 qty(20)份、最后一笔补不足 20 的零头,笔间隔 500ms。
-        //    每笔后重算需求(动态收敛):实盘 FAK 单笔小好成交,部分成交下一笔自动补足。
+        //    每笔后重算需求(动态收敛):实盘 FOK 保证整数份额,失败则下轮重试。
         for side in ["Up", "Down"] {
             let side_ask = if side == "Up" { up_ask } else { dn_ask };
             let dipped = if side == "Up" { &up_dip } else { &dn_dip };
@@ -919,14 +926,18 @@ impl SmartStrategy {
         ((goal - cur) / denom).max(0.0).ceil()                 // ceil 补够,不让 round 少补
     }
 
-    /// accum 专用下单 + 双轨记账(FAK,能成多少成多少;补仓份额可变,不按金额买超)。
+    /// accum 专用下单 + 双轨记账(FOK,只接受整数份额整单成交)。
     async fn accum_buy(&mut self, market: &Market, dir: &str, price: f64, shares: f64,
                        label: &str, price_to_beat: f64) -> Result<()> {
+        let Some(shares) = strategy_order_shares(shares) else {
+            warn!("[ACCUM] {} {dir} {label} 下单份额非法: {shares}", market.title);
+            return Ok(());
+        };
         let Some(token) = market.token_for(dir) else {
             warn!("[ACCUM] {} 找不到 {dir} 的 token_id,跳过", market.title);
             return Ok(());
         };
-        let fill = match self.executor.buy_fak(token, price, shares, None).await {
+        let fill = match self.executor.buy(token, price, shares, None).await {
             Ok(f) => f,
             Err(e) => { warn!("[ACCUM ORDER ERR] {} {dir} {label}: {e:#}", market.title); return Ok(()); }
         };
@@ -965,6 +976,13 @@ impl SmartStrategy {
         phase_label: &str,
         limit_price: Option<f64>,
     ) -> Option<crate::executor::Fill> {
+        let shares = match strategy_order_shares(shares) {
+            Some(v) => v,
+            None => {
+                warn!("[SMART] {} {dir} {phase_label} 下单份额非法: {shares}", market.title);
+                return None;
+            }
+        };
         let token = match market.token_for(dir) {
             Some(t) => t,
             None => {
@@ -978,7 +996,7 @@ impl SmartStrategy {
                     info!("[SMART ORDER] {} {dir} {phase_label} id={} status={} ok={} 成交{:.1}份@{:.3}",
                         market.title, fill.order_id, fill.status, fill.success,
                         fill.filled_shares, fill.filled_price);
-                    // 实盘发单但未成交=扑空(FAK taking=0)。记一条 phase:"miss" 到 signals,
+                    // 实盘发单但未成交=扑空。记一条 phase:"miss" 到 signals,
                     // 供 stats 算"下单未成交率"。纯增量记录,不改任何成交/决策逻辑;
                     // train.py 只读 phase=settlement/kind=train_sample,不读 miss,训练不受影响。
                     if !fill.success {
@@ -1009,9 +1027,11 @@ impl SmartStrategy {
         phase_label: &str,
         price_to_beat: f64,
     ) -> Result<bool> {
-        // 教训:FOK 下限价挂高反而买超更多(金额驱动,maker_amount=size×limit→预算变大→份额多)。
-        // 实测 0.99 → 8.8 份。精确份额须改 GTC resting limit(按份额成交、余量取消),待实现。
-        // 当前所有策略一律 ask+buffer(limit_override=None)。
+        let Some(shares) = strategy_order_shares(shares) else {
+            warn!("[SMART] {} {dir} {phase_label} 下单份额非法: {shares}", market.title);
+            return Ok(false);
+        };
+        // 默认不设价格帽:由 SDK market order 按 shares 扫订单簿算 cutoff 价格。
         let limit_override: Option<f64> = None;
         let fill = self.place_order(market, dir, price, shares, phase_label, limit_override).await;
 
@@ -1050,6 +1070,10 @@ impl SmartStrategy {
         projected_pnl: f64,
         phase_label: &str,
     ) -> Result<()> {
+        let Some(shares) = strategy_order_shares(shares) else {
+            warn!("[SMART LOCK] {} {dir} {phase_label} 下单份额非法: {shares}", market.title);
+            return Ok(());
+        };
         let mode   = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         let secs   = (pos.end_ts - chrono::Utc::now().timestamp()).max(0);
 
@@ -1139,7 +1163,8 @@ impl SmartStrategy {
     }
 
     fn order_shares(&self) -> f64 {
-        self.config.order_shares.to_string().parse::<f64>().unwrap_or(20.0)
+        let shares = self.config.order_shares.to_string().parse::<f64>().unwrap_or(20.0);
+        strategy_order_shares(shares).unwrap_or(20.0)
     }
 
     async fn write_signal(&self, v: &serde_json::Value) -> Result<()> {

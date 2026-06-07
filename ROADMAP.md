@@ -39,12 +39,12 @@ ev_solo 策略实盘运行中(爱尔兰 Lightsail,20份/场,DRY_RUN=0);同时攒
    **但延迟只影响扑空率,不影响方向对错=不是从亏变赚的关键。先确认ev_solo有edge,有才值得迁。**
    加拿大机=vital-wall-2/温哥华(非东部),密码已在对话暴露需改。
 4. **模型推理 Python→Rust**(方式A):正式上线时把 LightGBM 推理移入 bot(lleaves/ONNX),自包含+低延迟,去掉Python旁路。
-5. TAKER_BUFFER 调优(减FAK扑空):现0.02;若扑空仍高可调0.03-0.04更易成交,代价滑点+。
+5. 四策略实盘下单已改为 SDK market_order + Amount::shares FOK:按目标份额成交,由 SDK 扫订单簿计算 cutoff 价格。
 
 ## 关键参数现值(/opt/jy-data/.env)
 - ENTRY_STRATEGY=ev_solo, DRY_RUN=0, EV_SOLO_QTY=20
 - EV_SOLO_MIN_ASK=0.35, EV_SOLO_MAX_ASK=0.52(只在正EV价区入场)
-- TAKER_BUFFER=0.02, POLL_MS=200, FORCE 7%费(真费,不动)
+- POLL_MS=200, FORCE 7%费(真费,不动)。旧 TAKER_BUFFER 现在不参与下单。
 
 ## 环境
 - 当前机器:AWS Lightsail 爱尔兰($24/月),开发+安装+实盘全在此。

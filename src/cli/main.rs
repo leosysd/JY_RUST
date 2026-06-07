@@ -149,7 +149,6 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
 
 /// 可调策略参数表：(env 键, 中文说明, 默认值)。用于 `jy params` 展示与交互式调参菜单。
 const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
-    ("TAKER_BUFFER",          "taker 吃单滑点缓冲(限价=ask+此值)",  "0.02"),
     ("EV_SOLO_MAX_ASK",       "ev_solo 入场价上限(≤才买)",         "0.52"),
     ("EV_SOLO_MIN_ASK",       "ev_solo 入场价下限(≥才买)",         "0.44"),
     ("EV_SOLO_QTY",           "每笔下单份数(与QUANT_ORDER_SHARES同步)", "20"),
