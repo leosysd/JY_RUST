@@ -59,10 +59,12 @@ jobs:
             gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null \
               || gh release delete "$TAG" --yes 2>/dev/null || true
             git push origin --delete "$TAG" 2>/dev/null || true
+            # 用 --latest 标为正式「Latest」发行版（不再 --prerelease），
+            # 这样仓库侧边栏会正常显示带下载二进制的发行卡片，而不是只剩一个 tag。
             gh release create "$TAG" dist/jy dist/jy-bot dist/SHA256SUMS \
               --title "latest (${GITHUB_SHA::7})" \
               --notes "Rolling build from main @ ${GITHUB_SHA::7}" \
-              --prerelease --target "$GITHUB_SHA"
+              --latest --target "$GITHUB_SHA"
           else
             gh release create "$TAG" dist/jy dist/jy-bot dist/SHA256SUMS \
               --title "$TAG" --notes "Release $TAG" --target "$GITHUB_SHA"
