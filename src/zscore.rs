@@ -98,25 +98,21 @@ impl ZScoreModel {
         let xt_2 = bn_at(now - 2).unwrap_or(xt);
         let xt_5 = bn_at(now - 5).unwrap_or(xt);
 
-        // 2秒前 Chainlink(Chainlink at_ts 有 5s 容差:偏离超过 5s 视为取不到,回退 ct)
-        let ct_2 = cl_snap.iter()
-            .min_by_key(|p| (p.ts - (now - 2)).abs())
-            .filter(|p| (p.ts - (now - 2)).abs() <= 5)
-            .map(|p| p.price)
-            .unwrap_or(ct);
-
-        // basis60：最近60秒 Binance - Chainlink 平均差
+        // basis60：最近60秒 Binance - Chainlink 平均差（用于把币安价换算到 Chainlink 口径）
         let basis60 = compute_basis60(now, &cl_snap, &bn_snap);
 
         // σ120：最近120秒每秒价格变化的标准差
         let sigma120 = compute_sigma120(now, &bn_snap);
 
-        // 预期偏移 E
-        let e = (ct - price_to_beat)
-            + 0.60 * (xt - xt_2)
-            + 0.30 * (xt - xt_5)
-            + 0.20 * (ct - ct_2)
-            + 0.20 * ((xt - ct) - basis60);
+        // 预期偏移 E —— 方向信号全部改由「币安」驱动(tick级、实时,比 Chainlink 灵敏)。
+        // 开盘基准价 B(price_to_beat)仍用 Chainlink,保证与市场结算口径对齐。
+        // xt_adj = 币安现价经基差校正到 Chainlink 口径(basis60≈xt−ct),
+        // 这样"相对开盘价的漂移"用币安现价算,又不会和 Chainlink 开盘价串了口径。
+        // 原 Chainlink 动量项(ct−ct_2)与单独的基差回归项已并入此处,不再单列。
+        let xt_adj = xt - basis60;
+        let e = (xt_adj - price_to_beat)        // 币安现价(基差校正) − Chainlink 开盘价
+            + 0.60 * (xt - xt_2)                // 币安 2s 动量
+            + 0.30 * (xt - xt_5);               // 币安 5s 动量
 
         // 噪声尺度 V = σ120 × √T
         let t = seconds_left.max(1) as f64;
