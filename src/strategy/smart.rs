@@ -92,6 +92,8 @@ pub struct SmartStrategy {
     /// 覆盖两种重复挂单场景:DryRun 撤单后重挂、LIVE 挂单失败(余额不足等)重试。
     /// 距上次尝试不足 maker_quote_ttl_secs 则跳过,避免每 tick 重复挂单刷屏。
     pub maker_attempt: std::collections::HashMap<String, i64>,
+    /// zquote 每盘开局锁定的 z 方向(slug→"Up"/"Down")。开局定一次,之后不再随 z 变。
+    pub zquote_dir: std::collections::HashMap<String, String>,
 }
 
 /// accum 路线每盘状态。首笔 z 定主腿方向(盈亏锚点),之后谁涨追谁/谁跌补谁,
@@ -182,6 +184,7 @@ impl SmartStrategy {
             accum: std::collections::HashMap::new(),
             reconciled: false,
             maker_attempt: std::collections::HashMap::new(),
+            zquote_dir: std::collections::HashMap::new(),
         })
     }
 

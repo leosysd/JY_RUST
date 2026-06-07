@@ -1,7 +1,7 @@
 use super::smart::{SmartStrategy, ENTRY_MIN_SECONDS_LEFT};
 use crate::clob::Market;
 use anyhow::Result;
-use tracing::debug;
+use tracing::{debug, info};
 
 impl SmartStrategy {
     // ── 路线七:zquote z定方向 + 双边固定价 maker 挂单,买够即收手 ──────────
@@ -26,12 +26,20 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // z 方向:信号不足不挂。
-        let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
-        let Some(dir) = sig.direction() else {
-            debug!("[ZQUOTE] {} z={:.3} 信号不足,不挂", market.title, sig.z);
-            return Ok(());
+        // z 开局只定一次方向,锁定到该盘(之后不再随 z 重算/翻转)。
+        let dir: String = if let Some(d) = self.zquote_dir.get(&market.slug) {
+            d.clone()
+        } else {
+            let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
+            let Some(d) = sig.direction() else {
+                debug!("[ZQUOTE] {} z={:.3} 信号不足,不挂", market.title, sig.z);
+                return Ok(());
+            };
+            self.zquote_dir.insert(market.slug.clone(), d.to_string());
+            info!("[ZQUOTE] {} 开局锁定方向={d}(z={:.3})", market.title, sig.z);
+            d.to_string()
         };
+        let dir = dir.as_str();
         let opp_dir = if dir == "Up" { "Down" } else { "Up" };
 
         // 目标固定份额:各边买够即收手。
