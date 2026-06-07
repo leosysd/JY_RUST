@@ -226,7 +226,7 @@ fn interactive_menu() -> Result<()> {
             "7.  重启服务",
             "8.  查看实时日志",
             "9.  切换 DRY_RUN 模式",
-            "10. 切换入场策略（zscore / ev_solo / sniper / accum）",
+            "10. 切换入场策略（zscore / ev_solo / sniper / accum / zquote）",
             "11. 切换下单方式（market 吃单 / maker 挂单）",
             "12. 调策略参数（sniper / ev_solo / 滑点 等）",
             "13. 清空模拟数据",
