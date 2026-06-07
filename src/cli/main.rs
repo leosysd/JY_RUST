@@ -111,8 +111,9 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
                 "ev_solo" | "ev" | "solo" => "ev_solo",
                 "sniper" | "snipe" | "s" => "sniper",
                 "accum" | "ac" | "a" => "accum",
+                "zquote" | "zq" | "q" => "zquote",
                 other => {
-                    eprintln!("未知入场策略: {other}（可选 zscore | ev_solo | sniper | accum）");
+                    eprintln!("未知入场策略: {other}（可选 zscore | ev_solo | sniper | accum | zquote）");
                     std::process::exit(1);
                 }
             };
@@ -368,10 +369,11 @@ fn toggle_entry_strategy() -> Result<()> {
             "ev_solo - z-score 定方向 + 纯单边裸持（开盘预测,已被sniper取代）",
             "sniper  - 延迟套利狙击:binance突破→抢盘口反应延迟（30天回测+5.7%,推荐）",
             "accum   - z定主腿→谁涨追谁/谁跌补谁(计算模块)→赢≥12/亏≤7锁住即停",
+            "zquote  - z定方向+双边挂单(0.52/0.488)等成交",
         ])
-        .default(match curr.as_str() { "accum" => 3, "sniper" => 2, "ev_solo" => 1, _ => 0 })
+        .default(match curr.as_str() { "zquote" => 4, "accum" => 3, "sniper" => 2, "ev_solo" => 1, _ => 0 })
         .interact()?;
-    let new_val = match choice { 3 => "accum", 2 => "sniper", 1 => "ev_solo", _ => "zscore" };
+    let new_val = match choice { 4 => "zquote", 3 => "accum", 2 => "sniper", 1 => "ev_solo", _ => "zscore" };
     set_env_val("ENTRY_STRATEGY", new_val);
     println!("{} ENTRY_STRATEGY={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {

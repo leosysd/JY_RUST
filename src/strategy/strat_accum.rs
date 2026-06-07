@@ -201,10 +201,24 @@ impl SmartStrategy {
             warn!("[ACCUM] {} 找不到 {dir} 的 token_id,跳过", market.title);
             return Ok(());
         };
+        // audit:决策要下单、真正发单前记 intent。
+        self.write_signal(&serde_json::json!({
+            "phase": "intent", "market": market.slug,
+            "direction": dir, "shares": shares, "price": price,
+            "label": label, "mode": self.config.order_mode,
+            "ts": chrono::Utc::now().timestamp(),
+        })).await?;
         let fill = match self.executor.buy(token, price, shares, None).await {
             Ok(f) => f,
             Err(e) => { warn!("[ACCUM ORDER ERR] {} {dir} {label}: {e:#}", market.title); return Ok(()); }
         };
+        // audit:executor 返回后记 submit。
+        self.write_signal(&serde_json::json!({
+            "phase": "submit", "order_id": fill.order_id, "success": fill.success,
+            "filled_shares": fill.filled_shares, "filled_price": fill.filled_price,
+            "market": market.slug, "direction": dir,
+            "ts": chrono::Utc::now().timestamp(),
+        })).await?;
         if !fill.simulated {
             info!("[ACCUM ORDER] {} {dir} {label} id={} status={} ok={} 成交{:.1}份@{:.3}",
                 market.title, fill.order_id, fill.status, fill.success, fill.filled_shares, fill.filled_price);

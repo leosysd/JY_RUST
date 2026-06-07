@@ -9,11 +9,31 @@ impl SmartStrategy {
 
     /// maker 入场买单:在对侧 ask 下 1 tick 挂 GTC post_only 单。
     /// DryRun 立即全成交直接记账;LIVE 挂单成功则进 open_orders 等 harvest_makers 收割。
+    ///
+    /// 仅薄封装:算出"跟随盘口"挂价(price-1tick)后委托 do_buy_maker_at。
+    /// market maker 模式行为与拆分前完全一致。
     pub(crate) async fn do_buy_maker(
         &mut self,
         market: &Market,
         dir: &str,
         price: f64,
+        shares: f64,
+        phase_label: &str,
+        price_to_beat: f64,
+    ) -> Result<bool> {
+        // 挂价:比对侧 ask 低 1 tick,post_only 保证是 maker
+        let maker_px = (price - 0.01).clamp(0.01, 0.99);
+        self.do_buy_maker_at(market, dir, maker_px, shares, phase_label, price_to_beat).await
+    }
+
+    /// maker 入场买单(精确价):直接用传入的 maker_px 挂 GTC post_only 单。
+    /// 去重/place_maker/DryRun记账/记OpenOrder/token_id 逻辑与 do_buy_maker 完全一致,
+    /// 唯一区别是挂价由调用方给定(zquote 双边固定报价用此)。
+    pub(crate) async fn do_buy_maker_at(
+        &mut self,
+        market: &Market,
+        dir: &str,
+        maker_px: f64,
         shares: f64,
         phase_label: &str,
         price_to_beat: f64,
@@ -35,13 +55,25 @@ impl SmartStrategy {
             }
         }
 
-        // 挂价:比对侧 ask 低 1 tick,post_only 保证是 maker
-        let maker_px = (price - 0.01).clamp(0.01, 0.99);
+        // audit:决策要挂单、真正发单前记 intent。
+        self.write_signal(&serde_json::json!({
+            "phase": "intent", "market": market.slug,
+            "direction": dir, "shares": shares, "price": maker_px,
+            "label": phase_label, "mode": self.config.order_mode,
+            "ts": chrono::Utc::now().timestamp(),
+        })).await?;
 
         let fill = match self.executor.place_maker(token, maker_px, shares).await {
             Ok(f) => f,
             Err(e) => { warn!("[MAKER ORDER ERR] {} {dir} {phase_label}: {e:#}", market.title); return Ok(false); }
         };
+        // audit:executor 返回后记 submit。
+        self.write_signal(&serde_json::json!({
+            "phase": "submit", "order_id": fill.order_id, "success": fill.success,
+            "filled_shares": fill.filled_shares, "filled_price": fill.filled_price,
+            "market": market.slug, "direction": dir,
+            "ts": chrono::Utc::now().timestamp(),
+        })).await?;
         if !fill.success { return Ok(false); }
 
         // DryRun 特判:模拟立即全成交,直接记账,不进挂单追踪
@@ -62,6 +94,7 @@ impl SmartStrategy {
             placed_ts: now,
             phase: phase_label.to_string(),
             seen_live: false,
+            token_id: token.to_string(),
         };
         let pos = self.state.get_or_create(&market.slug, market.end_ts);
         pos.open_orders.push(order);
@@ -118,18 +151,61 @@ impl SmartStrategy {
                     info!("[MAKER FILL] {} {} 成交{new_fill:.1}份@{:.3}", slug, o.side, o.price);
                 }
 
-                // 撤单/移除判定
-                let expired = now >= end_ts - self.config.force_lock_seconds_left
-                    || (now - o.placed_ts) > 90;
+                // ── 撤单/移除判定（完整 lifecycle）──────────────────────────
+                // 撤掉后不在此重挂:下个 tick 策略循环会按新盘口自然挂新价(cancel/replace)。
                 let full = matched >= o.size - 0.001;
                 if full {
                     let pos = self.state.get_or_create(&slug, end_ts);
                     pos.open_orders.retain(|x| x.order_id != o.order_id);
-                } else if expired {
+                    continue;
+                }
+
+                // 条件 1:TTL 过期(挂单存活上限)。
+                let ttl_expired = now - o.placed_ts >= self.config.maker_quote_ttl_secs;
+                // 条件 2:盘末(force_lock 窗口内不再挂新单,已有挂单一律撤)。
+                let near_end = now >= end_ts - self.config.force_lock_seconds_left;
+
+                // 条件 3:盘口移动(仅"跟随盘口"的挂单;zquote 固定报价跳过)。
+                // 取价用本地 BookCache(self.cache,按 token_id 索引),零网络请求。
+                // "现在该挂的价" = 同向 best_ask - 0.01(与 do_buy_maker 的挂价口径一致);
+                // 与挂单价偏离 > maker_replace_ticks 个 0.01 tick 即撤,让策略按新盘口重挂。
+                let mut quote_moved = false;
+                if !o.phase.starts_with("zquote") && !o.token_id.is_empty() {
+                    let best_ask = {
+                        let cache = self.cache.read().await;
+                        cache.get(&o.token_id)
+                            .and_then(|b| b.best_ask())
+                            .and_then(|d| d.try_into().ok())
+                            .map(|a: f32| f64::from(a))
+                    };
+                    if let Some(best_ask) = best_ask {
+                        let target_px = (best_ask - 0.01).clamp(0.01, 0.99);
+                        let drift = (target_px - o.price).abs();
+                        let tol = self.config.maker_replace_ticks as f64 * 0.01;
+                        // 浮点容差:用 1e-9 抵消 0.01 二进制误差,避免恰好等于阈值时误撤。
+                        if drift > tol + 1e-9 {
+                            quote_moved = true;
+                        }
+                    }
+                }
+
+                if ttl_expired || near_end || quote_moved {
                     let _ = self.executor.cancel(&o.order_id).await;
                     let pos = self.state.get_or_create(&slug, end_ts);
                     pos.open_orders.retain(|x| x.order_id != o.order_id);
-                    info!("[MAKER CANCEL] {} {} 挂单过期撤单 id={}", slug, o.side, o.order_id);
+                    let reason = if near_end { "盘末" }
+                        else if ttl_expired { "TTL过期" }
+                        else { "盘口移动" };
+                    // audit:撤单结构化记录(reason 区分三种触发条件)。
+                    let reason_tag = if near_end { "near_end" }
+                        else if ttl_expired { "ttl" }
+                        else { "quote_moved" };
+                    let _ = self.write_signal(&serde_json::json!({
+                        "phase": "cancel", "order_id": o.order_id, "reason": reason_tag,
+                        "market": slug, "direction": o.side,
+                        "ts": now,
+                    })).await;
+                    info!("[MAKER CANCEL] {} {} {reason}撤单 id={} @{:.3}", slug, o.side, o.order_id, o.price);
                 }
                 // 否则:保留,继续等
             }

@@ -38,6 +38,11 @@ pub struct OpenOrder {
     /// serde default：兼容旧 state 文件（无此字段时为 false）。
     #[serde(default)]
     pub seen_live: bool,
+    /// 该挂单对应的 token_id（同向 outcome 的 CLOB token）。
+    /// harvest_makers 用它从本地 BookCache(按 token_id 索引)读当前盘口、判断盘口移动撤单，
+    /// 避免每 tick 发网络请求。serde default：兼容旧 state 文件（无此字段时为空串，盘口移动撤单自动跳过）。
+    #[serde(default)]
+    pub token_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -5,5 +5,7 @@ mod strat_zscore;
 mod strat_ev_solo;
 mod strat_sniper;
 mod strat_accum;
+mod strat_zquote;
 mod settlement;
 mod features;
+mod reconcile;

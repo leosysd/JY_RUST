@@ -86,6 +86,8 @@ pub struct SmartStrategy {
     pub shadow_mtime: i64,
     /// accum 路线每盘状态(slug→方向锚点+追涨/补仓进度+锁定)。
     pub accum: std::collections::HashMap<String, AccumLeg>,
+    /// 是否已执行启动对账(reconcile_on_startup)。run_once 首次跑时置 true 并对账一次。
+    pub reconciled: bool,
 }
 
 /// accum 路线每盘状态。首笔 z 定主腿方向(盈亏锚点),之后谁涨追谁/谁跌补谁,
@@ -174,10 +176,18 @@ impl SmartStrategy {
             z_last_ts: 0,
             shadow, model_dir, shadow_mtime,
             accum: std::collections::HashMap::new(),
+            reconciled: false,
         })
     }
 
     pub async fn run_once(&mut self) -> Result<()> {
+        // 启动对账(只跑一次):把本地 state open_orders 与链上挂单对齐,清幻影、告警孤儿。
+        // DryRun 下 list_open_orders 返回空、usdc_balance 返回 0,基本空跑,安全。
+        if !self.reconciled {
+            self.reconciled = true;
+            if let Err(e) = self.reconcile_on_startup().await { warn!("[RECONCILE] {e:#}"); }
+        }
+
         // 结算检查节流:绝大多数 tick 直接跳过,避免逐 tick 的结算网络请求拖慢决策/入场。
         let now = chrono::Utc::now().timestamp();
         if now - self.last_settlement_check >= SETTLEMENT_CHECK_INTERVAL {
@@ -275,6 +285,12 @@ impl SmartStrategy {
             return Ok(());
         }
 
+        // 路线七:zquote z定方向 + 双边固定价 maker 挂单等成交。
+        if self.config.entry_strategy == "zquote" {
+            self.decide_zquote(&market, up_ask, dn_ask, seconds_left).await?;
+            return Ok(());
+        }
+
         match pos.phase {
             Phase::Waiting  => self.decide_waiting(&market, pos, up_ask, dn_ask, seconds_left).await?,
             Phase::Holding  => self.decide_holding(&market, pos, up_ask, dn_ask, seconds_left).await?,
@@ -333,9 +349,27 @@ impl SmartStrategy {
         if self.config.order_mode == "maker" {
             return self.do_buy_maker(market, dir, price, shares, phase_label, price_to_beat).await;
         }
+        // audit:决策要下单、真正发单前记 intent。
+        self.write_signal(&serde_json::json!({
+            "phase": "intent", "market": market.slug,
+            "direction": dir, "shares": shares, "price": price,
+            "label": phase_label, "mode": self.config.order_mode,
+            "ts": chrono::Utc::now().timestamp(),
+        })).await?;
+
         // 默认不设价格帽:由 SDK market order 按 shares 扫订单簿算 cutoff 价格。
         let limit_override: Option<f64> = None;
         let fill = self.place_order(market, dir, price, shares, phase_label, limit_override).await;
+
+        // audit:executor 返回后记 submit(无论成交与否,fill 为 None 表示发单失败)。
+        if let Some(f) = &fill {
+            self.write_signal(&serde_json::json!({
+                "phase": "submit", "order_id": f.order_id, "success": f.success,
+                "filled_shares": f.filled_shares, "filled_price": f.filled_price,
+                "market": market.slug, "direction": dir,
+                "ts": chrono::Utc::now().timestamp(),
+            })).await?;
+        }
 
         // A轨 影子账（仅实盘）：假设按 ask 全额成交，与真实账对比滑点/未成交代价。
         // 模拟模式下主账本身即理想账，无需重复。
@@ -353,6 +387,13 @@ impl SmartStrategy {
             "phase": phase_label, "market": market.slug,
             "direction": dir, "price": rp, "shares": rs,
             "full_cost": full_cost_per_share(rp),
+            "dry_run": self.config.dry_run, "ts": chrono::Utc::now().timestamp(),
+        })).await?;
+        // audit:market 成交结构化 fill 记录(便于全生命周期 join intent/submit/fill)。
+        self.write_signal(&serde_json::json!({
+            "phase": "fill", "order_id": fill.order_id, "market": market.slug,
+            "direction": dir, "price": rp, "shares": rs,
+            "full_cost": full_cost_per_share(rp), "label": phase_label,
             "dry_run": self.config.dry_run, "ts": chrono::Utc::now().timestamp(),
         })).await?;
         record_trade(&mut self.state, market, dir, rp, rs, phase_label, price_to_beat, false);
