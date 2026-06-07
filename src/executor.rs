@@ -454,7 +454,8 @@ impl OrderExecutor {
                     .asset_type(AssetType::Collateral)
                     .build();
                 let r = client.balance_allowance(req).await.context("查询余额失败")?;
-                Ok(r.balance.to_string().parse::<f64>().unwrap_or(0.0))
+                // balance 是 6 位精度的 USDC base unit(micro),转人类美元
+                Ok(r.balance.to_string().parse::<f64>().unwrap_or(0.0) / 1e6)
             }
         }
     }

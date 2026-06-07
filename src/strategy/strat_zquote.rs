@@ -13,8 +13,8 @@ impl SmartStrategy {
     pub(crate) async fn decide_zquote(
         &mut self,
         market: &Market,
-        _up_ask: f64,
-        _dn_ask: f64,
+        up_ask: f64,
+        dn_ask: f64,
         seconds_left: i64,
     ) -> Result<()> {
         // 入场时机:太晚不挂(留出成交窗口)。
@@ -35,9 +35,14 @@ impl SmartStrategy {
         };
         let opp_dir = if dir == "Up" { "Down" } else { "Up" };
 
-        // 两边挂价:z 看好那边挂 up_px(稍高争成交),反向挂 dn_px(稍低捡便宜)。
-        let up_px = self.config.zquote_up_px;
-        let dn_px = self.config.zquote_dn_px;
+        // 两边对应的当前 ask:post-only 买单价必须 < ask,否则 "crosses book" 被拒。
+        let dir_ask = if dir == "Up" { up_ask } else { dn_ask };
+        let opp_ask = if opp_dir == "Up" { up_ask } else { dn_ask };
+        // 挂价 = 目标价与 (ask-1tick) 取低,确保 < ask 不 crosses;ask 无效(盘口未就绪)用目标价。
+        let up_px = if dir_ask > 0.011 { self.config.zquote_up_px.min(dir_ask - 0.01) } else { self.config.zquote_up_px };
+        let dn_px = if opp_ask > 0.011 { self.config.zquote_dn_px.min(opp_ask - 0.01) } else { self.config.zquote_dn_px };
+        let up_px = up_px.clamp(0.01, 0.99);
+        let dn_px = dn_px.clamp(0.01, 0.99);
         let shares = self.order_shares();
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
         info!(
