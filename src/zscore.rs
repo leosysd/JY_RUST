@@ -1,6 +1,14 @@
 use crate::feeds::{BinanceFeed, ChainlinkFeed};
 use crate::feeds::binance::TradePoint;
 use crate::feeds::chainlink::PricePoint;
+use crate::momentum;
+
+/// z 信号动量项：短/长窗口（秒）与权重。原内联写死的 2s/5s + 0.6/0.3，现抽成具名常量。
+/// 窗口/权重将来要可调的话，把这四个常量改成读 config 即可（动量计算本身已在 momentum 模块）。
+const MOM_WIN_SHORT: i64 = 2;
+const MOM_WIN_LONG: i64 = 5;
+const MOM_W_SHORT: f64 = 0.60;
+const MOM_W_LONG: f64 = 0.30;
 
 /// z-score 方向信号
 #[derive(Debug, Clone)]
@@ -62,7 +70,9 @@ impl ZScoreModel {
         self.binance.flow(now, window_sec)
     }
 
-    /// Binance 价格动量 = 现价 − window_sec 秒前价。>0 涨势。
+    /// Binance 价格动量 = 现价 − window_sec 秒前价。>0 涨势。各策略复用的动量入口。
+    /// 与 `momentum::momentum_on` 同口径（取时间最近点）；这里走 latest()+at_ts() 直接访问
+    /// feed（两次廉价锁、**不整段克隆**），适合策略独立调用——无需先 snapshot。
     pub fn binance_momentum(&self, now: i64, window_sec: i64) -> Option<f64> {
         let cur = self.binance.latest()?.price;
         let past = self.binance.at_ts(now - window_sec)?;
@@ -91,28 +101,27 @@ impl ZScoreModel {
         let ct = cl_latest.price;
         let xt = bn_latest.price;
 
-        // 2秒前和5秒前的 Binance 价格(Binance at_ts 无容差,取最近点;等价于原 feed.at_ts)
-        let bn_at = |target: i64| bn_snap.iter()
-            .min_by_key(|p| (p.ts - target).abs())
-            .map(|p| p.price);
-        let xt_2 = bn_at(now - 2).unwrap_or(xt);
-        let xt_5 = bn_at(now - 5).unwrap_or(xt);
-
         // basis60：最近60秒 Binance - Chainlink 平均差（用于把币安价换算到 Chainlink 口径）
         let basis60 = compute_basis60(now, &cl_snap, &bn_snap);
 
         // σ120：最近120秒每秒价格变化的标准差
         let sigma120 = compute_sigma120(now, &bn_snap);
 
+        // 动量项：调用独立的 momentum 模块，吃本函数已取好的 bn_snap 快照
+        // → 零额外加锁/克隆。取不到（切片太短）回退 0，等价于原来的 xt−xt=0。
+        let mom_short = momentum::momentum_on(&bn_snap, now, MOM_WIN_SHORT).unwrap_or(0.0);
+        let mom_long  = momentum::momentum_on(&bn_snap, now, MOM_WIN_LONG).unwrap_or(0.0);
+
         // 预期偏移 E —— 方向信号全部改由「币安」驱动(tick级、实时,比 Chainlink 灵敏)。
         // 开盘基准价 B(price_to_beat)仍用 Chainlink,保证与市场结算口径对齐。
         // xt_adj = 币安现价经基差校正到 Chainlink 口径(basis60≈xt−ct),
         // 这样"相对开盘价的漂移"用币安现价算,又不会和 Chainlink 开盘价串了口径。
-        // 原 Chainlink 动量项(ct−ct_2)与单独的基差回归项已并入此处,不再单列。
+        // 原 Chainlink 动量项(ct−ct_2)与单独的基差回归项已并入此处,不再单列;
+        // 动量已抽到 momentum 模块,各策略可经 binance_momentum() 复用同一定义。
         let xt_adj = xt - basis60;
         let e = (xt_adj - price_to_beat)        // 币安现价(基差校正) − Chainlink 开盘价
-            + 0.60 * (xt - xt_2)                // 币安 2s 动量
-            + 0.30 * (xt - xt_5);               // 币安 5s 动量
+            + MOM_W_SHORT * mom_short           // 币安短窗动量(默认 2s)
+            + MOM_W_LONG  * mom_long;           // 币安长窗动量(默认 5s)
 
         // 噪声尺度 V = σ120 × √T
         let t = seconds_left.max(1) as f64;
