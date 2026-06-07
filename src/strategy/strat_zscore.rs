@@ -140,9 +140,12 @@ impl SmartStrategy {
         // 锁仓只需补足"差额"使两边相等；对边已有的份额不能重复买，否则会超买成单边赌注
         let lock_qty = (main_shares - opp_shares).max(0.0);
 
-        // ── P2：锁利（补差额至两边相等后 worst_pnl >= 份额×系数）────
-        // 门槛随下单份额缩放：lock_min_profit_factor=0.2 时，设5需$1、设20需$4 才锁。
-        let lock_min_profit = shares * self.config.lock_min_profit_factor;
+        // ── P2：锁利（补差额至两边相等后 worst_pnl >= 实际持仓×系数）────
+        // 门槛随【实际持仓(主边份额 main_shares)】缩放,而非固定基础份额 order_shares。
+        // 关键:有追单时仓位会变大(如入场5+追单5=10份),门槛必须同步变大——否则10份还按
+        // 基础5份的门槛($1)算,太容易触发、锁定利润相对仓位太小。改用 main_shares 后:
+        // 10份门槛=10×系数(0.2→$2),20份=$4,与实际敞口对齐。
+        let lock_min_profit = main_shares * self.config.lock_min_profit_factor;
         if lock_qty > 0.0 {
             let p2_worst = pos.worst_pnl_if_add(opp_dir, opp_ask, lock_qty);
             if p2_worst >= lock_min_profit {

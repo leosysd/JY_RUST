@@ -180,7 +180,7 @@ const TUNABLE_PARAMS: &[(&str, &str, &str)] = &[
     ("FORCE_LOCK_SECONDS_LEFT","强制处理线(剩余 ≤ 此秒触发)",       "60"),
     ("QUANT_ORDER_SHARES",    "每笔下单份数(与EV_SOLO_QTY同步)",   "20"),
     ("TREND_CHASE_MAX_PRICE", "zscore 追单价格上限",               "0.60"),
-    ("LOCK_MIN_PROFIT_FACTOR","zscore 锁利门槛系数(×份额)",        "0.2"),
+    ("LOCK_MIN_PROFIT_FACTOR","zscore 锁利门槛系数(×实际持仓,含追单)", "0.2"),
     ("ACCUM_ENTRY_Z",         "accum 首笔定方向阈值(|z|≥才开主腿)", "0.15"),
     ("ACCUM_CHASE_LEVELS",    "accum 追涨档(逗号分隔,谁涨追谁)",    "0.62,0.65,0.68,0.70"),
     ("ACCUM_DIP_LEVELS",      "accum 补仓档(逗号分隔,谁跌补谁)",    "0.25,0.20"),
