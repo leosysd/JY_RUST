@@ -941,6 +941,9 @@ fn install_bin(src: &str, dst: &str) -> bool {
         let _ = std::process::Command::new("sudo").args(["rm", "-f", &tmp]).status();
         return false;
     }
+    // 强制可执行(+x):curl 下载的源文件无执行位,cp/mv 原样保留 → 不加这步会
+    // systemd 报 203/EXEC、手动跑报 Permission denied。无论源是什么都置 +x 兜底。
+    let _ = std::process::Command::new("sudo").args(["chmod", "+x", dst]).status();
     true
 }
 
