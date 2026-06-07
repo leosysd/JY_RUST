@@ -1,0 +1,5 @@
+# Shell 脚本与 YAML 必须用 LF：CRLF 会让 VPS 上 `curl | bash` 因 \r 报错、
+# 也会让 GitHub Actions/部分工具解析异常。强制以 LF 存入仓库（不随提交机器的平台变）。
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
