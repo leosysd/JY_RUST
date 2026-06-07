@@ -10,14 +10,14 @@
 
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use tracing::{info, warn};
 
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::types::{Amount, OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk_v2::types::{Address, Decimal as SdkDecimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
@@ -48,6 +48,25 @@ impl Fill {
             filled_shares: shares,
         }
     }
+}
+
+fn normalize_order_shares(shares: f64) -> Result<f64> {
+    ensure!(
+        shares.is_finite() && shares > 0.0,
+        "下单份额必须是正的有限数字: {shares}"
+    );
+    Ok(shares.round().max(1.0))
+}
+
+fn clob_price_string(price: f64) -> String {
+    let mut s = format!("{price:.4}");
+    while s.contains('.') && s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.push('0');
+    }
+    s
 }
 
 pub enum OrderExecutor {
@@ -114,8 +133,9 @@ impl OrderExecutor {
     /// LIVE 用 **FOK（fill-or-kill）**：要么按请求份额全部立即成交，要么整单取消，
     /// 不接受部分成交——避免延迟到达时盘口已变、只吃到零头或买在坏价。
     /// 代价：浅流动性下整单失败(扑空)概率高于 FAK。
-    /// 限价加 `MARKETABLE_BUFFER` 让单子能穿透盘口若干档。
-    /// FOK 下单(整单成交或扑空):狙击/锁仓用,杜绝部分成交零头。
+    /// 默认用 SDK market order + Amount::shares，按"目标份额"下单。
+    /// limit_price=None 时由 SDK 读取订单簿并计算吃满目标份额所需的 cutoff 价格；
+    /// limit_price=Some(x) 时作为价格上限。
     pub async fn buy(&self, token_id: &str, price: f64, shares: f64, limit_price: Option<f64>) -> Result<Fill> {
         self.buy_with(token_id, price, shares, limit_price, OrderType::FOK).await
     }
@@ -127,45 +147,33 @@ impl OrderExecutor {
     }
 
     async fn buy_with(&self, token_id: &str, price: f64, shares: f64, limit_price: Option<f64>, order_type: OrderType) -> Result<Fill> {
+        let order_shares = normalize_order_shares(shares)?;
         match self {
-            Self::DryRun => Ok(Fill::simulated(price, shares)),
+            Self::DryRun => Ok(Fill::simulated(price, order_shares)),
             Self::Live { client, signer } => {
                 let tid = U256::from_str(token_id)
                     .with_context(|| format!("token_id 解析失败: {token_id}"))?;
-                // marketable 限价：在 ask 上加缓冲并对齐到 0.01 tick，封顶 0.99。
-                // 缓冲(滑点容忍)可经 env TAKER_BUFFER 调整，默认 MARKETABLE_BUFFER(0.02)。
-                // 只在首单读一次 env 并缓存,后续下单零 getenv(见 taker_buffer)。
-                // limit_price=Some(x):直接用 x 作限价(狙击挂 0.99→撮合按"份额"封顶,精确成交,
-                // 不按金额买超);None:旧逻辑 ask+buffer 穿透盘口若干档。
-                let limit = match limit_price {
-                    Some(x) => (x.clamp(0.01, 0.99) * 100.0).round() / 100.0,
-                    None => {
-                        let buffer = taker_buffer();
-                        ((price + buffer).min(0.99) * 100.0).round() / 100.0
-                    }
-                };
-                // 份额取整：Polymarket 要求 BUY 金额(price×shares)≤2位小数。
-                // 价格已是2位小数，份额取整 → 乘积必然≤2位小数，金额合法。
-                // 成交返回的零头(如5.158729)若直接下单会算出4位小数金额被拒。
-                let order_shares = shares.round().max(1.0);
-                let p = SdkDecimal::from_str(&format!("{limit:.2}"))
-                    .context("价格转换失败")?;
                 let s = SdkDecimal::from_str(&format!("{order_shares:.0}"))
                     .context("份额转换失败")?;
+                let amount = Amount::shares(s).context("份额转换失败")?;
+                let price_cap = limit_price
+                    .map(|x| SdkDecimal::from_str(&clob_price_string(x.clamp(0.01, 0.99))))
+                    .transpose()
+                    .context("价格转换失败")?;
 
                 // 拆分埋点:build(取tick_size,预热后应命中缓存) / sign(本地EIP712) / post(POST /order)
                 // 各自计时,精确定位 ~400-1000ms 到底卡在哪一步。
                 let tb = std::time::Instant::now();
-                let order = client
-                    .limit_order()
+                let mut order_builder = client
+                    .market_order()
                     .token_id(tid)
                     .side(Side::Buy)
-                    .price(p)
-                    .size(s)
-                    .order_type(order_type.clone())
-                    .build()
-                    .await
-                    .context("build 失败")?;
+                    .amount(amount)
+                    .order_type(order_type.clone());
+                if let Some(p) = price_cap {
+                    order_builder = order_builder.price(p);
+                }
+                let order = order_builder.build().await.context("build 失败")?;
                 let t_build = tb.elapsed();
                 let tsg = std::time::Instant::now();
                 let signed = client.sign(signer, order).await.context("sign 失败")?;
@@ -184,10 +192,12 @@ impl OrderExecutor {
                 let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
                 let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
                 // FOK：要么全额成交(taking≈order_shares)，要么整单 kill(taking=0)。
-                // FAK：吃≤limit的量、最多order_shares份,部分成交(taking∈(0,shares))属正常。
+                // FAK：最多 order_shares 份,部分成交(taking∈(0,shares))属正常。
                 let filled = taking > 0.0;
+                let full_fok = matches!(order_type, OrderType::FOK) && (taking - order_shares).abs() <= 0.01;
+                let booked_shares = if full_fok { order_shares } else { taking };
                 let (filled_price, filled_shares) = if filled {
-                    (making / taking, taking)
+                    (making / booked_shares, booked_shares)
                 } else {
                     (price, 0.0)
                 };
@@ -195,8 +205,8 @@ impl OrderExecutor {
                 if !filled {
                     warn!("[EXEC] 订单未成交(不记账): id={} status={} ok={} err={:?}",
                         resp.order_id, resp.status, resp.success, resp.error_msg);
-                } else if matches!(order_type, OrderType::FOK) && (taking - shares).abs() > 0.01 {
-                    warn!("[EXEC] 部分成交: 请求{shares:.0}份 实际{taking:.1}份 @ {:.3}",
+                } else if matches!(order_type, OrderType::FOK) && !full_fok {
+                    warn!("[EXEC] 部分成交: 请求{order_shares:.0}份 实际{taking:.6}份 @ {:.3}",
                         making / taking);
                 }
                 Ok(Fill {
@@ -262,15 +272,15 @@ impl OrderExecutor {
     ///   - LIVE 挂单成功：success=true、filled_shares=0（挂在簿上，等 query_order 收割）。
     ///   - LIVE 被拒（会吃单/越界）：success=false。
     pub async fn place_maker(&self, token_id: &str, price: f64, shares: f64) -> Result<Fill> {
+        let order_shares = normalize_order_shares(shares)?;
         match self {
-            Self::DryRun => Ok(Fill::simulated(price, shares)),
+            Self::DryRun => Ok(Fill::simulated(price, order_shares)),
             Self::Live { client, signer } => {
                 let tid = U256::from_str(token_id)
                     .with_context(|| format!("token_id 解析失败: {token_id}"))?;
-                // maker 价对齐 0.01 tick；不加缓冲，就挂在该价位等成交。
-                let limit = ((price.clamp(0.01, 0.99)) * 100.0).round() / 100.0;
-                let order_shares = shares.round().max(1.0);
-                let p = SdkDecimal::from_str(&format!("{limit:.2}"))
+                // maker 不加缓冲,就挂在该价位等成交。
+                let limit = price.clamp(0.01, 0.99);
+                let p = SdkDecimal::from_str(&clob_price_string(limit))
                     .context("价格转换失败")?;
                 let s = SdkDecimal::from_str(&format!("{order_shares:.0}"))
                     .context("份额转换失败")?;
@@ -289,8 +299,10 @@ impl OrderExecutor {
 
                 let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
                 let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+                let full_fill = (taking - order_shares).abs() <= 0.01;
+                let booked_shares = if full_fill { order_shares } else { taking };
                 let (filled_price, filled_shares) = if taking > 0.0 {
-                    (making / taking, taking)
+                    (making / booked_shares, booked_shares)
                 } else {
                     (limit, 0.0)
                 };
@@ -402,22 +414,6 @@ pub struct OrderState {
     pub price: f64,
 }
 
-/// FOK 限价相对 ask 的上浮，使其可穿透盘口若干档成交。
-const MARKETABLE_BUFFER: f64 = 0.02;
-
-/// 下单滑点缓冲(TAKER_BUFFER)。只在首次调用时读一次环境变量并缓存,
-/// 避免每次下单都走 getenv+parse(下单是延迟敏感路径)。
-fn taker_buffer() -> f64 {
-    use std::sync::OnceLock;
-    static BUF: OnceLock<f64> = OnceLock::new();
-    *BUF.get_or_init(|| {
-        std::env::var("TAKER_BUFFER").ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|b| *b >= 0.0 && *b <= 0.5)
-            .unwrap_or(MARKETABLE_BUFFER)
-    })
-}
-
 /// 配置中的 signature_type(u8) → SDK 枚举。
 /// 0=EOA, 1=Proxy(email/magic), 2=GnosisSafe, 3=Poly1271(V2 智能合约钱包)
 fn map_sig_type(t: u8) -> SignatureType {
@@ -426,5 +422,37 @@ fn map_sig_type(t: u8) -> SignatureType {
         1 => SignatureType::Proxy,
         2 => SignatureType::GnosisSafe,
         _ => SignatureType::Poly1271,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clob_price_string, normalize_order_shares};
+
+    #[test]
+    fn order_shares_are_whole_numbers() {
+        assert_eq!(normalize_order_shares(20.49).unwrap(), 20.0);
+        assert_eq!(normalize_order_shares(20.50).unwrap(), 21.0);
+        assert_eq!(normalize_order_shares(0.40).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn order_shares_reject_non_finite_values() {
+        assert!(normalize_order_shares(f64::NAN).is_err());
+        assert!(normalize_order_shares(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn order_shares_reject_non_positive_values() {
+        assert!(normalize_order_shares(0.0).is_err());
+        assert!(normalize_order_shares(-3.0).is_err());
+    }
+
+    #[test]
+    fn clob_price_string_preserves_tick_precision() {
+        assert_eq!(clob_price_string(0.537), "0.537");
+        assert_eq!(clob_price_string(0.52), "0.52");
+        assert_eq!(clob_price_string(0.5), "0.5");
+        assert_eq!(clob_price_string(0.1234), "0.1234");
     }
 }

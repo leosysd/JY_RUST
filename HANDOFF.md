@@ -27,7 +27,7 @@
 ## 四、关键参数(/opt/jy-data/.env;未列项=用代码默认)
 - BOT_MODE=quant, DRY_RUN=0(实盘!), ENTRY_STRATEGY=ev_solo, POLL_MS=200
 - DEPOSIT_WALLET_ADDRESS=0xE690DA4ce6FbECf7bef11648D504b43e3620B11E, PRIVATE_KEY=(已设)
-- 代码默认(.env未显式写): EV_SOLO_QTY=20, EV_SOLO_MIN_ASK=0.35, EV_SOLO_MAX_ASK=0.52, TAKER_BUFFER=0.02
+- 代码默认(.env未显式写): EV_SOLO_QTY=20, EV_SOLO_MIN_ASK=0.35, EV_SOLO_MAX_ASK=0.52。实盘买入按 SDK market_order + Amount::shares FOK 固定目标份额；旧 TAKER_BUFFER 不再参与下单。
 - 费率=真7%(position.rs写死0.07*p*(1-p),别动)
 - 熄火: `jy set-dry-run 1 --restart`
 
@@ -52,7 +52,7 @@
 
 ## 七、下一步任务(优先级)
 1. **继续攒修复后场到100+**,确认62.7% edge 稳定(目前67场p=0.025已显著)。
-2. **减扑空增利**:edge已确认,可调 TAKER_BUFFER 0.02→0.03,扑空20%→~10%,利润预计+15-20%。
+2. **减扑空增利**:edge已确认后,优先优化下单延迟/盘口深度;当前按 shares FOK 固定份额,不再靠调 TAKER_BUFFER。
    (扑空17次≈漏掉~$30利润;扑空不亏钱只漏机会)
 3. **链上核对真实美元盈亏**(state口径+$143不一定准)。
 4. LightGBM:样本146/1000,够1000自动训→影子模式→接管下注(ROADMAP#1,2)。
