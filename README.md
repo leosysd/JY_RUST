@@ -6,7 +6,27 @@ Polymarket BTC 5 分钟 Up/Down 自动交易机器人。自带命令行工具 `j
 
 ## 安装
 
-Debian / Ubuntu。一条命令完成：装依赖 → 装 Rust → 从 GitHub 拉代码编译 → 注册 systemd 服务。
+### 方式 A：预编译二进制（推荐，秒装，VPS 不用编译）
+
+代码由 GitHub Actions 自动编译好并发布到 Release，VPS 直接下载二进制即可。
+**适用 x86_64 + Ubuntu 22.04+/Debian 12+（glibc ≥ 2.35）。** 一条命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leosysd/JY_RUST/main/scripts/install-bin.sh | bash
+```
+
+脚本会：下载 `jy`/`jy-bot`（带 SHA256 校验）→ 装到 `/usr/local/bin` → 建 `/opt/jy-data` 与 `.env` → 注册 systemd 服务。
+默认装滚动版 `latest`；要装指定版本：`JY_TAG=v0.1.0 curl ... | bash`。
+
+升级（重新拉最新二进制并重启）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leosysd/JY_RUST/main/scripts/install-bin.sh | bash && sudo systemctl restart jy-bot
+```
+
+### 方式 B：源码编译安装（其它架构 / 想自己编）
+
+在 VPS 上装 Rust 并从源码编译（约 5–8 分钟）：
 
 ```bash
 # 1. 先建好目录（安装脚本不会自动建，必须先手动建，否则报 Permission denied）

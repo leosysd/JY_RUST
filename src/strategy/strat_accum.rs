@@ -33,7 +33,7 @@ impl SmartStrategy {
         if !self.accum.contains_key(&market.slug) {
             let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
             if price_to_beat < 1000.0 { return Ok(()); }       // 开盘 Chainlink 价未就绪
-            let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
+            let Some(sig) = self.model.compute(price_to_beat, seconds_left, crate::zscore::DirSource::Chainlink) else { return Ok(()); };
             let z = self.config.accum_entry_z;
             let dir = if sig.z >= z { "Up" } else if sig.z <= -z { "Down" } else { return Ok(()); };
             let ask = if dir == "Up" { up_ask } else { dn_ask };

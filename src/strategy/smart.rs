@@ -17,9 +17,8 @@ use tokio::io::AsyncWriteExt;
 /// P1 纯套利门槛：full_cost(up)+full_cost(dn) < 此值时同时买两边
 pub(crate) const ARB_THRESHOLD: f64 = 0.995;
 /// P2 锁利门槛系数现由 config.lock_min_profit_factor 控制（门槛 = order_shares × factor）。
-/// P4 趋势入场价格范围
-pub(crate) const TREND_ENTRY_MIN: f64 = 0.48;
-pub(crate) const TREND_ENTRY_MAX: f64 = 0.65;
+/// 注:原 P4 趋势入场价带常量 TREND_ENTRY_MIN/MAX 已废弃——入场价带改用
+/// config.ev_solo_min_ask / ev_solo_max_ask（zscore 入场已对齐 ev_solo）。
 /// P4 趋势追单步长（价格涨 0.05 才追下一笔）
 pub(crate) const TREND_STEP: f64 = 0.05;
 /// P4 最多追多少笔
@@ -262,7 +261,8 @@ impl SmartStrategy {
         if self.config.z_record_enabled && now > self.z_last_ts {
             let pb = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
             if pb >= 1000.0 && now >= market.start_ts {
-                if let Some(sig) = self.model.compute(pb, seconds_left) {
+                // 盘内 z 快照沿用原 Chainlink 公式(与历史 z_tick 口径一致)。
+                if let Some(sig) = self.model.compute(pb, seconds_left, crate::zscore::DirSource::Chainlink) {
                     self.z_last_ts = now;
                     let rec = serde_json::json!({
                         "phase":"z_tick","market":market.slug,"ts":now,

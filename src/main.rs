@@ -3,6 +3,7 @@ mod config;
 mod executor;
 mod feeds;
 mod model;
+mod momentum;
 mod position;
 mod recorder;
 mod state;

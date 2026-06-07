@@ -18,6 +18,8 @@ mod ws;
 mod zscore;
 #[path = "../model.rs"]
 mod model;
+#[path = "../momentum.rs"]
+mod momentum;
 #[path = "../strategy/mod.rs"]
 mod strategy;
 

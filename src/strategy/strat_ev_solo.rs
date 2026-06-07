@@ -28,7 +28,8 @@ impl SmartStrategy {
         let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
         if price_to_beat < 1000.0 { return Ok(()); }
 
-        let Some(sig) = self.model.compute(price_to_beat, seconds_left) else { return Ok(()); };
+        // ev_solo 保持原 Chainlink 混合公式(不受 zscore 币安开关影响)。
+        let Some(sig) = self.model.compute(price_to_beat, seconds_left, crate::zscore::DirSource::Chainlink) else { return Ok(()); };
         let Some(dir) = sig.direction() else {
             debug!("[EV_SOLO] {} z={:.3} 信号不足,不入场", market.title, sig.z);
             return Ok(());
