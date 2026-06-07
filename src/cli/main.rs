@@ -122,6 +122,22 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
                 service_cmd("restart");
             }
         }
+        "set-order-mode" => {
+            let val = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            let v = match val.to_lowercase().as_str() {
+                "market" | "m" | "taker" => "market",
+                "maker" | "k" | "make" => "maker",
+                other => {
+                    eprintln!("未知下单方式: {other}（可选 market | maker）");
+                    std::process::exit(1);
+                }
+            };
+            set_env_val("ORDER_MODE", v);
+            println!("{} ORDER_MODE={v}", style("✔").green());
+            if args.contains(&"--restart".to_string()) {
+                service_cmd("restart");
+            }
+        }
         "set-param" => {
             // 通用：jy set-param <KEY> <VALUE> [--restart]
             let key = args.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -210,9 +226,10 @@ fn interactive_menu() -> Result<()> {
             "8.  查看实时日志",
             "9.  切换 DRY_RUN 模式",
             "10. 切换入场策略（zscore / ev_solo / sniper / accum）",
-            "11. 调策略参数（sniper / ev_solo / 滑点 等）",
-            "12. 清空模拟数据",
-            "13. 更新程序（从 GitHub 拉取最新版本）",
+            "11. 切换下单方式（market 吃单 / maker 挂单）",
+            "12. 调策略参数（sniper / ev_solo / 滑点 等）",
+            "13. 清空模拟数据",
+            "14. 更新程序（从 GitHub 拉取最新版本）",
             "0.  退出",
         ];
 
@@ -238,10 +255,11 @@ fn interactive_menu() -> Result<()> {
             }
             8 => toggle_dry_run()?,
             9 => toggle_entry_strategy()?,
-            10 => tune_params()?,
-            11 => clear_sim_data()?,
-            12 => update_bot()?,
-            13 => break,
+            10 => toggle_order_mode()?,
+            11 => tune_params()?,
+            12 => clear_sim_data()?,
+            13 => update_bot()?,
+            14 => break,
             _ => {}
         }
     }
@@ -356,6 +374,25 @@ fn toggle_entry_strategy() -> Result<()> {
     let new_val = match choice { 3 => "accum", 2 => "sniper", 1 => "ev_solo", _ => "zscore" };
     set_env_val("ENTRY_STRATEGY", new_val);
     println!("{} ENTRY_STRATEGY={new_val}", style("✔").green());
+    if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
+        service_cmd("restart");
+    }
+    Ok(())
+}
+
+fn toggle_order_mode() -> Result<()> {
+    let curr = read_env_val("ORDER_MODE").unwrap_or_else(|| "market".into());
+    let choice = Select::with_theme(&theme())
+        .with_prompt("选择下单方式")
+        .items(&[
+            "market - 市价吃单(taker,立即成交,付 taker 手续费;默认)",
+            "maker  - 挂单(GTC post_only,挂在对侧 ask 下 1 tick,省 taker 费,可能不成交)",
+        ])
+        .default(if curr == "maker" { 1 } else { 0 })
+        .interact()?;
+    let new_val = if choice == 1 { "maker" } else { "market" };
+    set_env_val("ORDER_MODE", new_val);
+    println!("{} ORDER_MODE={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
         service_cmd("restart");
     }

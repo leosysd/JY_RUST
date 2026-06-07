@@ -35,6 +35,14 @@ impl SmartStateStore {
         self.positions.get(slug)
     }
 
+    /// 返回当前持有未成交 maker 挂单的盘口 (slug, end_ts) 列表(供 maker 收割遍历)
+    pub fn open_order_slugs(&self) -> Vec<(String, i64)> {
+        self.positions.iter()
+            .filter(|(_, p)| !p.open_orders.is_empty())
+            .map(|(k, v)| (k.clone(), v.end_ts))
+            .collect()
+    }
+
     /// 返回需要结算查询的盘口（已结束 ≥10s，未结算）
     pub fn pending_settlement(&self) -> Vec<(String, MarketPosition)> {
         let now = chrono::Utc::now().timestamp();

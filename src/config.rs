@@ -54,6 +54,11 @@ pub struct Config {
     /// "zscore"=z信号+锁利/追单/减险(baseline);"ev_solo"=z定方向+纯单边裸持(正期望主策略)
     pub entry_strategy: String,
 
+    /// 下单方式开关(两个独立模块,互不影响):
+    /// "market"=吃单(taker,market FOK 立即成交、固定份额;现状,默认)
+    /// "maker"=挂单(GTC 挂单等成交,省 taker 手续费;不保证成交,5m 盘可能踏空)
+    pub order_mode: String,
+
     // ── 路线四:ev_solo 纯单边裸持(数学上唯一正期望路径)──────────────────────
     // z-score定方向→只买该边、不对冲、裸持到结算。靠 z-score 方向胜率(实测154场57.8%)
     // 在合适价位形成正EV。对冲腿在7%费下每份必亏(已数学证明),故彻底不对冲。
@@ -260,6 +265,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         stop_loss_max_opp: env_f64("STOP_LOSS_MAX_OPP", 0.75),
         stop_loss_max_seconds_left: env_i64("STOP_LOSS_MAX_SECONDS_LEFT", 120),
         entry_strategy: env("ENTRY_STRATEGY", "ev_solo").to_lowercase(),
+        order_mode: env("ORDER_MODE", "market").to_lowercase(),
         ev_solo_max_ask: env_f64("EV_SOLO_MAX_ASK", 0.52),
         ev_solo_min_ask: env_f64("EV_SOLO_MIN_ASK", 0.44),
         ev_solo_qty: env_f64("EV_SOLO_QTY", 20.0),
