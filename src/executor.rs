@@ -387,6 +387,85 @@ impl OrderExecutor {
         }
     }
 
+    /// 列出账户当前所有挂单（对账用）。
+    ///
+    /// 走 `client.orders()`(`data/orders` 列表)翻页(最多 5 页)。语义同 `maker_fills`:
+    /// 只返回**未全成**的单——全成交后从列表消失。DryRun 返回空。
+    pub async fn list_open_orders(&self) -> Result<Vec<OpenOrderInfo>> {
+        use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+        match self {
+            Self::DryRun => Ok(vec![]),
+            Self::Live { client, .. } => {
+                let req = OrdersRequest::builder().build();
+                let mut out: Vec<OpenOrderInfo> = Vec::new();
+                let mut cursor: Option<String> = None;
+                let mut pages = 0u32;
+                loop {
+                    let page = client.orders(&req, cursor.clone()).await
+                        .context("查询挂单失败")?;
+                    for o in &page.data {
+                        out.push(OpenOrderInfo {
+                            order_id: o.id.clone(),
+                            token_id: o.asset_id.to_string(),
+                            side: o.side.to_string(),
+                            price: o.price.to_string().parse::<f64>().unwrap_or(0.0),
+                            original_size: o.original_size.to_string().parse::<f64>().unwrap_or(0.0),
+                            size_matched: o.size_matched.to_string().parse::<f64>().unwrap_or(0.0),
+                        });
+                    }
+                    pages += 1;
+                    if page.next_cursor.is_empty() || page.data.is_empty() || pages >= 5 {
+                        break;
+                    }
+                    cursor = Some(page.next_cursor.clone());
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// 查 USDC 余额（对账用）。返回人类单位美元（CLOB balance-allowance 的 balance 字段
+    /// 已是美元单位，非 6 位 base unit，无需除 1e6）。DryRun 返回 0.0。
+    pub async fn usdc_balance(&self) -> Result<f64> {
+        use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+        use polymarket_client_sdk_v2::clob::types::AssetType;
+        match self {
+            Self::DryRun => Ok(0.0),
+            Self::Live { client, .. } => {
+                let req = BalanceAllowanceRequest::builder()
+                    .asset_type(AssetType::Collateral)
+                    .build();
+                let r = client.balance_allowance(req).await.context("查询余额失败")?;
+                Ok(r.balance.to_string().parse::<f64>().unwrap_or(0.0))
+            }
+        }
+    }
+
+    /// 查某 token 最优买一/卖一，返回 `(best_bid, best_ask)`。
+    /// asks 最低价=ask，bids 最高价=bid。空簿对应侧返回 0.0。
+    /// DryRun 返回 (0.0, 0.0)。
+    pub async fn best_bid_ask(&self, token_id: &str) -> Result<(f64, f64)> {
+        use polymarket_client_sdk_v2::clob::types::request::OrderBookSummaryRequest;
+        match self {
+            Self::DryRun => Ok((0.0, 0.0)),
+            Self::Live { client, .. } => {
+                let tid = U256::from_str(token_id)
+                    .with_context(|| format!("token_id 解析失败: {token_id}"))?;
+                let req = OrderBookSummaryRequest::builder().token_id(tid).build();
+                let book = client.order_book(&req).await.context("查询盘口失败")?;
+                // bid = bids 最高价；ask = asks 最低价。空簿返回 0.0。
+                let best_bid = book.bids.iter()
+                    .filter_map(|l| l.price.to_string().parse::<f64>().ok())
+                    .fold(0.0_f64, f64::max);
+                let best_ask = book.asks.iter()
+                    .filter_map(|l| l.price.to_string().parse::<f64>().ok())
+                    .fold(f64::INFINITY, f64::min);
+                let best_ask = if best_ask.is_finite() { best_ask } else { 0.0 };
+                Ok((best_bid, best_ask))
+            }
+        }
+    }
+
     /// 查询某 token 的真实手续费率（bps）。用于核对代码内写死的 7% 假费与实际值。
     pub async fn fee_rate_bps(&self, token_id: &str) -> Result<u32> {
         match self {
@@ -399,6 +478,18 @@ impl OrderExecutor {
             }
         }
     }
+}
+
+/// 账户一张挂单的对账信息（list_open_orders 返回）。
+#[derive(Debug, Clone)]
+pub struct OpenOrderInfo {
+    pub order_id: String,
+    pub token_id: String,
+    /// "BUY" / "SELL"（SDK Side 枚举的大写字符串）。
+    pub side: String,
+    pub price: f64,
+    pub original_size: f64,
+    pub size_matched: f64,
 }
 
 /// 一张 maker 挂单的当前状态（query_order 返回）。

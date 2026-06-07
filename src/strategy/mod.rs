@@ -1,1 +1,9 @@
 pub mod smart;
+mod order_market;
+mod order_maker;
+mod strat_zscore;
+mod strat_ev_solo;
+mod strat_sniper;
+mod strat_accum;
+mod settlement;
+mod features;

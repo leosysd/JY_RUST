@@ -113,6 +113,16 @@ pub struct Config {
     /// 晚场补救:顺势补强势边到"该边赢结算 PnL >此值"(cap 不限)。
     pub accum_rescue_goal: f64,
 
+    // ── maker quote/replace lifecycle 参数 ───────────────────────────────
+    /// maker 挂单存活时长(秒):挂单超过此时长未成交即撤(配合 replace)。
+    pub maker_quote_ttl_secs: i64,
+    /// 盘口移动超过几个 0.01 tick 就撤旧挂新(cancel/replace 判断)。
+    pub maker_replace_ticks: i64,
+    /// zquote 看涨侧挂单价。
+    pub zquote_up_px: f64,
+    /// zquote 看跌侧挂单价。
+    pub zquote_dn_px: f64,
+
     // 系统
     pub poll_ms: u64,
     pub state_file: PathBuf,
@@ -288,6 +298,11 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_rescue_lo: env_f64("ACCUM_RESCUE_LO", 0.78),
         accum_rescue_hi: env_f64("ACCUM_RESCUE_HI", 0.83),
         accum_rescue_goal: env_f64("ACCUM_RESCUE_GOAL", 10.0),
+
+        maker_quote_ttl_secs: env_i64("MAKER_QUOTE_TTL_SECS", 5),
+        maker_replace_ticks: env_i64("MAKER_REPLACE_TICKS", 1),
+        zquote_up_px: env_f64("ZQUOTE_UP_PX", 0.52),
+        zquote_dn_px: env_f64("ZQUOTE_DN_PX", 0.488),
 
         poll_ms: env_u64("POLL_MS", 200),
         state_file: base.join(env("QUANT_STATE_FILE", "quant_state.json")),
