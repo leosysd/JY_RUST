@@ -268,13 +268,31 @@ impl OrderExecutor {
     /// 挂 maker 限价单（GTC + post_only）。
     /// post_only 保证只做 maker：若该价会立即吃单，交易所直接拒绝（success=false），
     /// 从而永不付 taker 费。返回 Fill：
-    ///   - DryRun：立即全额成交（filled_shares=shares）。
+    ///   - DryRun：模拟「挂单成功但未成交」（success=true、simulated=true、filled_shares=0），
+    ///     order_id 唯一，让上层进 open_orders 走「挂→等→TTL撤→重挂」闭环（去重生效，不刷单）。
     ///   - LIVE 挂单成功：success=true、filled_shares=0（挂在簿上，等 query_order 收割）。
     ///   - LIVE 被拒（会吃单/越界）：success=false。
     pub async fn place_maker(&self, token_id: &str, price: f64, shares: f64) -> Result<Fill> {
         let order_shares = normalize_order_shares(shares)?;
         match self {
-            Self::DryRun => Ok(Fill::simulated(price, order_shares)),
+            // DryRun maker：模拟「挂单成功、尚未成交」。order_id 必须唯一,
+            // 否则 open_orders 里多张单 id 相同会互相覆盖/误撤。
+            Self::DryRun => {
+                let n = token_id.len().min(8);
+                let order_id = format!(
+                    "dryrun-maker-{}-{}",
+                    &token_id[..n],
+                    chrono::Utc::now().timestamp_millis()
+                );
+                Ok(Fill {
+                    order_id,
+                    status: "live".into(),
+                    success: true,
+                    simulated: true,
+                    filled_price: price,
+                    filled_shares: 0.0,
+                })
+            }
             Self::Live { client, signer } => {
                 let tid = U256::from_str(token_id)
                     .with_context(|| format!("token_id 解析失败: {token_id}"))?;

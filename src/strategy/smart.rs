@@ -88,6 +88,10 @@ pub struct SmartStrategy {
     pub accum: std::collections::HashMap<String, AccumLeg>,
     /// 是否已执行启动对账(reconcile_on_startup)。run_once 首次跑时置 true 并对账一次。
     pub reconciled: bool,
+    /// maker 挂单尝试节流:key=`slug|dir`,value=上次尝试挂单的时间戳(秒)。
+    /// 覆盖两种重复挂单场景:DryRun 撤单后重挂、LIVE 挂单失败(余额不足等)重试。
+    /// 距上次尝试不足 maker_quote_ttl_secs 则跳过,避免每 tick 重复挂单刷屏。
+    pub maker_attempt: std::collections::HashMap<String, i64>,
 }
 
 /// accum 路线每盘状态。首笔 z 定主腿方向(盈亏锚点),之后谁涨追谁/谁跌补谁,
@@ -177,6 +181,7 @@ impl SmartStrategy {
             shadow, model_dir, shadow_mtime,
             accum: std::collections::HashMap::new(),
             reconciled: false,
+            maker_attempt: std::collections::HashMap::new(),
         })
     }
 

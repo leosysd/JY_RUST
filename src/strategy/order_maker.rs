@@ -1,4 +1,4 @@
-use super::smart::{beijing_now, record_trade, strategy_order_shares, SmartStrategy};
+use super::smart::{beijing_now, strategy_order_shares, SmartStrategy};
 use crate::clob::Market;
 use crate::position::TradeRecord;
 use anyhow::Result;
@@ -55,6 +55,20 @@ impl SmartStrategy {
             }
         }
 
+        // 尝试节流:覆盖去重失效的两种重挂场景——
+        //   1. DryRun:挂单后又被 TTL 撤掉,open_orders 已空但不应立刻重挂;
+        //   2. LIVE:挂单失败(余额不足等)直接 return,open_orders 也空。
+        // 距上次「尝试挂单」不足 maker_quote_ttl_secs 则跳过,避免每 tick 重复挂单刷屏。
+        let now = chrono::Utc::now().timestamp();
+        let attempt_key = format!("{}|{}", market.slug, dir);
+        if now - *self.maker_attempt.get(&attempt_key).unwrap_or(&0)
+            < self.config.maker_quote_ttl_secs
+        {
+            debug!("[MAKER] {} {dir} 近期已尝试挂单,节流跳过", market.title);
+            return Ok(false);
+        }
+        self.maker_attempt.insert(attempt_key, now);
+
         // audit:决策要挂单、真正发单前记 intent。
         self.write_signal(&serde_json::json!({
             "phase": "intent", "market": market.slug,
@@ -76,15 +90,9 @@ impl SmartStrategy {
         })).await?;
         if !fill.success { return Ok(false); }
 
-        // DryRun 特判:模拟立即全成交,直接记账,不进挂单追踪
-        if fill.simulated && fill.filled_shares > 0.0 {
-            record_trade(&mut self.state, market, dir, maker_px, fill.filled_shares, phase_label, price_to_beat, false);
-            self.state.save().await?;
-            return Ok(true);
-        }
-
-        // LIVE 挂单成功:push 进 open_orders,等 harvest_makers 收割
-        let now = chrono::Utc::now().timestamp();
+        // 挂单成功(DryRun 模拟「已挂、未成交」/ LIVE 真挂):push 进 open_orders,
+        // 等 harvest_makers 收割。DryRun 下 query_order 返回 size_matched=0(不成交),
+        // 到 TTL 由 harvest 撤单移除,下次 decide 节流也到期才重挂,形成挂→等→撤→重挂闭环。
         let order = crate::position::OpenOrder {
             order_id: fill.order_id.clone(),
             side: dir.to_string(),
