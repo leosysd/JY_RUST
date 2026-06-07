@@ -41,12 +41,15 @@ curl -fsSL https://raw.githubusercontent.com/leosysd/JY_RUST/main/scripts/instal
 
 | 路径 | 内容 |
 |------|------|
-| `/opt/jy-rust` | 源码（从 GitHub 克隆，`jy update` 用它更新）|
 | `/opt/jy-data` | 配置 `.env`、状态 `quant_state.json`、日志、盘口数据 |
 | `/usr/local/bin/jy` | 命令行工具 |
 | `/usr/local/bin/jy-bot` | 后台交易进程（systemd 服务 `jy-bot`）|
+| `/opt/jy-rust` | 源码（仅方式 B 源码安装时存在）|
 
 > 默认 `DRY_RUN=1`（模拟，不下真单）。实盘前需先填钱包私钥并切到 `DRY_RUN=0`。
+>
+> **更新**：`jy update`（或菜单 14）现在直接下载 GitHub 预编译二进制并重启，秒级完成、无需在 VPS 编译；
+> 不论你当初用方式 A 还是 B 装的都能用。要源码编译更新：在 `/opt/jy-rust` 执行 `git pull && cargo build --release`。
 
 ---
 

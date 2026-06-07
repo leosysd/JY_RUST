@@ -236,7 +236,7 @@ fn interactive_menu() -> Result<()> {
             "11. 切换下单方式（market 吃单 / maker 挂单）",
             "12. 调策略参数（sniper / ev_solo / 滑点 等）",
             "13. 清空模拟数据",
-            "14. 更新程序（从 GitHub 拉取最新版本）",
+            "14. 更新程序（下载 GitHub 预编译二进制并重启）",
             "0.  退出",
         ];
 
@@ -830,112 +830,95 @@ fn set_env_val(key: &str, val: &str) {
 }
 
 fn update_bot() -> Result<()> {
-    const REPO: &str = "https://github.com/leosysd/JY_RUST.git";
-    const INSTALL_DIR: &str = "/opt/jy-rust";
+    // 更新方式已改为「下载 GitHub 预编译二进制」，与 scripts/install-bin.sh 一致：
+    // 不再在 VPS 上 git pull + cargo build，秒级完成，无需 Rust 工具链。
+    // 想用旧的源码编译更新：在 /opt/jy-rust 执行 git pull && cargo build --release。
+    const REPO: &str = "leosysd/JY_RUST";
+    let tag = std::env::var("JY_TAG").unwrap_or_else(|_| "latest".to_string());
+    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
 
-    println!("{}", style("── 更新程序 ──").bold());
-    println!("  来源: {}", style(REPO).dim());
+    println!("{}", style("── 更新程序（下载预编译二进制）──").bold());
+    println!("  来源: {}", style(&base).dim());
     println!();
 
-    // 确认
+    // 预编译仅 x86_64-linux-gnu；其它架构走源码更新。
+    if std::env::consts::ARCH != "x86_64" {
+        println!("  {} 当前架构 {}，无预编译二进制。", style("✖").red(), std::env::consts::ARCH);
+        println!("  请改用源码更新：在 /opt/jy-rust 执行 git pull && cargo build --release");
+        return Ok(());
+    }
+
     let ok = Confirm::with_theme(&theme())
-        .with_prompt("从 GitHub 拉取最新版本并重新编译？（服务将短暂停止）")
+        .with_prompt(format!("从 GitHub Release（{tag}）下载最新二进制并替换？（服务将短暂停止）"))
         .default(true)
         .interact()?;
     if !ok {
         return Ok(());
     }
 
+    // 出错时用旧版本把服务拉起来，避免停摆。
+    let restart = || {
+        let _ = std::process::Command::new("sudo")
+            .args(["systemctl", "start", SERVICE])
+            .status();
+    };
+
     println!("{} 停止服务...", style("[1/4]").cyan());
     let _ = std::process::Command::new("sudo")
         .args(["systemctl", "stop", SERVICE])
         .status();
 
-    println!("{} 拉取最新代码...", style("[2/4]").cyan());
-    let pull_status = if std::path::Path::new(&format!("{}/.git", INSTALL_DIR)).exists() {
-        std::process::Command::new("git")
-            .args(["-C", INSTALL_DIR, "pull", "--ff-only"])
+    println!("{} 下载二进制...", style("[2/4]").cyan());
+    let tmp = std::env::temp_dir().join("jy-update");
+    let _ = std::fs::create_dir_all(&tmp);
+    let dl = |url: String, out: &std::path::Path| -> bool {
+        std::process::Command::new("curl")
+            .args(["-fSL", &url, "-o", &out.to_string_lossy()])
             .status()
-    } else {
-        std::process::Command::new("git")
-            .args(["clone", REPO, INSTALL_DIR])
-            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     };
-
-    match pull_status {
-        Ok(s) if s.success() => println!("  {} 代码更新成功", style("✔").green()),
-        Ok(s) => {
-            println!("  {} git 退出码: {}", style("✖").red(), s.code().unwrap_or(-1));
-            println!("  正在重启服务（使用旧版本）...");
-            let _ = std::process::Command::new("sudo")
-                .args(["systemctl", "start", SERVICE])
-                .status();
-            return Ok(());
-        }
-        Err(e) => {
-            println!("  {} {e}", style("✖").red());
-            let _ = std::process::Command::new("sudo")
-                .args(["systemctl", "start", SERVICE])
-                .status();
-            return Ok(());
-        }
+    let tmp_bot = tmp.join("jy-bot");
+    let tmp_cli = tmp.join("jy");
+    if !dl(format!("{base}/jy-bot"), &tmp_bot) || !dl(format!("{base}/jy"), &tmp_cli) {
+        println!("  {} 下载失败（检查网络/该版本是否已发布），用旧版本重启", style("✖").red());
+        restart();
+        return Ok(());
     }
+    println!("  {} 下载完成", style("✔").green());
 
-    println!("{} 编译中（需要 1-2 分钟）...", style("[3/4]").cyan());
-
-    // 确保 cargo 在 PATH 中
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let cargo_path = format!("{home}/.cargo/bin");
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{cargo_path}:{current_path}");
-
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(INSTALL_DIR)
-        .env("PATH", &new_path)
-        .status();
-
-    match build_status {
-        Ok(s) if s.success() => println!("  {} 编译成功", style("✔").green()),
-        _ => {
-            println!("  {} 编译失败，使用旧版本重启", style("✖").red());
-            let _ = std::process::Command::new("sudo")
-                .args(["systemctl", "start", SERVICE])
-                .status();
+    println!("{} 校验 SHA256...", style("[3/4]").cyan());
+    if dl(format!("{base}/SHA256SUMS"), &tmp.join("SHA256SUMS")) {
+        let pass = std::process::Command::new("sha256sum")
+            .args(["-c", "SHA256SUMS"])
+            .current_dir(&tmp)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !pass {
+            println!("  {} 校验失败，放弃更新，用旧版本重启", style("✖").red());
+            restart();
             return Ok(());
         }
+        println!("  {} 校验通过", style("✔").green());
+    } else {
+        println!("  {} 无 SHA256SUMS，跳过校验", style("•").dim());
     }
 
     println!("{} 安装并重启服务...", style("[4/4]").cyan());
-    let bin_dir = format!("{INSTALL_DIR}/target/release");
-    // 原子替换:cp 到 .new 临时文件 → mv -f 覆盖。
-    // 关键:update 是用正在运行的 jy 跑的,直接 cp 覆盖 /usr/local/bin/jy 会
-    // "Text file busy"。mv(rename)不截断目标,能替换正在运行的二进制,彻底避坑。
-    let ok_bot = install_bin(&format!("{bin_dir}/jy-bot"), "/usr/local/bin/jy-bot");
-    let ok_cli = install_bin(&format!("{bin_dir}/jy"), "/usr/local/bin/jy");
+    // 原子替换:mv(rename)不截断目标,能替换正在运行的二进制,避免 "Text file busy"。
+    let ok_bot = install_bin(tmp_bot.to_string_lossy().as_ref(), "/usr/local/bin/jy-bot");
+    let ok_cli = install_bin(tmp_cli.to_string_lossy().as_ref(), "/usr/local/bin/jy");
     if !ok_bot || !ok_cli {
         println!("  {} 二进制安装失败,服务仍用旧版本重启,请人工检查", style("✖").red());
-        let _ = std::process::Command::new("sudo")
-            .args(["systemctl", "start", SERVICE])
-            .status();
+        restart();
         return Ok(());
     }
     println!("  {} 二进制已原子替换", style("✔").green());
-
-    let _ = std::process::Command::new("sudo")
-        .args(["systemctl", "start", SERVICE])
-        .status();
+    restart();
 
     println!();
-    println!("{} 更新完成！", style("✔").green().bold());
-
-    // 显示新版本的 git log
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["-C", INSTALL_DIR, "log", "--oneline", "-3"])
-        .output()
-    {
-        println!("  最新提交:\n  {}", String::from_utf8_lossy(&out.stdout).trim().replace('\n', "\n  "));
-    }
+    println!("{} 更新完成！（预编译版，未在本机编译）", style("✔").green().bold());
 
     Ok(())
 }
