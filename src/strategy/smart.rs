@@ -219,11 +219,14 @@ impl SmartStrategy {
         let up_token = market.token_ids[up_idx].clone();
         let dn_token = market.token_ids[dn_idx].clone();
 
-        // sniper 开盘预热(每盘一次):填好 Up/Down 的 tick/neg-risk/fee 缓存 + 打热一条连接。
+        // 开盘预热(每盘一次):填好 Up/Down 的 tick/neg-risk/fee 缓存 + 打热一条连接。
+        // 覆盖所有"开盘段吃单入场"的策略:sniper/accum/ev_solo/zscore——让首单 build 命中
+        // 缓存(冷缓存 build 实测 400-900ms,命中后降到几 ms)、post 复用热连接免握手。
         // 实盘统计:96% 下单在开盘后≤30s、全部≤48s,远早于 CF 切空闲连接(~100s),
-        // 故开盘 prewarm 一次即覆盖全部下单窗口,无需整盘每 50s ping(84% 时间根本不下单)。
-        // (连接握手实测仅 ~45ms;prewarm 省的是这 45ms,暴雷在平台撮合、与连接无关。)
-        if matches!(self.config.entry_strategy.as_str(), "sniper" | "accum") && !self.primed_slugs.contains(&market.slug) {
+        // 故开盘 prewarm 一次即覆盖入场窗口。(连接握手~45ms;post 大头是平台撮合、与连接无关。)
+        // 注:zscore 盘中追单/锁利可能晚于 90s、连接届时已冷——本预热只保证"入场"那笔快。
+        if matches!(self.config.entry_strategy.as_str(), "sniper" | "accum" | "ev_solo" | "zscore")
+            && !self.primed_slugs.contains(&market.slug) {
             self.executor.prime_token(&up_token).await;
             self.executor.prime_token(&dn_token).await;
             let exec = self.executor.clone();
