@@ -71,6 +71,9 @@ pub struct SmartStrategy {
     pub sniped_slugs: std::collections::HashSet<String>,
     /// 已预热缓存的盘(sniper 每盘开始预热 tick/neg-risk/fee,防重复预热)。
     pub primed_slugs: std::collections::HashSet<String>,
+    /// 已"开盘前保活"过的盘 end_ts(=下一盘 start_ts)。当前盘临结束前 ~2s 打热一条连接,
+    /// 让下一盘"开盘那笔"命中热连接;每个 end_ts 只打一次,防末段每 tick 刷。
+    pub prewarm_ahead_for: i64,
     /// 上次结算检查的 unix 秒。决策主循环据此节流结算网络请求(见 SETTLEMENT_CHECK_INTERVAL),
     /// 让结算查询不再每 tick 阻塞、拖慢下一盘入场。
     pub last_settlement_check: i64,
@@ -177,6 +180,7 @@ impl SmartStrategy {
             sampled_slugs: std::collections::HashSet::new(),
             sniped_slugs: std::collections::HashSet::new(),
             primed_slugs: std::collections::HashSet::new(),
+            prewarm_ahead_for: 0,
             last_settlement_check: 0,
             z_last_ts: 0,
             shadow, model_dir, shadow_mtime,
@@ -212,6 +216,22 @@ impl SmartStrategy {
         }
 
         let seconds_left = market.seconds_left();
+
+        // ── 开盘前保活 ──────────────────────────────────────────────────────
+        // 当前盘临结束前 ~2s(=下一盘即将开盘)打热一条连接,让下一盘"开盘那笔"
+        // (ev_solo/zscore 在 T-300 入场)命中热连接、免冷启 TCP+TLS 握手。
+        // 关键:必须放在下面 seconds_left<5 的 return 之前,否则收尾段被提前 return;
+        // 且每个 end_ts 只打一次(末段 ~10 个 tick 不重复 ping)。仅吃单入场策略需要。
+        if matches!(self.config.entry_strategy.as_str(), "sniper" | "accum" | "ev_solo" | "zscore")
+            && market.end_ts - now <= 2
+            && self.prewarm_ahead_for != market.end_ts
+        {
+            self.prewarm_ahead_for = market.end_ts;
+            let exec = self.executor.clone();
+            tokio::spawn(async move { exec.prewarm().await; });
+            debug!("[SMART] 开盘前保活:为下一盘(start={})预热连接", market.end_ts);
+        }
+
         if seconds_left < 5 { return Ok(()); }
 
         let up_idx = market.outcomes.iter().position(|o| o == "Up").unwrap_or(0);
