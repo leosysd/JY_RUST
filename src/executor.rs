@@ -186,7 +186,26 @@ impl OrderExecutor {
                     t_build.as_millis(), t_sign.as_millis(), t_post.as_millis(),
                     (t_build + t_sign + t_post).as_millis()
                 );
-                let resp = resp_result.context("提交订单失败")?;
+                // FAK 完全无对手单时,CLOB 不返回正常响应而是甩 400
+                // ("no orders found to match with FAK order")。这语义上就是扑空
+                // (等价 FOK 的 kill),不该走 Err 报错路径——转成 success=false 的 Fill,
+                // 让上层照常记 miss + 下个 tick 重试,日志也不再刷 [SMART ORDER ERR]。
+                let resp = match resp_result {
+                    Ok(r) => r,
+                    Err(e) if matches!(order_type, OrderType::FAK)
+                        && e.to_string().contains("no orders found to match") => {
+                        warn!("[EXEC] FAK 无可匹配挂单,视为扑空(不记账)");
+                        return Ok(Fill {
+                            order_id: String::new(),
+                            status: "unmatched".to_string(),
+                            success: false,
+                            simulated: false,
+                            filled_price: price,
+                            filled_shares: 0.0,
+                        });
+                    }
+                    Err(e) => return Err(e).context("提交订单失败"),
+                };
 
                 // 从真实成交额反推成交均价/份额：BUY → making=USDC支出, taking=买到份额
                 let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
