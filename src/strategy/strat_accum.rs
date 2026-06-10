@@ -208,7 +208,13 @@ impl SmartStrategy {
             "label": label, "mode": self.config.order_mode,
             "ts": chrono::Utc::now().timestamp(),
         })).await?;
-        let fill = match self.executor.buy(token, price, shares, None).await {
+        // 吃单类型按开关:"fak"=FAK(部分成交也要,对累积建仓尤其合适);其余=FOK。
+        let fill_res = if self.config.order_mode == "fak" {
+            self.executor.buy_fak(token, price, shares, None).await
+        } else {
+            self.executor.buy(token, price, shares, None).await
+        };
+        let fill = match fill_res {
             Ok(f) => f,
             Err(e) => { warn!("[ACCUM ORDER ERR] {} {dir} {label}: {e:#}", market.title); return Ok(()); }
         };

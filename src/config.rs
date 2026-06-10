@@ -54,9 +54,10 @@ pub struct Config {
     /// "zscore"=z信号+锁利/追单/减险(baseline);"ev_solo"=z定方向+纯单边裸持(正期望主策略)
     pub entry_strategy: String,
 
-    /// 下单方式开关(两个独立模块,互不影响):
-    /// "market"=吃单(taker,market FOK 立即成交、固定份额;现状,默认)
-    /// "maker"=挂单(GTC 挂单等成交,省 taker 手续费;不保证成交,5m 盘可能踏空)
+    /// 下单方式开关(独立模块,互不影响):
+    /// "market"=吃单 FOK(taker,要么全成要么整单废,固定份额)
+    /// "fak"   =吃单 FAK(taker,能成多少成多少、剩余撤;浅流动性不扑空但可能只成零头)
+    /// "maker" =挂单(GTC post_only 等成交,省 taker 手续费;不保证成交,5m 盘可能踏空)
     pub order_mode: String,
 
     // ── 路线四:ev_solo 纯单边裸持(数学上唯一正期望路径)──────────────────────

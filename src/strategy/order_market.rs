@@ -29,7 +29,13 @@ impl SmartStrategy {
                 return None;
             }
         };
-        match self.executor.buy(token, price, shares, limit_price).await {
+        // 吃单类型按开关:"fak"=FAK(能成多少成多少,剩余撤);其余("market")=FOK(全成或全废)。
+        let fill_res = if self.config.order_mode == "fak" {
+            self.executor.buy_fak(token, price, shares, limit_price).await
+        } else {
+            self.executor.buy(token, price, shares, limit_price).await
+        };
+        match fill_res {
             Ok(fill) => {
                 if !fill.simulated {
                     info!("[SMART ORDER] {} {dir} {phase_label} id={} status={} ok={} 成交{:.1}份@{:.3}",

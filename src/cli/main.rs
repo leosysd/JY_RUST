@@ -128,10 +128,11 @@ fn handle_subcommand(args: &[String]) -> Result<()> {
         "set-order-mode" => {
             let val = args.get(1).map(|s| s.as_str()).unwrap_or("");
             let v = match val.to_lowercase().as_str() {
-                "market" | "m" | "taker" => "market",
+                "market" | "m" | "taker" | "fok" => "market",
+                "fak" | "f" => "fak",
                 "maker" | "k" | "make" => "maker",
                 other => {
-                    eprintln!("未知下单方式: {other}（可选 market | maker）");
+                    eprintln!("未知下单方式: {other}（可选 market(FOK) | fak | maker）");
                     std::process::exit(1);
                 }
             };
@@ -233,7 +234,7 @@ fn interactive_menu() -> Result<()> {
             "8.  查看实时日志",
             "9.  切换 DRY_RUN 模式",
             "10. 切换入场策略（zscore / ev_solo / sniper / accum / zquote）",
-            "11. 切换下单方式（market 吃单 / maker 挂单）",
+            "11. 切换下单方式（market FOK / fak FAK / maker 挂单）",
             "12. 调策略参数（sniper / ev_solo / 滑点 等）",
             "13. 清空模拟数据",
             "14. 更新程序（下载 GitHub 预编译二进制并重启）",
@@ -393,12 +394,13 @@ fn toggle_order_mode() -> Result<()> {
     let choice = Select::with_theme(&theme())
         .with_prompt("选择下单方式")
         .items(&[
-            "market - 市价吃单(taker,立即成交,付 taker 手续费;默认)",
+            "market - 吃单 FOK(taker,要么全成要么整单废;默认)",
+            "fak    - 吃单 FAK(taker,能成多少成多少、剩余撤,浅流动性不扑空)",
             "maker  - 挂单(GTC post_only,挂在对侧 ask 下 1 tick,省 taker 费,可能不成交)",
         ])
-        .default(if curr == "maker" { 1 } else { 0 })
+        .default(match curr.as_str() { "maker" => 2, "fak" => 1, _ => 0 })
         .interact()?;
-    let new_val = if choice == 1 { "maker" } else { "market" };
+    let new_val = match choice { 2 => "maker", 1 => "fak", _ => "market" };
     set_env_val("ORDER_MODE", new_val);
     println!("{} ORDER_MODE={new_val}", style("✔").green());
     if Confirm::with_theme(&theme()).with_prompt("重启服务？").default(true).interact()? {
