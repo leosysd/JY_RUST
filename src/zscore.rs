@@ -10,14 +10,17 @@ const MOM_WIN_LONG: i64 = 5;
 const MOM_W_SHORT: f64 = 0.60;
 const MOM_W_LONG: f64 = 0.30;
 
-/// 方向公式来源：决定 compute() 用哪套预期偏移 E。隔离用——zscore 可独立选 Binance，
-/// 而 ev_solo/accum/zquote 仍走 Chainlink 原公式，互不影响。
+/// 方向公式来源：决定 compute() 用哪套预期偏移 E。隔离用——各策略独立选，互不影响。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirSource {
-    /// 币安驱动（新）：现价基差校正后相对开盘价 + 币安动量。
+    /// 币安驱动：现价基差校正后相对 Chainlink 开盘价 + 币安动量（仍需 Chainlink 在线）。
     Binance,
     /// Chainlink 混合（原公式）：Chainlink 水平(ct−B) + 币安动量 + Chainlink动量 + 基差回归。
     Chainlink,
+    /// 纯币安（ev_solo 用）：B 与现价都是币安价,同源相减基差自然抵消,无需校正。
+    /// **完全不依赖 Chainlink**——RTDS 断供时唯一还能算 z 的公式。
+    /// 调用方必须传币安开盘价作 price_to_beat（binance_at_tol(start_ts)）。
+    BinancePure,
 }
 
 /// z-score 方向信号
@@ -28,9 +31,9 @@ pub struct ZSignal {
     pub p_down: f64,
     pub e: f64,          // 预期偏移
     pub v: f64,          // 噪声尺度
-    pub ct: f64,         // 当前 Chainlink
+    pub ct: f64,         // 当前 Chainlink(BinancePure 且断供时为 0,仅日志参考)
     pub xt: f64,         // 当前 Binance
-    pub b: f64,          // Price to Beat (开盘 Chainlink)
+    pub b: f64,          // Price to Beat(开盘价;BinancePure 为币安开盘,其余为 Chainlink 开盘)
     pub sigma120: f64,
     pub basis60: f64,
     pub seconds_left: i64,
@@ -70,6 +73,12 @@ impl ZScoreModel {
         self.binance.at_ts(ts)
     }
 
+    /// 带容差取 Binance 价:最近样本偏离 ts 超过 tol_sec 返回 None。
+    /// BinancePure 取开盘价用(防重启后拿最旧点冒充开盘价)。
+    pub fn binance_at_tol(&self, ts: i64, tol_sec: i64) -> Option<f64> {
+        self.binance.at_ts_tol(ts, tol_sec)
+    }
+
     /// 获取 Binance 最新成交价(狙击用:当前价)。
     pub fn binance_latest(&self) -> Option<f64> {
         self.binance.latest().map(|p| p.price)
@@ -90,9 +99,10 @@ impl ZScoreModel {
     }
 
     /// 计算当前 z-score 信号
-    /// price_to_beat: 本轮开盘时的 Chainlink 价格 (B)
+    /// price_to_beat: 本轮开盘价 (B)。Chainlink/Binance 公式传 Chainlink 开盘价;
+    ///                BinancePure 必须传**币安**开盘价(同源相减,基差抵消)。
     /// seconds_left: 距结算剩余秒数
-    /// dir_src: 方向公式来源（zscore 可用 Binance；其他策略传 Chainlink 保持原公式）
+    /// dir_src: 方向公式来源（各策略独立选）
     pub fn compute(&self, price_to_beat: f64, seconds_left: i64, dir_src: DirSource) -> Option<ZSignal> {
         let now = chrono::Utc::now().timestamp();
 
@@ -101,15 +111,20 @@ impl ZScoreModel {
         let cl_snap = self.chainlink.snapshot();
         let bn_snap = self.binance.snapshot();
 
-        let cl_latest = cl_snap.last()?;
         let bn_latest = bn_snap.last()?;
+        // 币安数据必须新鲜（最多5秒延迟）——所有公式的硬条件。
+        if (now - bn_latest.ts).abs() > 5 { return None; }
 
-        // 检查数据是否足够新鲜（最多5秒延迟）
-        if (now - cl_latest.ts).abs() > 5 || (now - bn_latest.ts).abs() > 5 {
-            return None;
-        }
-
-        let ct = cl_latest.price;
+        // Chainlink 新鲜度只在用到它的公式里要求;BinancePure 零依赖,断供也照算
+        // (此时 ct=0 仅影响日志/特征里的 ct 系字段,不进公式)。
+        let ct = match dir_src {
+            DirSource::BinancePure => cl_snap.last().map(|p| p.price).unwrap_or(0.0),
+            _ => {
+                let cl_latest = cl_snap.last()?;
+                if (now - cl_latest.ts).abs() > 5 { return None; }
+                cl_latest.price
+            }
+        };
         let xt = bn_latest.price;
 
         // basis60：最近60秒 Binance - Chainlink 平均差（用于把币安价换算到 Chainlink 口径）
@@ -132,6 +147,12 @@ impl ZScoreModel {
             DirSource::Binance => {
                 let xt_adj = xt - basis60;
                 (xt_adj - price_to_beat)
+                    + MOM_W_SHORT * mom_short
+                    + MOM_W_LONG * mom_long
+            }
+            DirSource::BinancePure => {
+                // 纯币安:B 与现价同源,无需基差校正,不碰任何 Chainlink 数据。
+                (xt - price_to_beat)
                     + MOM_W_SHORT * mom_short
                     + MOM_W_LONG * mom_long
             }

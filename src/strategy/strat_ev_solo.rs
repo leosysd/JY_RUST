@@ -24,13 +24,14 @@ impl SmartStrategy {
         if !matches!(pos.phase, Phase::Waiting) { return Ok(()); }
         if seconds_left < self.config.ev_solo_min_seconds_left { return Ok(()); }
 
-        // 真开盘价取不到则跳过(不退回最新价,见 decide_waiting 注释)。
-        let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
+        // ev_solo 的 z 完全舍弃 Chainlink(用户实测币安近似 z 胜率~70%,且不再受 RTDS 断供影响):
+        // 开盘价 B 取**币安** start_ts 价(5s 容差,取不到不入场——不拿错价凑数),
+        // 公式用 BinancePure(币安现价−币安开盘,同源基差自然抵消,无校正项)。
+        // 注意:结算仍按 Chainlink,这里赌的是 5 分钟内币安涨跌方向≈Chainlink 涨跌方向。
+        let price_to_beat = self.model.binance_at_tol(market.start_ts, 5).unwrap_or(0.0);
         if price_to_beat < 1000.0 { return Ok(()); }
 
-        // ev_solo 切币安方向公式(用户实测币安近似 z 胜率~70%,高于 Chainlink 混合公式的 57.8%)。
-        // 开盘价 B 仍用 Chainlink(与结算口径对齐),现价改用币安(经 basis60 基差校正)+币安动量。
-        let Some(sig) = self.model.compute(price_to_beat, seconds_left, crate::zscore::DirSource::Binance) else { return Ok(()); };
+        let Some(sig) = self.model.compute(price_to_beat, seconds_left, crate::zscore::DirSource::BinancePure) else { return Ok(()); };
         let Some(dir) = sig.direction() else {
             debug!("[EV_SOLO] {} z={:.3} 信号不足,不入场", market.title, sig.z);
             return Ok(());

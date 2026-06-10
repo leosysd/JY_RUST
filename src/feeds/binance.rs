@@ -60,6 +60,15 @@ impl BinanceFeed {
             .map(|p| p.price)
     }
 
+    /// 同 at_ts,但最近样本偏离超过 tol_sec 秒则返回 None。
+    /// 取"开盘价"必须用这个:重启后历史不含 start_ts 时,at_ts 会拿最旧点冒充开盘价
+    /// (与 ChainlinkFeed::at_ts 的 5s 容差同理,宁可不入场也不拿错价)。
+    pub fn at_ts_tol(&self, target_ts: i64, tol_sec: i64) -> Option<f64> {
+        let h = self.history.lock().unwrap();
+        let p = h.iter().min_by_key(|p| (p.ts - target_ts).abs())?;
+        if (p.ts - target_ts).abs() <= tol_sec { Some(p.price) } else { None }
+    }
+
     /// 获取全部历史
     pub fn snapshot(&self) -> Vec<TradePoint> {
         self.history.lock().unwrap().iter().cloned().collect()
