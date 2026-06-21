@@ -23,11 +23,14 @@ impl SmartStrategy {
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         if now < market.start_ts { return Ok(()); }                          // 还没开盘
+        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+        if self.config.accum_late_cascade_enabled {
+            return self.decide_accum_late_cascade(market, up_ask, dn_ask, seconds_left, mode).await;
+        }
         if seconds_left <= self.config.accum_force_seconds { return Ok(()); } // 临近结算停建
         let qty = strategy_order_shares(self.config.accum_qty).unwrap_or(20.0);
         let target = self.config.accum_target_win;
         let maxloss = self.config.accum_max_loss;
-        let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
 
         // ── 首笔:z 定主腿方向,只 BUY ──
         if !self.accum.contains_key(&market.slug) {
@@ -159,6 +162,196 @@ impl SmartStrategy {
         }
 
         Ok(())
+    }
+
+    async fn decide_accum_late_cascade(&mut self, market: &Market, up_ask: f64, dn_ask: f64,
+                            seconds_left: i64, mode: &str) -> Result<()> {
+        let price_to_beat = self.model.chainlink_at(market.start_ts)
+            .or_else(|| self.model.chainlink_latest())
+            .unwrap_or(0.0);
+
+        if !self.accum.contains_key(&market.slug) {
+            if let Some(pos) = self.state.get(&market.slug) {
+                if !pos.trades.is_empty() {
+                    let cascade_done = pos.trades.iter()
+                        .any(|t| t.phase.starts_with("accum_late_cascade_confirm"));
+                    let cascade_base = pos.trades.iter()
+                        .all(|t| t.phase.starts_with("accum_late_cascade"));
+                    let main_dir = if pos.up_shares >= pos.down_shares { "Up" } else { "Down" };
+                    self.accum.insert(market.slug.clone(), AccumLeg {
+                        main_dir: main_dir.to_string(),
+                        up_chase: Vec::new(), dn_chase: Vec::new(),
+                        up_dip: Vec::new(), dn_dip: Vec::new(),
+                        locked: cascade_done || !cascade_base,
+                        rescued: false,
+                    });
+                    self.write_signal(&serde_json::json!({
+                        "phase": "accum_late_cascade_resume_existing",
+                        "market": market.slug,
+                        "existing_trades": pos.trades.len(),
+                        "up_shares": pos.up_shares,
+                        "down_shares": pos.down_shares,
+                        "locked": cascade_done || !cascade_base,
+                        "seconds_left": seconds_left,
+                        "ts": chrono::Utc::now().timestamp(),
+                    })).await?;
+                    return Ok(());
+                }
+            }
+
+            let base_usdc = self.config.accum_late_cascade_base_usdc.max(1.0);
+            let up_q = Self::accum_shares_for_usdc(up_ask, base_usdc);
+            let dn_q = Self::accum_shares_for_usdc(dn_ask, base_usdc);
+            let (up_q, dn_q) = if self.config.accum_late_cascade_base_equal_shares {
+                let q = up_q.max(dn_q);
+                (q, q)
+            } else {
+                (up_q, dn_q)
+            };
+            if up_q < 1.0 || dn_q < 1.0 { return Ok(()); }
+
+            let base_cost = full_cost_per_share(up_ask) * up_q + full_cost_per_share(dn_ask) * dn_q;
+            if self.config.accum_max_exposure > 0.0 && base_cost > self.config.accum_max_exposure {
+                self.write_signal(&serde_json::json!({
+                    "phase": "accum_late_cascade_base_block",
+                    "market": market.slug,
+                    "reason": "base_cost_exceeds_max_exposure",
+                    "base_cost": base_cost,
+                    "max_exposure": self.config.accum_max_exposure,
+                    "up_ask": up_ask,
+                    "dn_ask": dn_ask,
+                    "up_shares": up_q,
+                    "down_shares": dn_q,
+                    "seconds_left": seconds_left,
+                    "ts": chrono::Utc::now().timestamp(),
+                })).await?;
+                return Ok(());
+            }
+
+            info!("[ACCUM {mode}] {} late-cascade base Up@{up_ask:.3}×{up_q:.0} Down@{dn_ask:.3}×{dn_q:.0} T-{seconds_left}s",
+                market.title);
+            self.accum_buy(market, "Up", up_ask, up_q, "accum_late_cascade_base", price_to_beat).await?;
+            self.accum_buy(market, "Down", dn_ask, dn_q, "accum_late_cascade_base", price_to_beat).await?;
+            let main_dir = if up_ask >= dn_ask { "Up" } else { "Down" };
+            self.accum.insert(market.slug.clone(), AccumLeg {
+                main_dir: main_dir.to_string(),
+                up_chase: Vec::new(), dn_chase: Vec::new(),
+                up_dip: Vec::new(), dn_dip: Vec::new(),
+                locked: false, rescued: false,
+            });
+            return Ok(());
+        }
+
+        let leg = self.accum.get(&market.slug).unwrap().clone();
+        if leg.locked { return Ok(()); }
+
+        let Some((rule_name, bin_idx, main, main_px, hedge, hedge_px, target_req)) =
+            Self::accum_late_cascade_rule(seconds_left, up_ask, dn_ask,
+                                          self.config.accum_late_cascade_qty)
+        else { return Ok(()); };
+
+        let target_main = Self::accum_shares_for_request(
+            main_px, target_req, self.config.accum_late_cascade_base_usdc.max(1.0));
+        let (main_now, hedge_now, exposure_now) = {
+            let pos = self.state.get_or_create(&market.slug, market.end_ts);
+            let main_now = if main == "Up" { pos.up_shares } else { pos.down_shares };
+            let hedge_now = if hedge == "Up" { pos.up_shares } else { pos.down_shares };
+            (main_now, hedge_now, pos.up_cost_total + pos.down_cost_total)
+        };
+        let add_main = (target_main - main_now).max(0.0).ceil();
+        let main_after = main_now + add_main;
+        let target_hedge = (main_after * self.config.accum_late_cascade_hedge_frac - 1e-9).ceil();
+        let add_hedge = (target_hedge - hedge_now).max(0.0).ceil();
+        if add_main < 1.0 && add_hedge < 1.0 {
+            if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
+            return Ok(());
+        }
+
+        let add_cost = full_cost_per_share(main_px) * add_main
+            + full_cost_per_share(hedge_px) * add_hedge;
+        let projected_exposure = exposure_now + add_cost;
+        if self.config.accum_max_exposure > 0.0 && projected_exposure > self.config.accum_max_exposure {
+            self.write_signal(&serde_json::json!({
+                "phase": "accum_late_cascade_block",
+                "market": market.slug,
+                "rule": rule_name,
+                "bin": bin_idx,
+                "reason": "projected_exposure_exceeds_max",
+                "exposure": exposure_now,
+                "add_cost": add_cost,
+                "projected_exposure": projected_exposure,
+                "max_exposure": self.config.accum_max_exposure,
+                "main": main,
+                "main_px": main_px,
+                "add_main": add_main,
+                "hedge": hedge,
+                "hedge_px": hedge_px,
+                "add_hedge": add_hedge,
+                "seconds_left": seconds_left,
+                "ts": chrono::Utc::now().timestamp(),
+            })).await?;
+            return Ok(());
+        }
+
+        info!("[ACCUM {mode}] {} late-cascade {rule_name} bin#{bin_idx} main {main}@{main_px:.3} add×{add_main:.0}, hedge {hedge}@{hedge_px:.3} add×{add_hedge:.0} T-{seconds_left}s",
+            market.title);
+        if add_main >= 1.0 {
+            self.accum_buy(market, main, main_px, add_main, "accum_late_cascade_confirm_main", price_to_beat).await?;
+        }
+        if add_hedge >= 1.0 {
+            self.accum_buy(market, hedge, hedge_px, add_hedge, "accum_late_cascade_confirm_hedge", price_to_beat).await?;
+        }
+        if let Some(l) = self.accum.get_mut(&market.slug) {
+            l.main_dir = main.to_string();
+            l.locked = true;
+        }
+        Ok(())
+    }
+
+    fn accum_late_cascade_rule(seconds_left: i64, up_ask: f64, dn_ask: f64, qty: f64)
+        -> Option<(&'static str, usize, &'static str, f64, &'static str, f64, f64)> {
+        let (main, main_px, hedge, hedge_px) = if up_ask >= dn_ask {
+            ("Up", up_ask, "Down", dn_ask)
+        } else {
+            ("Down", dn_ask, "Up", up_ask)
+        };
+        let spread = main_px - hedge_px;
+        if seconds_left <= 30 && hedge_px <= 0.20 && spread >= 0.70 {
+            if let Some(bin) =
+                Self::accum_price_bin(main_px, &[(0.85, 0.87), (0.87, 0.88), (0.94, 0.96)])
+            {
+                return Some(("C30", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        if seconds_left <= 25 && hedge_px <= 0.20 && spread >= 0.70 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.85, 0.87), (0.88, 0.92)]) {
+                return Some(("C25", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        if seconds_left <= 10 && hedge_px <= 0.15 && spread >= 0.80 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.90, 0.92), (0.96, 0.985)]) {
+                return Some(("C10", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        None
+    }
+
+    fn accum_price_bin(price: f64, bins: &[(f64, f64)]) -> Option<usize> {
+        bins.iter().enumerate()
+            .find(|(i, (lo, hi))| {
+                (*lo <= price && price < *hi)
+                    || (*i == bins.len() - 1 && *lo <= price && price <= *hi)
+            })
+            .map(|(i, _)| i)
+    }
+
+    fn accum_shares_for_usdc(price: f64, usdc: f64) -> f64 {
+        if price <= 0.0 { return 0.0; }
+        (usdc / price - 1e-9).ceil().max(1.0)
+    }
+
+    fn accum_shares_for_request(price: f64, shares: f64, min_order_usdc: f64) -> f64 {
+        shares.max(Self::accum_shares_for_usdc(price, min_order_usdc))
     }
 
     /// 当前两个结算情景的 PnL:返回 (主腿方向赢, 主腿方向输)。

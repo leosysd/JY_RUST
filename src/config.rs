@@ -117,6 +117,8 @@ pub struct Config {
     pub accum_target_win: f64,
     /// 计算模块:主腿方向输的最大亏损(补到结算 PnL ≥ −此值)。
     pub accum_max_loss: f64,
+    /// 硬风控:本盘累计含费成本超过此值则不再加仓。0=关闭。
+    pub accum_max_exposure: f64,
     /// 晚场顺势补救:剩余秒<此值才触发(临结算市场已收敛区)。
     pub accum_rescue_secs: i64,
     /// 晚场补救收敛带下/上限:某边 ask∈(lo,hi) 视为"市场已选定该边"。
@@ -124,6 +126,16 @@ pub struct Config {
     pub accum_rescue_hi: f64,
     /// 晚场补救:顺势补强势边到"该边赢结算 PnL >此值"(cap 不限)。
     pub accum_rescue_goal: f64,
+    /// 实验: late-confirm cascade 候选(C30/C25/C10) dry-run/FAK 研究模式。默认关闭。
+    pub accum_late_cascade_enabled: bool,
+    /// late-confirm cascade 主腿目标份额。
+    pub accum_late_cascade_qty: f64,
+    /// late-confirm cascade 对冲腿至少为主腿份额的比例。第二种候选为 0.25(约4:1)。
+    pub accum_late_cascade_hedge_frac: f64,
+    /// 每盘基础双边订单的最小名义金额。Polymarket 最小订单按金额约 $1。
+    pub accum_late_cascade_base_usdc: f64,
+    /// 基础双边订单是否强制等份额。第二种候选为 false, 即 $1 Up + $1 Down。
+    pub accum_late_cascade_base_equal_shares: bool,
 
     // ── maker quote/replace lifecycle 参数 ───────────────────────────────
     /// maker 挂单存活时长(秒):挂单超过此时长未成交即撤(配合 replace)。
@@ -312,10 +324,16 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_dip_levels: env_f64_vec("ACCUM_DIP_LEVELS", "0.25,0.20"),
         accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
         accum_max_loss: env_f64("ACCUM_MAX_LOSS", 7.0),
+        accum_max_exposure: env_f64("ACCUM_MAX_EXPOSURE", 0.0),
         accum_rescue_secs: env_i64("ACCUM_RESCUE_SECS", 100),
         accum_rescue_lo: env_f64("ACCUM_RESCUE_LO", 0.78),
         accum_rescue_hi: env_f64("ACCUM_RESCUE_HI", 0.83),
         accum_rescue_goal: env_f64("ACCUM_RESCUE_GOAL", 10.0),
+        accum_late_cascade_enabled: env_bool("ACCUM_LATE_CASCADE_ENABLED", false),
+        accum_late_cascade_qty: env_f64("ACCUM_LATE_CASCADE_QTY", 300.0),
+        accum_late_cascade_hedge_frac: env_f64("ACCUM_LATE_CASCADE_HEDGE_FRAC", 0.25),
+        accum_late_cascade_base_usdc: env_f64("ACCUM_LATE_CASCADE_BASE_USDC", 1.0),
+        accum_late_cascade_base_equal_shares: env_bool("ACCUM_LATE_CASCADE_BASE_EQUAL_SHARES", false),
 
         maker_quote_ttl_secs: env_i64("MAKER_QUOTE_TTL_SECS", 5),
         maker_replace_ticks: env_i64("MAKER_REPLACE_TICKS", 1),
