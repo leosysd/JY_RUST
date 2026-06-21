@@ -119,11 +119,17 @@ pub struct Config {
     pub accum_max_loss: f64,
     /// 晚场顺势补救:剩余秒<此值才触发(临结算市场已收敛区)。
     pub accum_rescue_secs: i64,
+    /// 晚场顺势补救:剩余秒≤此值则太晚不再触发。0=不设下限。
+    pub accum_rescue_min_seconds_left: i64,
     /// 晚场补救收敛带下/上限:某边 ask∈(lo,hi) 视为"市场已选定该边"。
     pub accum_rescue_lo: f64,
     pub accum_rescue_hi: f64,
-    /// 晚场补救:顺势补强势边到"该边赢结算 PnL >此值"(cap 不限)。
+    /// 晚场补救:顺势补强势边到"该边赢结算 PnL >此值"。
     pub accum_rescue_goal: f64,
+    /// 晚场补救:每盘 rescue 阶段最多补多少份。0=不限。
+    pub accum_rescue_max_shares: f64,
+    /// 晚场补救:补完后若押错,真实结算 PnL 不得低于 -此值。0=关闭。
+    pub accum_rescue_max_worst_loss: f64,
 
     // ── maker quote/replace lifecycle 参数 ───────────────────────────────
     /// maker 挂单存活时长(秒):挂单超过此时长未成交即撤(配合 replace)。
@@ -313,9 +319,12 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
         accum_max_loss: env_f64("ACCUM_MAX_LOSS", 7.0),
         accum_rescue_secs: env_i64("ACCUM_RESCUE_SECS", 100),
+        accum_rescue_min_seconds_left: env_i64("ACCUM_RESCUE_MIN_SECONDS_LEFT", 0),
         accum_rescue_lo: env_f64("ACCUM_RESCUE_LO", 0.78),
         accum_rescue_hi: env_f64("ACCUM_RESCUE_HI", 0.83),
         accum_rescue_goal: env_f64("ACCUM_RESCUE_GOAL", 10.0),
+        accum_rescue_max_shares: env_f64("ACCUM_RESCUE_MAX_SHARES", 0.0),
+        accum_rescue_max_worst_loss: env_f64("ACCUM_RESCUE_MAX_WORST_LOSS", 0.0),
 
         maker_quote_ttl_secs: env_i64("MAKER_QUOTE_TTL_SECS", 5),
         maker_replace_ticks: env_i64("MAKER_REPLACE_TICKS", 1),

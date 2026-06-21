@@ -87,34 +87,41 @@ impl SmartStrategy {
             }
         }
 
-        // ② 晚场顺势补救(临结算收敛,优先于 dip):剩余<rescue_secs、未补救过、某边 ask 进收敛带
+        // ② 晚场顺势补救(临结算收敛,优先于 dip):min_left<剩余<rescue_secs、未补救过、某边 ask 进收敛带
         //    (0.78-0.83)→ 市场已选定该边(6/6回测:未锁盘到此无一不收敛,该边赢≈88%)。
-        //    分笔顺势补强势边到"该边赢结算>rescue_goal"(每笔20+零头,间隔500ms,动态重算),
+        //    分笔顺势补强势边到"该边赢结算>rescue_goal",但受 rescue 份额上限和押错最坏亏损约束。
         //    补完即 locked 停手裸持——押定这边、不再 dip 补反向主腿(否则两边对冲互抵,见21:50盘bug)。
         //    放大下注(正EV×杠杆):命中赚/翻盘亏更大,靠88%命中撑——多天验证为先。
-        if !leg.rescued && seconds_left < self.config.accum_rescue_secs {
+        let rescue_min_left = self.config.accum_rescue_min_seconds_left;
+        let rescue_time_ok = seconds_left < self.config.accum_rescue_secs
+            && (rescue_min_left <= 0 || seconds_left > rescue_min_left);
+        if !leg.rescued && rescue_time_ok {
             let (lo, hi) = (self.config.accum_rescue_lo, self.config.accum_rescue_hi);
             let fired = if up_ask > lo && up_ask < hi { Some(("Up", up_ask)) }
                         else if dn_ask > lo && dn_ask < hi { Some(("Down", dn_ask)) }
                         else { None };
             if let Some((side, p)) = fired {
                 if let Some(l) = self.accum.get_mut(&market.slug) { l.rescued = true; }   // 每盘只补救一次
-                let denom = 1.0 - full_cost_per_share(p);
-                if denom > 0.001 {
+                if 1.0 - full_cost_per_share(p) > 0.001 {
                     let goal = self.config.accum_rescue_goal;
-                    // 分笔补:每笔最多 qty,不足 1 份停止;FOK 不接受部分成交零头。
+                    // 分笔补:最终份额=min(目标份额,风险份额,rescue份额上限,每笔qty)。
+                    // 目标/风险都用真实结算 PnL 口径,避免旧逻辑低估输方手续费。
                     for _step in 0..50 {
-                        let cur = {
-                            let pos = self.state.get_or_create(&market.slug, market.end_ts);
-                            if side == "Up" { pos.pnl_if_up_wins() } else { pos.pnl_if_down_wins() }
-                        };
-                        let need = ((goal - cur) / denom).max(0.0).ceil();
-                        if need < 1.0 { break; }
-                        let this = need.min(qty);
-                        info!("[ACCUM {mode}] {} 晚场补救:顺势补{side}@{p:.3}×{this:.0}份(剩需{need:.0},该边赢→>{goal:.0}) T-{seconds_left}s",
+                        let (target_need, risk_need, cap_left, allowed) = self.accum_rescue_qty(
+                            &market.slug,
+                            market.end_ts,
+                            side,
+                            p,
+                            goal,
+                            self.config.accum_rescue_max_worst_loss,
+                            self.config.accum_rescue_max_shares,
+                        );
+                        if target_need < 1.0 || allowed < 1.0 { break; }
+                        let this = allowed.min(qty);
+                        info!("[ACCUM {mode}] {} 晚场补救:顺势补{side}@{p:.3}×{this:.0}份(目标需{target_need:.0},风险允{risk_need:.0},cap余{cap_left:.0},该边赢→>{goal:.0}) T-{seconds_left}s",
                             market.title);
                         self.accum_buy(market, side, p, this, "accum_rescue", price_to_beat).await?;
-                        if need > qty {
+                        if target_need > this && this >= qty {
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         }
                     }
@@ -184,6 +191,46 @@ impl SmartStrategy {
         if denom <= 0.001 { return 0.0; }                      // 价格过高,补也无效
         let goal = if side == main_dir { target } else { -maxloss };
         ((goal - cur) / denom).max(0.0).ceil()                 // ceil 补够,不让 round 少补
+    }
+
+    /// rescue 份额约束:
+    /// 目标份额 = 补到 side 赢真实结算 PnL >= goal 所需份额;
+    /// 风险份额 = 保证 side 输时真实结算 PnL >= -max_worst_loss 的最多可补份额;
+    /// cap 剩余 = 本盘 rescue 阶段还允许补的份额。
+    pub(crate) fn accum_rescue_qty(&mut self, slug: &str, end_ts: i64, side: &str, price: f64,
+                                   goal: f64, max_worst_loss: f64, max_shares: f64)
+        -> (f64, f64, f64, f64)
+    {
+        let pos = self.state.get_or_create(slug, end_ts);
+        let full_cost = full_cost_per_share(price);
+        let denom = 1.0 - full_cost;
+        if denom <= 0.001 || full_cost <= 0.0 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+
+        let win_cur = pos.settle_pnl(side);
+        let target_need = ((goal - win_cur) / denom).max(0.0).ceil();
+
+        let risk_need = if max_worst_loss > 0.0 {
+            let lose_side = if side == "Up" { "Down" } else { "Up" };
+            let lose_cur = pos.settle_pnl(lose_side);
+            ((lose_cur + max_worst_loss) / full_cost).max(0.0).floor()
+        } else {
+            f64::INFINITY
+        };
+
+        let rescue_done: f64 = pos.trades.iter()
+            .filter(|t| t.phase == "accum_rescue")
+            .map(|t| t.shares)
+            .sum();
+        let cap_left = if max_shares > 0.0 {
+            (max_shares - rescue_done).max(0.0).floor()
+        } else {
+            f64::INFINITY
+        };
+
+        let allowed = target_need.min(risk_need).min(cap_left).floor();
+        (target_need, risk_need, cap_left, allowed)
     }
 
     /// accum 专用下单 + 双轨记账(FOK,只接受整数份额整单成交)。
