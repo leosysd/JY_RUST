@@ -144,15 +144,15 @@ pub struct Config {
     pub accum_rescue_on_locked: bool,
     /// 已锁仓 rescue 只在触发边当前结算 PnL ≤ 此值时执行,避免对已足够盈利的一边继续加仓。
     pub accum_rescue_locked_side_pnl_below: f64,
-    /// 实验: late-confirm cascade 候选(C180/C60/C30/C25/C10) dry-run/FAK 研究模式。默认关闭。
+    /// 实验: late-confirm cascade 候选(C200/C180/.../C5) dry-run/FAK 研究模式。默认关闭。
     pub accum_late_cascade_enabled: bool,
-    /// late-confirm cascade 主腿目标份额。严格 2:1 候选为 295。
+    /// late-confirm cascade 主腿目标份额。当前全样本候选为 295。
     pub accum_late_cascade_qty: f64,
     /// late-confirm cascade 对冲腿至少为主腿份额的比例。0.25 = 最大约 4:1,0.5 = 最大 2:1。
     pub accum_late_cascade_hedge_frac: f64,
     /// 每盘基础双边订单的最小名义金额。Polymarket 最小订单按金额约 $1。
     pub accum_late_cascade_base_usdc: f64,
-    /// 基础双边订单是否强制等份额。严格 2:1 候选为 true。
+    /// 基础双边订单是否强制等份额。当前候选为 true。
     pub accum_late_cascade_base_equal_shares: bool,
     /// late-confirm cascade 单盘最大含费成本。严格候选回测按 300u 资金口径筛选。
     pub accum_late_cascade_max_exposure: f64,

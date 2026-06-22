@@ -746,14 +746,29 @@ impl SmartStrategy {
             ("Down", dn_ask, "Up", up_ask)
         };
         let spread = main_px - hedge_px;
+        if seconds_left == 200 && hedge_px <= 0.22 && spread >= 0.55 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.79, 0.80)]) {
+                return Some(("C200", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
         if seconds_left == 180 && hedge_px <= 0.25 && spread >= 0.55 {
             if let Some(bin) = Self::accum_price_bin(main_px, &[(0.83, 0.85)]) {
                 return Some(("C180", bin, main, main_px, hedge, hedge_px, qty));
             }
         }
+        if seconds_left == 120 && hedge_px <= 0.22 && spread >= 0.70 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.94, 1.00)]) {
+                return Some(("C120", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
         if seconds_left == 60 && hedge_px <= 0.15 && spread >= 0.55 {
             if let Some(bin) = Self::accum_price_bin(main_px, &[(0.85, 0.88)]) {
                 return Some(("C60", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        if seconds_left == 50 && hedge_px <= 0.22 && spread >= 0.55 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.79, 0.81)]) {
+                return Some(("C50", bin, main, main_px, hedge, hedge_px, qty));
             }
         }
         if seconds_left == 30 && hedge_px <= 0.20 && spread >= 0.70 {
@@ -768,9 +783,24 @@ impl SmartStrategy {
                 return Some(("C25", bin, main, main_px, hedge, hedge_px, qty));
             }
         }
+        if seconds_left == 15 && hedge_px <= 0.25 && spread >= 0.50 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.79, 0.82)]) {
+                return Some(("C15", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
         if seconds_left == 10 && hedge_px <= 0.15 && spread >= 0.80 {
             if let Some(bin) = Self::accum_price_bin(main_px, &[(0.90, 0.92), (0.96, 0.985)]) {
                 return Some(("C10", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        if seconds_left == 8 && hedge_px <= 0.18 && spread >= 0.60 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.83, 0.89)]) {
+                return Some(("C8", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        if seconds_left == 5 && hedge_px <= 0.25 && spread >= 0.50 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.75, 0.81)]) {
+                return Some(("C5", bin, main, main_px, hedge, hedge_px, qty));
             }
         }
         None
