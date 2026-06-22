@@ -125,6 +125,8 @@ pub struct Config {
     pub accum_target_win: f64,
     /// 计算模块:主腿方向输的最大亏损(补到结算 PnL ≥ −此值)。
     pub accum_max_loss: f64,
+    /// accum 硬风控:本盘累计含费成本超过此值则冻结/阻止后续加仓。0=关闭。
+    pub accum_max_exposure: f64,
     /// 晚场顺势补救:剩余秒<此值才触发(临结算市场已收敛区)。
     pub accum_rescue_secs: i64,
     /// 晚场顺势补救:剩余秒≤此值则太晚不再触发。0=不设下限。
@@ -142,6 +144,18 @@ pub struct Config {
     pub accum_rescue_on_locked: bool,
     /// 已锁仓 rescue 只在触发边当前结算 PnL ≤ 此值时执行,避免对已足够盈利的一边继续加仓。
     pub accum_rescue_locked_side_pnl_below: f64,
+    /// 实验: late-confirm cascade 候选(C30/C25/C10) dry-run/FAK 研究模式。默认关闭。
+    pub accum_late_cascade_enabled: bool,
+    /// late-confirm cascade 主腿目标份额。严格 2:1 候选为 295。
+    pub accum_late_cascade_qty: f64,
+    /// late-confirm cascade 对冲腿至少为主腿份额的比例。0.5 = 最大 2:1。
+    pub accum_late_cascade_hedge_frac: f64,
+    /// 每盘基础双边订单的最小名义金额。Polymarket 最小订单按金额约 $1。
+    pub accum_late_cascade_base_usdc: f64,
+    /// 基础双边订单是否强制等份额。严格 2:1 候选为 true。
+    pub accum_late_cascade_base_equal_shares: bool,
+    /// late-confirm cascade 单盘最大含费成本。严格候选回测按 300u 资金口径筛选。
+    pub accum_late_cascade_max_exposure: f64,
 
     // ── maker quote/replace lifecycle 参数 ───────────────────────────────
     /// maker 挂单存活时长(秒):挂单超过此时长未成交即撤(配合 replace)。
@@ -330,6 +344,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_dip_levels: env_f64_vec("ACCUM_DIP_LEVELS", "0.25,0.20"),
         accum_target_win: env_f64("ACCUM_TARGET_WIN", 12.0),
         accum_max_loss: env_f64("ACCUM_MAX_LOSS", 7.0),
+        accum_max_exposure: env_f64("ACCUM_MAX_EXPOSURE", 0.0),
         accum_rescue_secs: env_i64("ACCUM_RESCUE_SECS", 100),
         accum_rescue_min_seconds_left: env_i64("ACCUM_RESCUE_MIN_SECONDS_LEFT", 0),
         accum_rescue_lo: env_f64("ACCUM_RESCUE_LO", 0.78),
@@ -339,6 +354,15 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_rescue_max_worst_loss: env_f64("ACCUM_RESCUE_MAX_WORST_LOSS", 0.0),
         accum_rescue_on_locked: env_bool("ACCUM_RESCUE_ON_LOCKED", false),
         accum_rescue_locked_side_pnl_below: env_f64("ACCUM_RESCUE_LOCKED_SIDE_PNL_BELOW", 0.0),
+        accum_late_cascade_enabled: env_bool("ACCUM_LATE_CASCADE_ENABLED", false),
+        accum_late_cascade_qty: env_f64("ACCUM_LATE_CASCADE_QTY", 295.0),
+        accum_late_cascade_hedge_frac: env_f64("ACCUM_LATE_CASCADE_HEDGE_FRAC", 0.5),
+        accum_late_cascade_base_usdc: env_f64("ACCUM_LATE_CASCADE_BASE_USDC", 1.0),
+        accum_late_cascade_base_equal_shares: env_bool(
+            "ACCUM_LATE_CASCADE_BASE_EQUAL_SHARES",
+            true,
+        ),
+        accum_late_cascade_max_exposure: env_f64("ACCUM_LATE_CASCADE_MAX_EXPOSURE", 300.0),
 
         maker_quote_ttl_secs: env_i64("MAKER_QUOTE_TTL_SECS", 5),
         maker_replace_ticks: env_i64("MAKER_REPLACE_TICKS", 1),

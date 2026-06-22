@@ -36,6 +36,12 @@ impl SmartStrategy {
         let force_stop = seconds_left <= self.config.accum_force_seconds;
         let selector_enabled = self.accum_selector_enabled();
 
+        if self.config.accum_late_cascade_enabled {
+            return self
+                .decide_accum_late_cascade(market, up_ask, dn_ask, seconds_left, mode)
+                .await;
+        }
+
         // ── 首笔:z 定主腿方向,只 BUY ──
         if !self.accum.contains_key(&market.slug) {
             if force_stop {
@@ -69,7 +75,7 @@ impl SmartStrategy {
                 "[ACCUM {mode}] {} 首笔 z={:.3}→{dir} 主腿@{ask:.3}×{qty:.0} T-{seconds_left}s",
                 market.title, sig.z
             );
-            self.accum_buy(market, dir, ask, qty, "accum_first", price_to_beat)
+            self.accum_buy(market, dir, ask, qty, "accum_first", price_to_beat, None)
                 .await?;
             self.accum.insert(
                 market.slug.clone(),
@@ -93,8 +99,16 @@ impl SmartStrategy {
                     let cover_ask = if cover == "Up" { up_ask } else { dn_ask };
                     info!("[ACCUM {mode}] {} selector最小对冲 {cover}@{cover_ask:.3} T-{seconds_left}s",
                         market.title);
-                    self.accum_buy(market, cover, cover_ask, 1.0, "accum_cover", price_to_beat)
-                        .await?;
+                    self.accum_buy(
+                        market,
+                        cover,
+                        cover_ask,
+                        1.0,
+                        "accum_cover",
+                        price_to_beat,
+                        None,
+                    )
+                    .await?;
                 } else {
                     warn!(
                         "[ACCUM {mode}] {} selector首笔未成交,跳过最小对冲 T-{seconds_left}s",
@@ -209,8 +223,16 @@ impl SmartStrategy {
                     }
                     info!("[ACCUM {mode}] {} 追涨{side}#{k}(ask{side_ask:.3}≥{lv:.2})×{qty:.0} T-{seconds_left}s",
                         market.title);
-                    self.accum_buy(market, side, side_ask, qty, "accum_chase", price_to_beat)
-                        .await?;
+                    self.accum_buy(
+                        market,
+                        side,
+                        side_ask,
+                        qty,
+                        "accum_chase",
+                        price_to_beat,
+                        None,
+                    )
+                    .await?;
                     if let Some(l) = self.accum.get_mut(&market.slug) {
                         if side == "Up" {
                             l.up_chase.push(k);
@@ -308,8 +330,16 @@ impl SmartStrategy {
                     }
                     info!("[ACCUM {mode}] {} 晚场补救:顺势补{side}@{p:.3}×{order_shares:.0}份(目标需{target_need:.0},风险允{risk_need:.0},cap余{cap_left:.0},该边赢→>{goal:.0}) T-{seconds_left}s",
                         market.title);
-                    self.accum_buy(market, side, p, order_shares, "accum_rescue", price_to_beat)
-                        .await?;
+                    self.accum_buy(
+                        market,
+                        side,
+                        p,
+                        order_shares,
+                        "accum_rescue",
+                        price_to_beat,
+                        None,
+                    )
+                    .await?;
                     if target_need > order_shares && order_shares >= qty {
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     }
@@ -377,8 +407,16 @@ impl SmartStrategy {
                     let this = need.min(qty); // 每笔最多20,最后一笔=零头
                     info!("[ACCUM {mode}] {} 补{side}#{j}(ask{side_ask:.3}≤{lv:.2}) ×{this:.0}份(剩需{need:.0}) T-{seconds_left}s",
                         market.title);
-                    self.accum_buy(market, side, side_ask, this, "accum_dip", price_to_beat)
-                        .await?;
+                    self.accum_buy(
+                        market,
+                        side,
+                        side_ask,
+                        this,
+                        "accum_dip",
+                        price_to_beat,
+                        None,
+                    )
+                    .await?;
                     let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
                     if wm >= target && wo >= -maxloss {
                         if let Some(l) = self.accum.get_mut(&market.slug) {
@@ -399,6 +437,354 @@ impl SmartStrategy {
         }
 
         Ok(())
+    }
+
+    async fn decide_accum_late_cascade(
+        &mut self,
+        market: &Market,
+        up_ask: f64,
+        dn_ask: f64,
+        seconds_left: i64,
+        mode: &str,
+    ) -> Result<()> {
+        let price_to_beat = self
+            .model
+            .chainlink_at(market.start_ts)
+            .or_else(|| self.model.chainlink_latest())
+            .unwrap_or(0.0);
+        let exposure_cap = self.accum_late_cascade_exposure_cap();
+
+        if !self.accum.contains_key(&market.slug) {
+            if let Some(pos) = self.state.get(&market.slug) {
+                if !pos.trades.is_empty() {
+                    let cascade_done = pos
+                        .trades
+                        .iter()
+                        .any(|t| t.phase.starts_with("accum_late_cascade_confirm"));
+                    let cascade_base = pos
+                        .trades
+                        .iter()
+                        .all(|t| t.phase.starts_with("accum_late_cascade"));
+                    let main_dir = if pos.up_shares >= pos.down_shares {
+                        "Up"
+                    } else {
+                        "Down"
+                    };
+                    let mut leg = AccumLeg::new(main_dir, up_ask, dn_ask, seconds_left);
+                    leg.locked = cascade_done || !cascade_base;
+                    self.accum.insert(market.slug.clone(), leg);
+                    self.write_signal(&serde_json::json!({
+                        "phase": "accum_late_cascade_resume_existing",
+                        "market": market.slug,
+                        "existing_trades": pos.trades.len(),
+                        "up_shares": pos.up_shares,
+                        "down_shares": pos.down_shares,
+                        "locked": cascade_done || !cascade_base,
+                        "seconds_left": seconds_left,
+                        "ts": chrono::Utc::now().timestamp(),
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+            }
+
+            if seconds_left <= self.config.accum_force_seconds {
+                return Ok(());
+            }
+
+            let base_usdc = self.config.accum_late_cascade_base_usdc.max(1.0);
+            let up_q = Self::accum_shares_for_usdc(up_ask, base_usdc);
+            let dn_q = Self::accum_shares_for_usdc(dn_ask, base_usdc);
+            let (up_q, dn_q) = if self.config.accum_late_cascade_base_equal_shares {
+                let q = up_q.max(dn_q);
+                (q, q)
+            } else {
+                (up_q, dn_q)
+            };
+            if up_q < 1.0 || dn_q < 1.0 {
+                return Ok(());
+            }
+
+            let base_cost = full_cost_per_share(up_ask) * up_q + full_cost_per_share(dn_ask) * dn_q;
+            if exposure_cap > 0.0 && base_cost > exposure_cap {
+                self.write_signal(&serde_json::json!({
+                    "phase": "accum_late_cascade_base_block",
+                    "market": market.slug,
+                    "reason": "base_cost_exceeds_max_exposure",
+                    "base_cost": base_cost,
+                    "max_exposure": exposure_cap,
+                    "up_ask": up_ask,
+                    "dn_ask": dn_ask,
+                    "up_shares": up_q,
+                    "down_shares": dn_q,
+                    "seconds_left": seconds_left,
+                    "ts": chrono::Utc::now().timestamp(),
+                }))
+                .await?;
+                return Ok(());
+            }
+
+            info!(
+                "[ACCUM {mode}] {} late-cascade base Up@{up_ask:.3}×{up_q:.0} Down@{dn_ask:.3}×{dn_q:.0} T-{seconds_left}s",
+                market.title
+            );
+            self.accum_buy(
+                market,
+                "Up",
+                up_ask,
+                up_q,
+                "accum_late_cascade_base",
+                price_to_beat,
+                Some(serde_json::json!({
+                    "base_usdc": base_usdc,
+                    "base_equal_shares": self.config.accum_late_cascade_base_equal_shares,
+                    "seconds_left": seconds_left,
+                    "up_ask": up_ask,
+                    "dn_ask": dn_ask,
+                })),
+            )
+            .await?;
+            self.accum_buy(
+                market,
+                "Down",
+                dn_ask,
+                dn_q,
+                "accum_late_cascade_base",
+                price_to_beat,
+                None,
+            )
+            .await?;
+
+            let (up_filled, dn_filled) = self
+                .state
+                .get(&market.slug)
+                .map(|pos| (pos.up_shares, pos.down_shares))
+                .unwrap_or((0.0, 0.0));
+            let main_dir = if up_filled >= dn_filled { "Up" } else { "Down" };
+            let mut leg = AccumLeg::new(main_dir, up_ask, dn_ask, seconds_left);
+            if up_filled < 1.0 || dn_filled < 1.0 {
+                leg.locked = true;
+                self.write_signal(&serde_json::json!({
+                    "phase": "accum_late_cascade_base_partial",
+                    "market": market.slug,
+                    "up_shares": up_filled,
+                    "down_shares": dn_filled,
+                    "locked": true,
+                    "seconds_left": seconds_left,
+                    "ts": chrono::Utc::now().timestamp(),
+                }))
+                .await?;
+            }
+            self.accum.insert(market.slug.clone(), leg);
+            return Ok(());
+        }
+
+        let leg = self.accum.get(&market.slug).unwrap().clone();
+        if leg.locked {
+            return Ok(());
+        }
+
+        let Some((rule_name, bin_idx, main, main_px, hedge, hedge_px, target_req)) =
+            Self::accum_late_cascade_rule(
+                seconds_left,
+                up_ask,
+                dn_ask,
+                self.config.accum_late_cascade_qty,
+            )
+        else {
+            return Ok(());
+        };
+
+        let target_main = Self::accum_shares_for_request(
+            main_px,
+            target_req,
+            self.config.accum_late_cascade_base_usdc.max(1.0),
+        );
+        let (main_now, hedge_now, exposure_now) = {
+            let pos = self.state.get_or_create(&market.slug, market.end_ts);
+            let main_now = if main == "Up" {
+                pos.up_shares
+            } else {
+                pos.down_shares
+            };
+            let hedge_now = if hedge == "Up" {
+                pos.up_shares
+            } else {
+                pos.down_shares
+            };
+            (main_now, hedge_now, pos.up_cost_total + pos.down_cost_total)
+        };
+        let target_hedge = (target_main * self.config.accum_late_cascade_hedge_frac - 1e-9).ceil();
+        let add_hedge = (target_hedge - hedge_now).max(0.0).ceil();
+        let mut planned_add_main = (target_main - main_now).max(0.0).ceil();
+        if planned_add_main < 1.0 && add_hedge < 1.0 {
+            if let Some(l) = self.accum.get_mut(&market.slug) {
+                l.locked = true;
+            }
+            return Ok(());
+        }
+
+        let planned_cost = full_cost_per_share(hedge_px) * add_hedge
+            + full_cost_per_share(main_px) * planned_add_main;
+        let projected_exposure = exposure_now + planned_cost;
+        if exposure_cap > 0.0 && projected_exposure > exposure_cap {
+            self.write_signal(&serde_json::json!({
+                "phase": "accum_late_cascade_block",
+                "market": market.slug,
+                "rule": rule_name,
+                "bin": bin_idx,
+                "reason": "projected_exposure_exceeds_max",
+                "exposure": exposure_now,
+                "add_cost": planned_cost,
+                "projected_exposure": projected_exposure,
+                "max_exposure": exposure_cap,
+                "main": main,
+                "main_px": main_px,
+                "planned_add_main": planned_add_main,
+                "hedge": hedge,
+                "hedge_px": hedge_px,
+                "add_hedge": add_hedge,
+                "seconds_left": seconds_left,
+                "ts": chrono::Utc::now().timestamp(),
+            }))
+            .await?;
+            return Ok(());
+        }
+
+        info!(
+            "[ACCUM {mode}] {} late-cascade {rule_name} bin#{bin_idx} hedge {hedge}@{hedge_px:.3} add×{add_hedge:.0}, main {main}@{main_px:.3} plan×{planned_add_main:.0} T-{seconds_left}s",
+            market.title
+        );
+        if add_hedge >= 1.0 {
+            self.accum_buy(
+                market,
+                hedge,
+                hedge_px,
+                add_hedge,
+                "accum_late_cascade_confirm_hedge",
+                price_to_beat,
+                Some(serde_json::json!({
+                    "rule": rule_name,
+                    "bin": bin_idx,
+                    "target_main": target_main,
+                    "target_hedge": target_hedge,
+                    "hedge_frac": self.config.accum_late_cascade_hedge_frac,
+                    "seconds_left": seconds_left,
+                    "up_ask": up_ask,
+                    "dn_ask": dn_ask,
+                })),
+            )
+            .await?;
+        }
+
+        let hedge_after = {
+            let pos = self.state.get_or_create(&market.slug, market.end_ts);
+            if hedge == "Up" {
+                pos.up_shares
+            } else {
+                pos.down_shares
+            }
+        };
+        if self.config.accum_late_cascade_hedge_frac > 0.0 {
+            let max_main_by_ratio =
+                (hedge_after / self.config.accum_late_cascade_hedge_frac).floor();
+            planned_add_main = planned_add_main.min((max_main_by_ratio - main_now).max(0.0));
+        }
+        if planned_add_main >= 1.0 {
+            self.accum_buy(
+                market,
+                main,
+                main_px,
+                planned_add_main,
+                "accum_late_cascade_confirm_main",
+                price_to_beat,
+                Some(serde_json::json!({
+                    "rule": rule_name,
+                    "bin": bin_idx,
+                    "target_main": target_req,
+                    "hedge_after": hedge_after,
+                    "hedge_frac": self.config.accum_late_cascade_hedge_frac,
+                    "seconds_left": seconds_left,
+                    "up_ask": up_ask,
+                    "dn_ask": dn_ask,
+                })),
+            )
+            .await?;
+        }
+        if let Some(l) = self.accum.get_mut(&market.slug) {
+            l.main_dir = main.to_string();
+            l.locked = true;
+        }
+        Ok(())
+    }
+
+    fn accum_late_cascade_exposure_cap(&self) -> f64 {
+        if self.config.accum_late_cascade_max_exposure > 0.0 {
+            self.config.accum_late_cascade_max_exposure
+        } else {
+            self.config.accum_max_exposure
+        }
+    }
+
+    fn accum_late_cascade_rule(
+        seconds_left: i64,
+        up_ask: f64,
+        dn_ask: f64,
+        qty: f64,
+    ) -> Option<(
+        &'static str,
+        usize,
+        &'static str,
+        f64,
+        &'static str,
+        f64,
+        f64,
+    )> {
+        let (main, main_px, hedge, hedge_px) = if up_ask >= dn_ask {
+            ("Up", up_ask, "Down", dn_ask)
+        } else {
+            ("Down", dn_ask, "Up", up_ask)
+        };
+        let spread = main_px - hedge_px;
+        if seconds_left <= 30 && hedge_px <= 0.20 && spread >= 0.70 {
+            if let Some(bin) =
+                Self::accum_price_bin(main_px, &[(0.85, 0.87), (0.87, 0.88), (0.94, 0.96)])
+            {
+                return Some(("C30", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        if seconds_left <= 25 && hedge_px <= 0.20 && spread >= 0.70 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.85, 0.87), (0.88, 0.92)]) {
+                return Some(("C25", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        if seconds_left <= 10 && hedge_px <= 0.15 && spread >= 0.80 {
+            if let Some(bin) = Self::accum_price_bin(main_px, &[(0.90, 0.92), (0.96, 0.985)]) {
+                return Some(("C10", bin, main, main_px, hedge, hedge_px, qty));
+            }
+        }
+        None
+    }
+
+    fn accum_price_bin(price: f64, bins: &[(f64, f64)]) -> Option<usize> {
+        bins.iter()
+            .enumerate()
+            .find(|(i, (lo, hi))| {
+                (*lo <= price && price < *hi)
+                    || (*i == bins.len() - 1 && *lo <= price && price <= *hi)
+            })
+            .map(|(i, _)| i)
+    }
+
+    fn accum_shares_for_usdc(price: f64, usdc: f64) -> f64 {
+        if price <= 0.0 {
+            return 0.0;
+        }
+        (usdc / price - 1e-9).ceil().max(1.0)
+    }
+
+    fn accum_shares_for_request(price: f64, shares: f64, min_order_usdc: f64) -> f64 {
+        shares.max(Self::accum_shares_for_usdc(price, min_order_usdc))
     }
 
     fn accum_selector_enabled(&self) -> bool {
@@ -722,6 +1108,7 @@ impl SmartStrategy {
         shares: f64,
         label: &str,
         price_to_beat: f64,
+        audit: Option<serde_json::Value>,
     ) -> Result<()> {
         let Some(shares) = self.accum_order_shares(price, shares) else {
             warn!(
@@ -800,13 +1187,20 @@ impl SmartStrategy {
             return Ok(());
         }
         let (rp, rs) = (fill.filled_price, fill.filled_shares);
-        self.write_signal(&serde_json::json!({
+        let mut rec = serde_json::json!({
             "phase": label, "market": market.slug,
             "direction": dir, "price": rp, "shares": rs,
             "full_cost": full_cost_per_share(rp),
             "dry_run": self.config.dry_run, "ts": chrono::Utc::now().timestamp(),
-        }))
-        .await?;
+        });
+        if let Some(extra) = audit {
+            if let (Some(dst), Some(src)) = (rec.as_object_mut(), extra.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        self.write_signal(&rec).await?;
         record_trade(
             &mut self.state,
             market,
