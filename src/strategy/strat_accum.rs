@@ -120,9 +120,53 @@ impl SmartStrategy {
         let (up_chase, dn_chase) = (leg.up_chase.clone(), leg.dn_chase.clone());
         let (up_dip, dn_dip) = (leg.up_dip.clone(), leg.dn_dip.clone());
 
-        // 进 tick 先判锁住(可能上 tick 刚好达标)
+        let selector_branch = if selector_enabled {
+            Some(
+                self.accum_selector_branch(market, up_ask, dn_ask, seconds_left, price_to_beat)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let selector_rescue = selector_branch
+            .as_deref()
+            .is_some_and(|b| matches!(b, "stable" | "recover"));
+        let rescue_min_left = if selector_rescue {
+            50
+        } else {
+            self.config.accum_rescue_min_seconds_left
+        };
+        let rescue_max_left = if selector_rescue { 98 } else { 0 };
+        let rescue_secs = if selector_rescue {
+            100
+        } else {
+            self.config.accum_rescue_secs
+        };
+        let rescue_time_ok = seconds_left < rescue_secs
+            && (rescue_min_left <= 0 || seconds_left > rescue_min_left)
+            && (rescue_max_left <= 0 || seconds_left <= rescue_max_left);
+        let (rescue_lo, rescue_hi) = if selector_rescue {
+            (0.83, 0.86)
+        } else {
+            (self.config.accum_rescue_lo, self.config.accum_rescue_hi)
+        };
+        let rescue_fired =
+            if !leg.rescued && (selector_rescue || !selector_enabled) && seconds_left < rescue_secs
+            {
+                if up_ask > rescue_lo && up_ask < rescue_hi {
+                    Some(("Up", up_ask))
+                } else if dn_ask > rescue_lo && dn_ask < rescue_hi {
+                    Some(("Down", dn_ask))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        // 进 tick 判锁住,但若当前 tick 已出现有效 rescue 信号,先让补救逻辑处理。
         let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
-        if wm >= target && wo >= -maxloss {
+        if wm >= target && wo >= -maxloss && !(rescue_fired.is_some() && rescue_time_ok) {
             if let Some(l) = self.accum.get_mut(&market.slug) {
                 l.locked = true;
             }
@@ -131,20 +175,10 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        let selector_branch = if selector_enabled {
-            let branch = self
-                .accum_selector_branch(market, up_ask, dn_ask, seconds_left, price_to_beat)
-                .await?;
-            if branch.is_empty() {
-                return Ok(());
-            }
-            if branch == "fallback" {
-                return Ok(());
-            }
-            Some(branch)
-        } else {
-            None
-        };
+        if selector_branch.as_deref() == Some("") || selector_branch.as_deref() == Some("fallback")
+        {
+            return Ok(());
+        }
 
         // ① 谁涨追谁:Up/Down 两边,ask≥追涨档且未追过 → 追买 qty 份。
         // 临近结算 force_stop 只停普通建仓,不挡后面的 rescue。
@@ -168,7 +202,8 @@ impl SmartStrategy {
                         }
                     }
                     let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
-                    if wm >= target && wo >= -maxloss {
+                    if wm >= target && wo >= -maxloss && !(rescue_fired.is_some() && rescue_time_ok)
+                    {
                         if let Some(l) = self.accum.get_mut(&market.slug) {
                             l.locked = true;
                         }
@@ -187,129 +222,91 @@ impl SmartStrategy {
         //    分笔顺势补强势边到"该边赢结算>rescue_goal",但受 rescue 份额上限和押错最坏亏损约束。
         //    补完即 locked 停手持有——押定这边、不再 dip 补反向主腿(否则两边对冲互抵,见21:50盘bug)。
         //    放大下注(正EV×杠杆):命中赚/翻盘亏更大,靠88%命中撑——多天验证为先。
-        let selector_rescue = selector_branch
-            .as_deref()
-            .is_some_and(|b| matches!(b, "stable" | "recover"));
-        let rescue_min_left = if selector_rescue {
-            50
-        } else {
-            self.config.accum_rescue_min_seconds_left
-        };
-        let rescue_max_left = if selector_rescue { 98 } else { 0 };
-        let rescue_secs = if selector_rescue {
-            100
-        } else {
-            self.config.accum_rescue_secs
-        };
-        let rescue_time_ok = seconds_left < rescue_secs
-            && (rescue_min_left <= 0 || seconds_left > rescue_min_left)
-            && (rescue_max_left <= 0 || seconds_left <= rescue_max_left);
-        if !leg.rescued && (selector_rescue || !selector_enabled) && seconds_left < rescue_secs {
-            let (lo, hi) = if selector_rescue {
-                (0.83, 0.86)
-            } else {
-                (self.config.accum_rescue_lo, self.config.accum_rescue_hi)
-            };
-            let fired = if up_ask > lo && up_ask < hi {
-                Some(("Up", up_ask))
-            } else if dn_ask > lo && dn_ask < hi {
-                Some(("Down", dn_ask))
-            } else {
-                None
-            };
-            if let Some((side, p)) = fired {
-                if let Some(l) = self.accum.get_mut(&market.slug) {
-                    l.rescued = true;
-                } // 每盘只补救一次
-                if !rescue_time_ok {
-                    if !selector_rescue {
-                        return Ok(());
-                    }
-                    if let Some(l) = self.accum.get_mut(&market.slug) {
-                        l.locked = true;
-                    }
-                    info!(
-                        "[ACCUM {mode}] {} selector rescue窗口外冻结 {side}@{p:.3} T-{seconds_left}s",
-                        market.title
-                    );
+        if let Some((side, p)) = rescue_fired {
+            if let Some(l) = self.accum.get_mut(&market.slug) {
+                l.rescued = true;
+            } // 每盘只补救一次
+            if !rescue_time_ok {
+                if !selector_rescue {
                     return Ok(());
                 }
-                if selector_rescue
-                    && self.accum_selector_rescue_whipsaw_blocked(&leg, side, p, seconds_left)
-                {
-                    if let Some(l) = self.accum.get_mut(&market.slug) {
-                        l.locked = true;
-                    }
-                    info!(
-                        "[ACCUM {mode}] {} selector rescue急拉回扫冻结 {side}@{p:.3} T-{seconds_left}s",
-                        market.title
-                    );
-                    return Ok(());
-                }
-                if 1.0 - full_cost_per_share(p) > 0.001 {
-                    let goal = if selector_rescue {
-                        10.0
-                    } else {
-                        self.config.accum_rescue_goal
-                    };
-                    let rescue_max_worst_loss = if selector_rescue {
-                        35.0
-                    } else {
-                        self.config.accum_rescue_max_worst_loss
-                    };
-                    let rescue_max_shares = if selector_rescue {
-                        35.0
-                    } else {
-                        self.config.accum_rescue_max_shares
-                    };
-                    // 分笔补:最终份额=min(目标份额,风险份额,rescue份额上限,每笔qty)。
-                    // 目标/风险都用真实结算 PnL 口径,避免旧逻辑低估输方手续费。
-                    for _step in 0..50 {
-                        let (target_need, risk_need, cap_left, allowed) = self.accum_rescue_qty(
-                            &market.slug,
-                            market.end_ts,
-                            side,
-                            p,
-                            goal,
-                            rescue_max_worst_loss,
-                            rescue_max_shares,
-                        );
-                        if target_need < 1.0 || allowed < 1.0 {
-                            break;
-                        }
-                        let this = allowed.min(qty);
-                        let Some(order_shares) = self.accum_order_shares(p, this) else {
-                            break;
-                        };
-                        if order_shares > allowed {
-                            break;
-                        }
-                        info!("[ACCUM {mode}] {} 晚场补救:顺势补{side}@{p:.3}×{order_shares:.0}份(目标需{target_need:.0},风险允{risk_need:.0},cap余{cap_left:.0},该边赢→>{goal:.0}) T-{seconds_left}s",
-                            market.title);
-                        self.accum_buy(
-                            market,
-                            side,
-                            p,
-                            order_shares,
-                            "accum_rescue",
-                            price_to_beat,
-                        )
-                        .await?;
-                        if target_need > order_shares && order_shares >= qty {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        }
-                    }
-                }
-                // 押定强势边,停止一切后续下单持有到结算(不再 dip 补反向主腿)
                 if let Some(l) = self.accum.get_mut(&market.slug) {
                     l.locked = true;
                 }
                 info!(
-                    "[ACCUM {mode}] {} 补救完成,押定{side}停止下单持有 T-{seconds_left}s",
+                    "[ACCUM {mode}] {} selector rescue窗口外冻结 {side}@{p:.3} T-{seconds_left}s",
                     market.title
                 );
                 return Ok(());
             }
+            if selector_rescue
+                && self.accum_selector_rescue_whipsaw_blocked(&leg, side, p, seconds_left)
+            {
+                if let Some(l) = self.accum.get_mut(&market.slug) {
+                    l.locked = true;
+                }
+                info!(
+                    "[ACCUM {mode}] {} selector rescue急拉回扫冻结 {side}@{p:.3} T-{seconds_left}s",
+                    market.title
+                );
+                return Ok(());
+            }
+            if 1.0 - full_cost_per_share(p) > 0.001 {
+                let goal = if selector_rescue {
+                    10.0
+                } else {
+                    self.config.accum_rescue_goal
+                };
+                let rescue_max_worst_loss = if selector_rescue {
+                    35.0
+                } else {
+                    self.config.accum_rescue_max_worst_loss
+                };
+                let rescue_max_shares = if selector_rescue {
+                    35.0
+                } else {
+                    self.config.accum_rescue_max_shares
+                };
+                // 分笔补:最终份额=min(目标份额,风险份额,rescue份额上限,每笔qty)。
+                // 目标/风险都用真实结算 PnL 口径,避免旧逻辑低估输方手续费。
+                for _step in 0..50 {
+                    let (target_need, risk_need, cap_left, allowed) = self.accum_rescue_qty(
+                        &market.slug,
+                        market.end_ts,
+                        side,
+                        p,
+                        goal,
+                        rescue_max_worst_loss,
+                        rescue_max_shares,
+                    );
+                    if target_need < 1.0 || allowed < 1.0 {
+                        break;
+                    }
+                    let this = allowed.min(qty);
+                    let Some(order_shares) = self.accum_order_shares(p, this) else {
+                        break;
+                    };
+                    if order_shares > allowed {
+                        break;
+                    }
+                    info!("[ACCUM {mode}] {} 晚场补救:顺势补{side}@{p:.3}×{order_shares:.0}份(目标需{target_need:.0},风险允{risk_need:.0},cap余{cap_left:.0},该边赢→>{goal:.0}) T-{seconds_left}s",
+                        market.title);
+                    self.accum_buy(market, side, p, order_shares, "accum_rescue", price_to_beat)
+                        .await?;
+                    if target_need > order_shares && order_shares >= qty {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+            // 押定强势边,停止一切后续下单持有到结算(不再 dip 补反向主腿)
+            if let Some(l) = self.accum.get_mut(&market.slug) {
+                l.locked = true;
+            }
+            info!(
+                "[ACCUM {mode}] {} 补救完成,押定{side}停止下单持有 T-{seconds_left}s",
+                market.title
+            );
+            return Ok(());
         }
         if force_stop {
             return Ok(());
