@@ -23,14 +23,15 @@ impl SmartStrategy {
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         if now < market.start_ts { return Ok(()); }                          // 还没开盘
-        if seconds_left <= self.config.accum_force_seconds { return Ok(()); } // 临近结算停建
         let qty = strategy_order_shares(self.config.accum_qty).unwrap_or(20.0);
         let target = self.config.accum_target_win;
         let maxloss = self.config.accum_max_loss;
         let mode = if self.config.dry_run { "DRY_RUN" } else { "LIVE" };
+        let force_stop = seconds_left <= self.config.accum_force_seconds;
 
         // ── 首笔:z 定主腿方向,只 BUY ──
         if !self.accum.contains_key(&market.slug) {
+            if force_stop { return Ok(()); }                    // 临近结算不新开首笔
             let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
             if price_to_beat < 1000.0 { return Ok(()); }       // 开盘 Chainlink 价未就绪
             let Some(sig) = self.model.compute(price_to_beat, seconds_left, crate::zscore::DirSource::Chainlink) else { return Ok(()); };
@@ -66,23 +67,26 @@ impl SmartStrategy {
             return Ok(());
         }
 
-        // ① 谁涨追谁:Up/Down 两边,ask≥追涨档且未追过 → 追买 qty 份
-        for side in ["Up", "Down"] {
-            let side_ask = if side == "Up" { up_ask } else { dn_ask };
-            let chased = if side == "Up" { &up_chase } else { &dn_chase };
-            for (k, &lv) in chase.iter().enumerate() {
-                if chased.contains(&k) || side_ask < lv { continue; }
-                info!("[ACCUM {mode}] {} 追涨{side}#{k}(ask{side_ask:.3}≥{lv:.2})×{qty:.0} T-{seconds_left}s",
-                    market.title);
-                self.accum_buy(market, side, side_ask, qty, "accum_chase", price_to_beat).await?;
-                if let Some(l) = self.accum.get_mut(&market.slug) {
-                    if side == "Up" { l.up_chase.push(k); } else { l.dn_chase.push(k); }
-                }
-                let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
-                if wm >= target && wo >= -maxloss {
-                    if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
-                    info!("[ACCUM {mode}] {} 盈亏锁住,停止下单裸持 T-{seconds_left}s", market.title);
-                    return Ok(());
+        // ① 谁涨追谁:Up/Down 两边,ask≥追涨档且未追过 → 追买 qty 份。
+        // 临近结算 force_stop 只停普通建仓,不挡后面的 rescue。
+        if !force_stop {
+            for side in ["Up", "Down"] {
+                let side_ask = if side == "Up" { up_ask } else { dn_ask };
+                let chased = if side == "Up" { &up_chase } else { &dn_chase };
+                for (k, &lv) in chase.iter().enumerate() {
+                    if chased.contains(&k) || side_ask < lv { continue; }
+                    info!("[ACCUM {mode}] {} 追涨{side}#{k}(ask{side_ask:.3}≥{lv:.2})×{qty:.0} T-{seconds_left}s",
+                        market.title);
+                    self.accum_buy(market, side, side_ask, qty, "accum_chase", price_to_beat).await?;
+                    if let Some(l) = self.accum.get_mut(&market.slug) {
+                        if side == "Up" { l.up_chase.push(k); } else { l.dn_chase.push(k); }
+                    }
+                    let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
+                    if wm >= target && wo >= -maxloss {
+                        if let Some(l) = self.accum.get_mut(&market.slug) { l.locked = true; }
+                        info!("[ACCUM {mode}] {} 盈亏锁住,停止下单裸持 T-{seconds_left}s", market.title);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -132,6 +136,7 @@ impl SmartStrategy {
                 return Ok(());
             }
         }
+        if force_stop { return Ok(()); } // 临近结算不再 chase/dip/首笔,但上面的 rescue 已经有机会执行。
 
         // ③ 谁跌补谁(计算模块):Up/Down 两边,ask≤补档且未补过 → 分笔补。
         //    每笔最多 qty(20)份、最后一笔补不足 20 的零头,笔间隔 500ms。
