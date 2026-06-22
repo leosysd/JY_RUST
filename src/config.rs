@@ -105,8 +105,16 @@ pub struct Config {
     // ── 路线六:accum 双边追涨补仓 + 计算模块(主腿赢≥target/输≥−maxloss,锁住即停)──
     /// 首笔/追买份额(每档固定)。
     pub accum_qty: f64,
+    /// accum 下单最小名义金额。Polymarket 最小交易额按 USDC,不是按份额。
+    pub accum_min_order_usdc: f64,
     /// 首笔定方向阈值:|z|≥此值才开首笔主腿。
     pub accum_entry_z: f64,
+    /// 回测 selector 模式:"off"=旧 accum;"weak"=四分支;"capitulation"=五分支激进候选。
+    pub accum_selector_mode: String,
+    /// selector 观察点:剩余秒≤此值时只用当时可见特征决定是否开放 dip/rescue。
+    pub accum_selector_gate_seconds: i64,
+    /// selector dip 档位。当前最佳候选固定为 0.20。
+    pub accum_selector_dip_level: f64,
     /// 临近结算停建:剩余秒≤此值不再下单。
     pub accum_force_seconds: i64,
     /// 追涨档(谁涨追谁,升序):任一边 ask≥某档且未追过 → 追买那边 accum_qty 份。
@@ -199,21 +207,15 @@ fn env_decimal(key: &str, default: &str) -> Decimal {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env(key, &default.to_string())
-        .parse()
-        .unwrap_or(default)
+    env(key, &default.to_string()).parse().unwrap_or(default)
 }
 
 fn env_i64(key: &str, default: i64) -> i64 {
-    env(key, &default.to_string())
-        .parse()
-        .unwrap_or(default)
+    env(key, &default.to_string()).parse().unwrap_or(default)
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
-    env(key, &default.to_string())
-        .parse()
-        .unwrap_or(default)
+    env(key, &default.to_string()).parse().unwrap_or(default)
 }
 
 /// 解析逗号分隔的浮点列表(价格阶梯)。空项/解析失败的项忽略。
@@ -229,7 +231,9 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
     // 否则 bot 不带 .env 参数启动会退回 CWD 解析(dotenv 搜 CWD + base="."),
     // 把 quant_state.json 写进工作目录,而 CLI 仍读 /opt/polymarket-copy/quant_state.json
     // → stats 永远"暂无数据文件"。见其他 VPS 模拟无统计表问题。
-    let env_path: String = env_path.map(|s| s.to_string()).unwrap_or_else(default_env_path);
+    let env_path: String = env_path
+        .map(|s| s.to_string())
+        .unwrap_or_else(default_env_path);
     dotenvy::from_path(&env_path).ok();
 
     let private_key = match std::env::var("PRIVATE_KEY") {
@@ -312,7 +316,11 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         sniper_buy_limit: env_f64("SNIPER_BUY_LIMIT", 0.99),
 
         accum_qty: env_f64("ACCUM_QTY", 20.0),
+        accum_min_order_usdc: env_f64("ACCUM_MIN_ORDER_USDC", 1.0),
         accum_entry_z: env_f64("ACCUM_ENTRY_Z", 0.15),
+        accum_selector_mode: env("ACCUM_SELECTOR_MODE", "off").to_lowercase(),
+        accum_selector_gate_seconds: env_i64("ACCUM_SELECTOR_GATE_SECONDS", 260),
+        accum_selector_dip_level: env_f64("ACCUM_SELECTOR_DIP_LEVEL", 0.20),
         accum_force_seconds: env_i64("ACCUM_FORCE_SECONDS", 15),
         accum_chase_levels: env_f64_vec("ACCUM_CHASE_LEVELS", "0.62,0.65,0.68,0.70"),
         accum_dip_levels: env_f64_vec("ACCUM_DIP_LEVELS", "0.25,0.20"),
