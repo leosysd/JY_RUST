@@ -275,20 +275,35 @@ impl SmartStrategy {
             }
         }
 
-        // 结算检查节流:绝大多数 tick 直接跳过,避免逐 tick 的结算网络请求拖慢决策/入场。
         let now = chrono::Utc::now().timestamp();
-        if now - self.last_settlement_check >= SETTLEMENT_CHECK_INTERVAL {
-            self.last_settlement_check = now;
-            self.check_settlements().await?;
-        }
-
-        if let Err(e) = self.harvest_makers().await {
-            warn!("[MAKER HARVEST] {e:#}");
-        }
-
         let Some(market) = self.get_or_fetch_market().await else {
+            // 没有当前盘口时才把后台维护任务放在前面跑。
+            if now - self.last_settlement_check >= SETTLEMENT_CHECK_INTERVAL {
+                self.last_settlement_check = now;
+                self.check_settlements().await?;
+            }
+            if let Err(e) = self.harvest_makers().await {
+                warn!("[MAKER HARVEST] {e:#}");
+            }
             return Ok(());
         };
+
+        let seconds_left = market.seconds_left();
+        let t1_late_critical = self.config.entry_strategy == "t1_late"
+            && seconds_left <= self.config.t1_late_confirm1_secs + 20;
+
+        // 结算/挂单收割会打网络请求。t1_late 的有效窗口只有最后几秒,
+        // 尾段必须让策略决策先跑,否则一次慢结算就会错过 T-10/T-1。
+        if !t1_late_critical {
+            if now - self.last_settlement_check >= SETTLEMENT_CHECK_INTERVAL {
+                self.last_settlement_check = now;
+                self.check_settlements().await?;
+            }
+
+            if let Err(e) = self.harvest_makers().await {
+                warn!("[MAKER HARVEST] {e:#}");
+            }
+        }
 
         if market.start_ts < self.first_allowed_start {
             debug!(
@@ -297,8 +312,6 @@ impl SmartStrategy {
             );
             return Ok(());
         }
-
-        let seconds_left = market.seconds_left();
 
         // ── 开盘前保活 ──────────────────────────────────────────────────────
         // 当前盘临结束前 ~2s(=下一盘即将开盘)打热一条连接,让下一盘"开盘那笔"
