@@ -144,7 +144,7 @@ pub struct Config {
     pub accum_rescue_on_locked: bool,
     /// 已锁仓 rescue 只在触发边当前结算 PnL ≤ 此值时执行,避免对已足够盈利的一边继续加仓。
     pub accum_rescue_locked_side_pnl_below: f64,
-    /// 实验: late-confirm cascade 候选(C30/C25/C10) dry-run/FAK 研究模式。默认关闭。
+    /// 实验: late-confirm cascade 候选(C180/C60/C30/C25/C10) dry-run/FAK 研究模式。默认关闭。
     pub accum_late_cascade_enabled: bool,
     /// late-confirm cascade 主腿目标份额。严格 2:1 候选为 295。
     pub accum_late_cascade_qty: f64,
