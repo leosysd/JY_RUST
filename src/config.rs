@@ -138,6 +138,10 @@ pub struct Config {
     pub accum_rescue_max_shares: f64,
     /// 晚场补救:补完后若押错,真实结算 PnL 不得低于 -此值。0=关闭。
     pub accum_rescue_max_worst_loss: f64,
+    /// 已锁仓后是否仍允许晚场 rescue。用于解决较早锁仓后最后收敛盘口不再补救的问题。
+    pub accum_rescue_on_locked: bool,
+    /// 已锁仓 rescue 只在触发边当前结算 PnL ≤ 此值时执行,避免对已足够盈利的一边继续加仓。
+    pub accum_rescue_locked_side_pnl_below: f64,
 
     // ── maker quote/replace lifecycle 参数 ───────────────────────────────
     /// maker 挂单存活时长(秒):挂单超过此时长未成交即撤(配合 replace)。
@@ -333,6 +337,8 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_rescue_goal: env_f64("ACCUM_RESCUE_GOAL", 10.0),
         accum_rescue_max_shares: env_f64("ACCUM_RESCUE_MAX_SHARES", 0.0),
         accum_rescue_max_worst_loss: env_f64("ACCUM_RESCUE_MAX_WORST_LOSS", 0.0),
+        accum_rescue_on_locked: env_bool("ACCUM_RESCUE_ON_LOCKED", false),
+        accum_rescue_locked_side_pnl_below: env_f64("ACCUM_RESCUE_LOCKED_SIDE_PNL_BELOW", 0.0),
 
         maker_quote_ttl_secs: env_i64("MAKER_QUOTE_TTL_SECS", 5),
         maker_replace_ticks: env_i64("MAKER_REPLACE_TICKS", 1),

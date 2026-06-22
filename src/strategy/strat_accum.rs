@@ -110,9 +110,7 @@ impl SmartStrategy {
             self.accum_selector_note_tick(&market.slug, up_ask, dn_ask, seconds_left);
         }
         let leg = self.accum.get(&market.slug).unwrap().clone();
-        if leg.locked {
-            return Ok(());
-        } // 已锁住,不再下单
+        let locked_at_start = leg.locked;
         let main_dir = leg.main_dir.clone();
         let price_to_beat = self.model.chainlink_at(market.start_ts).unwrap_or(0.0);
         let chase = self.config.accum_chase_levels.clone();
@@ -163,6 +161,25 @@ impl SmartStrategy {
             } else {
                 None
             };
+
+        let locked_rescue_ok = if locked_at_start {
+            if let Some((side, _p)) = rescue_fired {
+                let side_pnl = {
+                    let pos = self.state.get_or_create(&market.slug, market.end_ts);
+                    pos.settle_pnl(side)
+                };
+                self.config.accum_rescue_on_locked
+                    && rescue_time_ok
+                    && side_pnl <= self.config.accum_rescue_locked_side_pnl_below
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if locked_at_start && !locked_rescue_ok {
+            return Ok(());
+        }
 
         // 进 tick 判锁住,但若当前 tick 已出现有效 rescue 信号,先让补救逻辑处理。
         let (wm, wo) = self.accum_pnl(&market.slug, market.end_ts, &main_dir);
