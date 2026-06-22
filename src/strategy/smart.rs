@@ -96,6 +96,8 @@ pub struct SmartStrategy {
     pub maker_attempt: std::collections::HashMap<String, i64>,
     /// zquote 每盘开局锁定的 z 方向(slug→"Up"/"Down")。开局定一次,之后不再随 z 变。
     pub zquote_dir: std::collections::HashMap<String, String>,
+    /// T-1 late-entry 每盘确认状态(slug→T-10/T-8 确认快照)。
+    pub t1_late: std::collections::HashMap<String, T1LateState>,
 }
 
 /// accum 路线每盘状态。首笔 z 定主腿方向(盈亏锚点),之后谁涨追谁/谁跌补谁,
@@ -150,6 +152,18 @@ impl AccumLeg {
             rescued: false,
         }
     }
+}
+
+/// T-1 late-entry 每盘状态。T-10/T-8 只记录一次, T-1 触发后 locked=true 防重复。
+#[derive(Clone, Default)]
+pub struct T1LateState {
+    pub confirm1_side: String,
+    pub confirm1_ask: f64,
+    pub confirm1_seen_at: i64,
+    pub confirm2_side: String,
+    pub confirm2_ask: f64,
+    pub confirm2_seen_at: i64,
+    pub locked: bool,
 }
 
 /// 读 model.txt 的修改时间(unix 秒);不存在则 0。用于热重载判新。
@@ -247,6 +261,7 @@ impl SmartStrategy {
             reconciled: false,
             maker_attempt: std::collections::HashMap::new(),
             zquote_dir: std::collections::HashMap::new(),
+            t1_late: std::collections::HashMap::new(),
         })
     }
 
@@ -292,7 +307,7 @@ impl SmartStrategy {
         // 且每个 end_ts 只打一次(末段 ~10 个 tick 不重复 ping)。仅吃单入场策略需要。
         if matches!(
             self.config.entry_strategy.as_str(),
-            "sniper" | "accum" | "ev_solo" | "zscore"
+            "sniper" | "accum" | "ev_solo" | "zscore" | "t1_late"
         ) && market.end_ts - now <= 2
             && self.prewarm_ahead_for != market.end_ts
         {
@@ -307,7 +322,7 @@ impl SmartStrategy {
             );
         }
 
-        if seconds_left < 5 {
+        if seconds_left < 5 && self.config.entry_strategy != "t1_late" {
             return Ok(());
         }
 
@@ -328,7 +343,7 @@ impl SmartStrategy {
         // 注:zscore 盘中追单/锁利可能晚于 90s、连接届时已冷——本预热只保证"入场"那笔快。
         if matches!(
             self.config.entry_strategy.as_str(),
-            "sniper" | "accum" | "ev_solo" | "zscore"
+            "sniper" | "accum" | "ev_solo" | "zscore" | "t1_late"
         ) && !self.primed_slugs.contains(&market.slug)
         {
             self.executor.prime_token(&up_token).await;
@@ -411,6 +426,13 @@ impl SmartStrategy {
         // 路线六：accum 双边追涨补仓 + 计算模块(谁涨追谁/谁跌补谁,赢≥12/亏≤7,锁住即停)。
         if self.config.entry_strategy == "accum" {
             self.decide_accum(&market, up_ask, dn_ask, seconds_left)
+                .await?;
+            return Ok(());
+        }
+
+        // 路线八：T-10/T-8 确认, T-1 最后一秒 FAK 买强势边, dry-run 对齐 live 盘口。
+        if self.config.entry_strategy == "t1_late" {
+            self.decide_t1_late(&market, up_ask, dn_ask, seconds_left)
                 .await?;
             return Ok(());
         }

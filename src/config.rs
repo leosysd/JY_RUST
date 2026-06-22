@@ -157,6 +157,22 @@ pub struct Config {
     /// late-confirm cascade 单盘最大含费成本。严格候选回测按 300u 资金口径筛选。
     pub accum_late_cascade_max_exposure: f64,
 
+    // ── 路线八:t1_late 最后一秒确认 taker ───────────────────────────────
+    /// T-1 late-entry 候选: T-10/T-8 确认同向, T-1 最后一秒仍同向才 FAK 买强势边。
+    pub t1_late_confirm1_secs: i64,
+    pub t1_late_confirm2_secs: i64,
+    pub t1_late_entry_secs: i64,
+    pub t1_late_confirm_min_ask: f64,
+    pub t1_late_entry_min_ask: f64,
+    pub t1_late_opp_max_ask: f64,
+    pub t1_late_target_qty: f64,
+    /// 0=不按本地权益滚仓; >0 时 max_deploy = dry_equity × 此比例。
+    pub t1_late_risk_fraction: f64,
+    /// 固定最大部署资金。0=不设固定 cap,只受 risk_fraction/target_qty/ask_size 限制。
+    pub t1_late_max_deploy_usdc: f64,
+    /// dry-run 本地权益起点。实际权益 = 起点 + 本策略已结算 PnL。
+    pub t1_late_start_equity: f64,
+
     // ── maker quote/replace lifecycle 参数 ───────────────────────────────
     /// maker 挂单存活时长(秒):挂单超过此时长未成交即撤(配合 replace)。
     pub maker_quote_ttl_secs: i64,
@@ -363,6 +379,17 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
             true,
         ),
         accum_late_cascade_max_exposure: env_f64("ACCUM_LATE_CASCADE_MAX_EXPOSURE", 300.0),
+
+        t1_late_confirm1_secs: env_i64("T1_LATE_CONFIRM1_SECS", 10),
+        t1_late_confirm2_secs: env_i64("T1_LATE_CONFIRM2_SECS", 8),
+        t1_late_entry_secs: env_i64("T1_LATE_ENTRY_SECS", 1),
+        t1_late_confirm_min_ask: env_f64("T1_LATE_CONFIRM_MIN_ASK", 0.98),
+        t1_late_entry_min_ask: env_f64("T1_LATE_ENTRY_MIN_ASK", 0.75),
+        t1_late_opp_max_ask: env_f64("T1_LATE_OPP_MAX_ASK", 0.30),
+        t1_late_target_qty: env_f64("T1_LATE_TARGET_QTY", 2000.0),
+        t1_late_risk_fraction: env_f64("T1_LATE_RISK_FRACTION", 0.0),
+        t1_late_max_deploy_usdc: env_f64("T1_LATE_MAX_DEPLOY_USDC", 300.0),
+        t1_late_start_equity: env_f64("T1_LATE_START_EQUITY", 300.0),
 
         maker_quote_ttl_secs: env_i64("MAKER_QUOTE_TTL_SECS", 5),
         maker_replace_ticks: env_i64("MAKER_REPLACE_TICKS", 1),

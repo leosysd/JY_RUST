@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     let env_path = std::env::args().nth(1);
     let config = config::load(env_path.as_deref())?;
 
-    // 显示"真正生效"的下单份数:ev_solo 用 EV_SOLO_QTY,其余策略用 QUANT_ORDER_SHARES。
+    // 显示"真正生效"的下单份数:ev_solo/accum/t1_late 用各自参数,其余策略用 QUANT_ORDER_SHARES。
     // 二者经 CLI 已同步,但仍按策略取实际值,避免日志显示一个、下单用另一个。
     let eff_shares = if config.entry_strategy == "ev_solo" {
         config.ev_solo_qty
@@ -41,6 +41,8 @@ async fn main() -> Result<()> {
         config.sniper_qty
     } else if config.entry_strategy == "accum" {
         config.accum_qty
+    } else if config.entry_strategy == "t1_late" {
+        config.t1_late_target_qty
     } else {
         config.order_shares.to_string().parse::<f64>().unwrap_or(20.0)
     };
@@ -118,4 +120,3 @@ async fn run_quant(
         }
     }
 }
-

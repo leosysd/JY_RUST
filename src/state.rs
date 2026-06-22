@@ -77,6 +77,16 @@ impl SmartStateStore {
         Summary { total, locked, win, lose, total_pnl }
     }
 
+    /// 只统计某类策略 phase 前缀的已结算 PnL。用于 dry-run 本地权益滚仓,
+    /// 避免历史 state 里其它策略的结算污染当前候选策略资金曲线。
+    pub fn realized_pnl_for_phase_prefix(&self, prefix: &str) -> f64 {
+        self.positions
+            .values()
+            .filter(|p| p.trades.iter().any(|t| t.phase.starts_with(prefix)))
+            .filter_map(|p| p.realized_pnl)
+            .sum()
+    }
+
     pub async fn save(&self) -> Result<()> {
         // 目录已在 load() 建好;此处不再 create_dir_all。紧凑序列化(非 pretty)减少
         // 序列化与写入字节数——状态文件供程序读,无需人肉缩进。
