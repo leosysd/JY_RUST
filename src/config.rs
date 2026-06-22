@@ -148,7 +148,7 @@ pub struct Config {
     pub accum_late_cascade_enabled: bool,
     /// late-confirm cascade 主腿目标份额。严格 2:1 候选为 295。
     pub accum_late_cascade_qty: f64,
-    /// late-confirm cascade 对冲腿至少为主腿份额的比例。0.5 = 最大 2:1。
+    /// late-confirm cascade 对冲腿至少为主腿份额的比例。0.25 = 最大约 4:1,0.5 = 最大 2:1。
     pub accum_late_cascade_hedge_frac: f64,
     /// 每盘基础双边订单的最小名义金额。Polymarket 最小订单按金额约 $1。
     pub accum_late_cascade_base_usdc: f64,
@@ -356,7 +356,7 @@ pub fn load(env_path: Option<&str>) -> Result<Config> {
         accum_rescue_locked_side_pnl_below: env_f64("ACCUM_RESCUE_LOCKED_SIDE_PNL_BELOW", 0.0),
         accum_late_cascade_enabled: env_bool("ACCUM_LATE_CASCADE_ENABLED", false),
         accum_late_cascade_qty: env_f64("ACCUM_LATE_CASCADE_QTY", 295.0),
-        accum_late_cascade_hedge_frac: env_f64("ACCUM_LATE_CASCADE_HEDGE_FRAC", 0.5),
+        accum_late_cascade_hedge_frac: env_f64("ACCUM_LATE_CASCADE_HEDGE_FRAC", 0.25),
         accum_late_cascade_base_usdc: env_f64("ACCUM_LATE_CASCADE_BASE_USDC", 1.0),
         accum_late_cascade_base_equal_shares: env_bool(
             "ACCUM_LATE_CASCADE_BASE_EQUAL_SHARES",
